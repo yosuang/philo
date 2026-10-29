@@ -1,4 +1,4 @@
 <div align="center">
   <h1>philo</h1>
-  <p><b>Always with you.</b> A personal agent for presence, routing, and orchestration.</p>
+  <p><b>Your agent, your friend.</b> Always on for you.</p>
 </div>
