@@ -1,0 +1,22 @@
+// The Rust root, opened headless by `nsh test`.
+import { expect, open, test } from "nsh/test";
+
+test("shows the desktop shell", async () => {
+  const app = await open(".", { width: 1280, height: 900, platform: "linux" });
+  const text = () => app.texts().join("\n");
+  expect(text()).toContain("Philo");
+  expect(text()).toContain("Your agent, your friend.");
+  expect(text()).toContain("New agent");
+
+  await app.press("Settings");
+  expect(text()).toContain("Server URL");
+  await app.press("Dark");
+  expect(text()).toContain("Appearance: dark");
+
+  await app.press("Skills");
+  expect(text()).toContain("Not available yet");
+
+  await app.press("Connectors");
+  expect(text()).toContain("Sign-in");
+  expect(text()).toContain("Not available yet");
+});

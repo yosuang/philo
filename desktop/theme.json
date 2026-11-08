@@ -1,0 +1,17 @@
+{
+  "cssVars": {
+    "theme": {
+      "radius": "0.75rem"
+    },
+    "light": {
+      "primary": "oklch(0.42 0.07 210)",
+      "primary-foreground": "oklch(0.98 0.01 210)",
+      "ring": "oklch(0.42 0.07 210)"
+    },
+    "dark": {
+      "primary": "oklch(0.78 0.07 210)",
+      "primary-foreground": "oklch(0.22 0.04 210)",
+      "ring": "oklch(0.78 0.07 210)"
+    }
+  }
+}
