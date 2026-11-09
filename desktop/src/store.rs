@@ -1,16 +1,19 @@
 //! Workspace state. Signals stay private to this module; pages call the methods.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nsh_core::platform::Appearance;
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::client::{self, WsCmd, WsEvent};
 use crate::model::{
     Agent, Approval, Connector, DEFAULT_SERVER, Health, Message, Session, Task, normalize_base,
-    sort_sessions_newest_first,
+    sort_sessions_newest_first, transcript_summary,
 };
 
 const SERVER_KEY: &str = "serverUrl";
@@ -80,6 +83,8 @@ pub struct Store {
     pub action_error: Signal<Option<String>>,
     pub agents: Signal<Vec<Agent>>,
     pub sessions: Signal<Vec<Session>>,
+    /// Latest-message line for each bot, keyed by agent id. Not a session list.
+    pub previews: Signal<HashMap<String, String>>,
     pub messages: Signal<Vec<Message>>,
     pub approvals: Signal<Vec<Approval>>,
     pub tasks: Signal<Vec<Task>>,
@@ -101,6 +106,10 @@ pub struct Store {
     pub library_tab: Signal<bool>,
     ws_generation: Signal<u64>,
     transcript_epoch: Signal<u64>,
+    /// Bumps when the open bot changes so an older resume cannot overwrite it.
+    open_generation: Signal<u64>,
+    /// One resume at a time, so the first visit creates a single server session.
+    resume_lock: Stored<Arc<Mutex<()>>>,
     ws_out: Stored<Option<UnboundedSender<WsCmd>>>,
 }
 
@@ -120,6 +129,7 @@ impl Store {
             action_error: signal(None),
             agents: signal(Vec::new()),
             sessions: signal(Vec::new()),
+            previews: signal(HashMap::new()),
             messages: signal(Vec::new()),
             approvals: signal(Vec::new()),
             tasks: signal(Vec::new()),
@@ -139,6 +149,8 @@ impl Store {
             library_tab: signal(false),
             ws_generation: signal(0),
             transcript_epoch: signal(0),
+            open_generation: signal(0),
+            resume_lock: stored(Arc::new(Mutex::new(()))),
             ws_out: stored(None),
         };
         if let Some(saved) = Storage::get_item(SERVER_KEY)
@@ -227,12 +239,13 @@ impl Store {
                 }
                 Err(err) => store.server_error.set(Some(err)),
             }
-            if let Some(agent_id) = store.selected_agent.get() {
-                store.load_sessions(agent_id).await;
-            }
             if let Some(session_id) = store.selected_session.get() {
                 store.load_transcript(session_id).await;
+            } else if let Some(agent_id) = store.selected_agent.get() {
+                let generation = store.open_generation.get();
+                store.resume_bot(agent_id, generation).await;
             }
+            store.load_previews().await;
         });
     }
 
@@ -245,26 +258,24 @@ impl Store {
     }
 
     pub fn select_agent(self, id: String) {
-        self.selected_agent.set(Some(id.clone()));
-        self.selected_session.set(None);
-        self.messages.set(Vec::new());
-        self.approvals.set(Vec::new());
-        self.tasks.set(Vec::new());
-        self.route.set(Route::Chat);
-        let store = self;
-        go(async move {
-            store.load_sessions(id).await;
-        });
-    }
-
-    pub fn select_session(self, id: String) {
-        self.selected_session.set(Some(id.clone()));
+        let same = self.selected_agent.get().as_deref() == Some(id.as_str());
         self.route.set(Route::Chat);
         self.action_error.set(None);
-        self.subscribe(&id);
+        if same && self.selected_session.get().is_some() {
+            return;
+        }
+        if !same {
+            self.open_generation.update(|generation| *generation += 1);
+            self.selected_agent.set(Some(id.clone()));
+            self.selected_session.set(None);
+            self.messages.set(Vec::new());
+            self.approvals.set(Vec::new());
+            self.tasks.set(Vec::new());
+        }
+        let generation = self.open_generation.get();
         let store = self;
         go(async move {
-            store.load_transcript(id).await;
+            store.resume_bot(id, generation).await;
         });
     }
 
@@ -281,7 +292,7 @@ impl Store {
     pub fn open_edit_agent(self) {
         let Some(id) = self.selected_agent.get() else {
             self.action_error
-                .set(Some("Select an agent to configure.".to_owned()));
+                .set(Some("Choose a bot to configure.".to_owned()));
             return;
         };
         let Some(agent) = self
@@ -315,6 +326,7 @@ impl Store {
         let store = self;
         go(async move {
             let url = store.server_url.get();
+            let created = editing.is_none();
             let result = if let Some(id) = editing {
                 client::update_agent(&url, &id, &name, &instructions, &model_id).await
             } else {
@@ -324,8 +336,16 @@ impl Store {
             match result {
                 Ok(agent) => {
                     let id = agent.id.clone();
+                    store.open_generation.update(|generation| *generation += 1);
+                    let generation = store.open_generation.get();
                     store.selected_agent.set(Some(id.clone()));
                     store.route.set(Route::Chat);
+                    if created {
+                        store.selected_session.set(None);
+                        store.messages.set(Vec::new());
+                        store.approvals.set(Vec::new());
+                        store.tasks.set(Vec::new());
+                    }
                     match client::list_agents(&url).await {
                         Ok(agents) => store.agents.set(agents),
                         Err(err) => {
@@ -333,30 +353,8 @@ impl Store {
                             store.server_error.set(Some(err));
                         }
                     }
-                    store.load_sessions(id).await;
-                }
-                Err(err) => store.action_error.set(Some(err)),
-            }
-        });
-    }
-
-    pub fn create_session(self) {
-        log::info!("create session");
-        let Some(agent_id) = self.selected_agent.get() else {
-            self.action_error
-                .set(Some("Create or select an agent first.".to_owned()));
-            return;
-        };
-        self.action_error.set(None);
-        let store = self;
-        go(async move {
-            match client::create_session(&store.server_url.get(), &agent_id, "New session").await {
-                Ok(session) => {
-                    let id = session.id.clone();
-                    store.sessions.update(|list| {
-                        list.insert(0, session);
-                    });
-                    store.select_session(id);
+                    store.resume_bot(id, generation).await;
+                    store.load_previews().await;
                 }
                 Err(err) => store.action_error.set(Some(err)),
             }
@@ -369,9 +367,9 @@ impl Store {
         if content.is_empty() {
             return;
         }
-        let Some(session_id) = self.selected_session.get() else {
+        let Some(agent_id) = self.selected_agent.get() else {
             self.action_error
-                .set(Some("Start a session before sending.".to_owned()));
+                .set(Some("Create or choose a bot before sending.".to_owned()));
             return;
         };
         if self.streaming() {
@@ -383,26 +381,62 @@ impl Store {
         if self.sending.get() {
             return;
         }
+        let known = self.selected_session.get();
+        let generation = self.open_generation.get();
         self.draft.set(String::new());
         self.sending.set(true);
         self.action_error.set(None);
         let store = self;
         go(async move {
+            let session_id = if let Some(id) = known {
+                id
+            } else {
+                store.resume_bot(agent_id.clone(), generation).await;
+                if store.selected_agent.get().as_deref() != Some(agent_id.as_str()) {
+                    store.sending.set(false);
+                    return;
+                }
+                match store.selected_session.get() {
+                    Some(id) => id,
+                    None => {
+                        store.sending.set(false);
+                        store.draft.set(content);
+                        if store.action_error.get().is_none() {
+                            store
+                                .action_error
+                                .set(Some("This bot's chat is not ready yet.".to_owned()));
+                        }
+                        return;
+                    }
+                }
+            };
+            if store.selected_agent.get().as_deref() != Some(agent_id.as_str())
+                || store.selected_session.get().as_deref() != Some(session_id.as_str())
+            {
+                store.sending.set(false);
+                return;
+            }
             let result = client::send_message(&store.server_url.get(), &session_id, &content).await;
             store.sending.set(false);
             match result {
                 Ok(posted) => {
+                    if store.selected_session.get().as_deref() != Some(session_id.as_str()) {
+                        return;
+                    }
                     if let Some(message) = posted.user_message {
                         store.upsert_message(message);
                     }
                     if let Some(message) = posted.assistant_message {
                         store.upsert_message(message);
                     }
+                    store.remember_preview();
                     store.load_transcript(session_id).await;
                 }
                 Err(err) => {
-                    store.draft.set(content);
-                    store.action_error.set(Some(err));
+                    if store.selected_agent.get().as_deref() == Some(agent_id.as_str()) {
+                        store.draft.set(content);
+                        store.action_error.set(Some(err));
+                    }
                 }
             }
         });
@@ -454,16 +488,31 @@ impl Store {
     }
 
     pub fn reload_transcript(self) {
-        let Some(session_id) = self.selected_session.get() else {
+        let Some(agent_id) = self.selected_agent.get() else {
             self.action_error
-                .set(Some("Select a session to reload.".to_owned()));
+                .set(Some("Choose a bot to reload.".to_owned()));
             return;
         };
         self.action_error.set(None);
         let store = self;
-        go(async move {
-            store.load_transcript(session_id).await;
-        });
+        if let Some(session_id) = self.selected_session.get() {
+            go(async move {
+                store.load_transcript(session_id).await;
+            });
+        } else {
+            let generation = self.open_generation.get();
+            go(async move {
+                store.resume_bot(agent_id, generation).await;
+            });
+        }
+    }
+
+    pub fn preview(self, agent_id: &str) -> String {
+        self.previews.with(|map| {
+            map.get(agent_id)
+                .cloned()
+                .unwrap_or_else(|| "No messages yet".to_owned())
+        })
     }
 
     pub fn streaming(self) -> bool {
@@ -478,17 +527,6 @@ impl Store {
                 .as_ref()
                 .and_then(|id| list.iter().find(|agent| &agent.id == id))
                 .map(|agent| agent.name.clone())
-                .unwrap_or_default()
-        })
-    }
-
-    pub fn selected_session_label(self) -> String {
-        let selected = self.selected_session.get();
-        self.sessions.with(|list| {
-            selected
-                .as_ref()
-                .and_then(|id| list.iter().find(|session| &session.id == id))
-                .map(Session::label)
                 .unwrap_or_default()
         })
     }
@@ -522,16 +560,110 @@ impl Store {
         }
     }
 
-    async fn load_sessions(self, agent_id: String) {
-        match client::list_sessions(&self.server_url.get(), &agent_id).await {
+    fn still_opening(self, agent_id: &str, generation: u64) -> bool {
+        self.selected_agent.get().as_deref() == Some(agent_id)
+            && self.open_generation.get() == generation
+    }
+
+    /// Resume this bot's newest server session. Create one only when it has none.
+    async fn resume_bot(self, agent_id: String, generation: u64) {
+        let lock = self.resume_lock.with(|lock| Arc::clone(lock));
+        let _guard = lock.lock().await;
+        if !self.still_opening(&agent_id, generation) {
+            return;
+        }
+        let url = self.server_url.get();
+        let mut sessions = match client::list_sessions(&url, &agent_id).await {
             Ok(mut sessions) => {
-                if self.selected_agent.get().as_deref() == Some(agent_id.as_str()) {
-                    sort_sessions_newest_first(&mut sessions);
-                    self.sessions.set(sessions);
+                sort_sessions_newest_first(&mut sessions);
+                sessions
+            }
+            Err(err) => {
+                if self.still_opening(&agent_id, generation) {
+                    self.action_error.set(Some(err));
+                }
+                return;
+            }
+        };
+        if !self.still_opening(&agent_id, generation) {
+            return;
+        }
+        let session = if let Some(latest) = sessions.first().cloned() {
+            latest
+        } else {
+            let title = self.selected_agent_name();
+            let title = if title.trim().is_empty() {
+                "Chat".to_owned()
+            } else {
+                title
+            };
+            match client::create_session(&url, &agent_id, &title).await {
+                Ok(session) => session,
+                Err(err) => {
+                    if self.still_opening(&agent_id, generation) {
+                        self.action_error.set(Some(err));
+                    }
+                    return;
                 }
             }
-            Err(err) => self.action_error.set(Some(err)),
+        };
+        if !self.still_opening(&agent_id, generation) {
+            return;
         }
+        if !sessions.iter().any(|item| item.id == session.id) {
+            sessions.insert(0, session.clone());
+        }
+        self.sessions.set(sessions);
+        let session_id = session.id.clone();
+        self.selected_session.set(Some(session_id.clone()));
+        self.subscribe(&session_id);
+        self.load_transcript(session_id).await;
+    }
+
+    async fn load_previews(self) {
+        let agents = self.agents.get();
+        for agent in agents {
+            if self.selected_agent.get().as_deref() == Some(agent.id.as_str())
+                && self.messages.with(|list| !list.is_empty())
+            {
+                self.remember_preview();
+                continue;
+            }
+            let url = self.server_url.get();
+            let summary = match client::list_sessions(&url, &agent.id).await {
+                Ok(mut sessions) => {
+                    sort_sessions_newest_first(&mut sessions);
+                    if let Some(session) = sessions.first() {
+                        match client::list_messages(&url, &session.id).await {
+                            Ok(messages) => transcript_summary(&messages),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        "No messages yet".to_owned()
+                    }
+                }
+                Err(_) => continue,
+            };
+            if self.selected_agent.get().as_deref() == Some(agent.id.as_str())
+                && self.messages.with(|list| !list.is_empty())
+            {
+                continue;
+            }
+            let id = agent.id.clone();
+            self.previews.update(|map| {
+                map.insert(id, summary);
+            });
+        }
+    }
+
+    fn remember_preview(self) {
+        let Some(agent_id) = self.selected_agent.get() else {
+            return;
+        };
+        let summary = self.messages.with(|list| transcript_summary(list));
+        self.previews.update(|map| {
+            map.insert(agent_id, summary);
+        });
     }
 
     async fn load_transcript(self, session_id: String) {
@@ -543,6 +675,7 @@ impl Store {
         if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
             return;
         }
+        let loaded = messages.is_ok();
         match messages {
             Ok(messages) if self.transcript_epoch.get() == epoch => self.messages.set(messages),
             Ok(_) => {}
@@ -553,6 +686,9 @@ impl Store {
         }
         if let Ok(tasks) = tasks {
             self.tasks.set(tasks);
+        }
+        if loaded {
+            self.remember_preview();
         }
     }
 
@@ -684,6 +820,7 @@ impl Store {
                 });
             }
         });
+        self.remember_preview();
     }
 
     fn set_status(self, session_id: &str, message_id: &str, status: &str, error: Option<String>) {
@@ -718,6 +855,7 @@ impl Store {
                 list.push(message);
             }
         });
+        self.remember_preview();
     }
 
     fn upsert_agent(self, agent: Agent) {

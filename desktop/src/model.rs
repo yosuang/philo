@@ -55,6 +55,8 @@ pub struct Session {
 }
 
 impl Session {
+    /// Server title. The sidebar does not show it.
+    #[allow(dead_code)]
     pub fn label(&self) -> String {
         let title = self.title.trim();
         if title.is_empty() {
@@ -428,6 +430,34 @@ pub fn sort_messages(messages: &mut [Message]) {
     }
 }
 
+/// One line from the newest message, short enough for a bot row.
+pub fn message_summary(content: &str) -> String {
+    let line = content
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let flat = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flat.chars();
+    let summary: String = chars.by_ref().take(72).collect();
+    if chars.next().is_some() {
+        format!("{summary}…")
+    } else if summary.is_empty() {
+        "No messages yet".to_owned()
+    } else {
+        summary
+    }
+}
+
+pub fn transcript_summary(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| !message.content.trim().is_empty())
+        .map(|message| message_summary(&message.content))
+        .unwrap_or_else(|| "No messages yet".to_owned())
+}
+
 pub fn sort_sessions_newest_first(sessions: &mut [Session]) {
     if sessions
         .iter()
@@ -491,6 +521,15 @@ mod tests {
             "wss://philo.example/v1/events"
         );
         assert!(events_url("ftp://nope").is_err());
+    }
+
+    #[test]
+    fn message_summary_uses_the_last_line() {
+        let summary = message_summary(
+            "[philo dev adapter] Deterministic local reply. This is not a live model.\nReceived: Hello from Philo",
+        );
+        assert_eq!(summary, "Received: Hello from Philo");
+        assert_eq!(message_summary("   "), "No messages yet");
     }
 
     #[test]

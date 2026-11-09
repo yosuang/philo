@@ -33,7 +33,6 @@ fn sidebar(store: Store) -> impl IntoElement {
         .child(sidebar_tools(store))
         .child(brand())
         .child(agent_pane(store))
-        .child(session_pane(store))
         .child(sidebar_footer(store))
 }
 
@@ -82,7 +81,7 @@ fn main_column(store: Store) -> impl IntoElement {
             store,
             Route::ToolCalls,
             "Tool calls",
-            "Tool-call transcripts are not available yet. The one action this version runs is the approval-backed draft, on the session.",
+            "Tool-call transcripts are not available yet. The one action this version runs is the approval-backed draft, in the bot's chat.",
         ))
 }
 
@@ -102,7 +101,7 @@ fn sidebar_tools(store: Store) -> impl IntoElement {
             move || store.not_available("Search"),
         ))
         .child(ui::round_button(
-            "New agent",
+            "New bot",
             "+",
             false,
             move || !store.sending.get(),
@@ -185,59 +184,23 @@ fn sidebar_footer(store: Store) -> impl IntoElement {
         ))
 }
 
-fn label_row(label: &'static str) -> impl IntoElement {
-    view().px_4().pt_3().pb_1().child(ui::section_label(label))
-}
-
 fn agent_pane(store: Store) -> impl IntoElement {
     let agents = store.agents;
     view()
-        .min_h(px(44.0))
+        .flex_1()
+        .min_h(px(0.0))
         .px_2()
         .child(when(
             move || agents.with(Vec::is_empty),
             move || {
                 view().px_2().py_2().child(if_error_or(
                     store,
-                    "No agents yet. Create one to start a session.",
-                    "Agents will show here once the server responds.",
+                    "No bots yet. Create one to start a chat.",
+                    "Bots will show here once the server responds.",
                 ))
             },
         ))
         .child(agent_list(store, agents))
-}
-
-fn session_pane(store: Store) -> impl IntoElement {
-    let sessions = store.sessions;
-    view()
-        .flex_1()
-        .min_h(px(64.0))
-        .px_2()
-        .child(label_row("Sessions"))
-        .child(view().px_2().pb_1().child(ui::secondary_button(
-            "New session",
-            move || store.selected_agent.get().is_some() && !store.sending.get(),
-            move || store.create_session(),
-        )))
-        .child(when(
-            move || store.selected_agent.get().is_none() || sessions.with(Vec::is_empty),
-            move || {
-                view().px_2().py_2().child(
-                    text(move || {
-                        if store.selected_agent.get().is_none() {
-                            "Select an agent to see its sessions.".to_owned()
-                        } else if store.server_error.get().is_some() {
-                            "Sessions will show here once the server responds.".to_owned()
-                        } else {
-                            "No sessions yet.".to_owned()
-                        }
-                    })
-                    .text_size(px(12.0))
-                    .text_color(move || theme().muted_foreground),
-                )
-            },
-        ))
-        .child(session_list(store, sessions))
 }
 
 fn agent_list(store: Store, agents: Signal<Vec<Agent>>) -> impl IntoElement {
@@ -299,18 +262,12 @@ fn agent_list(store: Store, agents: Signal<Vec<Agent>>) -> impl IntoElement {
                             text(move || {
                                 agents.with(|list| {
                                     list.get(at.index())
-                                        .map(|agent| {
-                                            if agent.model_id.is_empty() {
-                                                "Agent".to_owned()
-                                            } else {
-                                                agent.model_id.clone()
-                                            }
-                                        })
-                                        .unwrap_or_default()
+                                        .map(|agent| store.preview(&agent.id))
+                                        .unwrap_or_else(|| "No messages yet".to_owned())
                                 })
                             })
                             .number_of_lines(1)
-                            .text_size(px(11.0))
+                            .text_size(px(12.0))
                             .text_color(move || theme().muted_foreground),
                         ),
                 )
@@ -320,63 +277,6 @@ fn agent_list(store: Store, agents: Signal<Vec<Agent>>) -> impl IntoElement {
         agents.with(|list| {
             list.iter()
                 .map(|agent| agent.id.clone())
-                .collect::<Vec<_>>()
-        })
-    })
-    .estimated_item_size(px(40.0))
-    .row_gap(px(4.0))
-    .flex_1()
-}
-
-fn session_list(store: Store, sessions: Signal<Vec<crate::model::Session>>) -> impl IntoElement {
-    virtual_list(
-        move || sessions.with(Vec::len),
-        move |at| {
-            button()
-                .w_full()
-                .flex_row()
-                .items_center()
-                .px_3()
-                .py_2()
-                .rounded(px(8.0))
-                .bg(move || {
-                    let selected = store.selected_session.get();
-                    let mine = sessions.with(|list| {
-                        list.get(at.index())
-                            .is_some_and(|session| Some(&session.id) == selected.as_ref())
-                    });
-                    if mine {
-                        theme().sidebar_accent
-                    } else {
-                        theme().sidebar
-                    }
-                })
-                .hover(|style| style.bg(move || theme().sidebar_accent))
-                .on_press(move || {
-                    if let Some(id) =
-                        sessions.with(|list| list.get(at.index()).map(|session| session.id.clone()))
-                    {
-                        store.select_session(id);
-                    }
-                })
-                .child(
-                    text(move || {
-                        sessions.with(|list| {
-                            list.get(at.index())
-                                .map(|session| session.label())
-                                .unwrap_or_default()
-                        })
-                    })
-                    .number_of_lines(1)
-                    .text_size(px(14.0))
-                    .text_color(move || theme().sidebar_foreground),
-                )
-        },
-    )
-    .keys(move || {
-        sessions.with(|list| {
-            list.iter()
-                .map(|session| session.id.clone())
                 .collect::<Vec<_>>()
         })
     })
@@ -509,14 +409,14 @@ fn library_pane() -> impl IntoElement {
 fn activity_pane(store: Store) -> impl IntoElement {
     view()
         .gap_3()
-        .child(ui::section_label("Session"))
+        .child(ui::section_label("Chat"))
         .child(
             ui::card()
                 .child(
                     text(move || {
                         let name = store.selected_agent_name();
                         if name.is_empty() {
-                            "No agent".to_owned()
+                            "No bot".to_owned()
                         } else {
                             name
                         }
@@ -526,33 +426,34 @@ fn activity_pane(store: Store) -> impl IntoElement {
                 )
                 .child(
                     text(move || {
-                        let label = store.selected_session_label();
-                        if label.is_empty() {
-                            "No session yet".to_owned()
+                        if store.selected_agent.get().is_none() {
+                            "No bot selected".to_owned()
                         } else if store.streaming() {
-                            format!("{label} · streaming")
+                            "Streaming a reply".to_owned()
+                        } else if store.messages.with(|list| list.is_empty()) {
+                            "No messages yet".to_owned()
                         } else {
-                            format!("{label} · idle")
+                            "Idle".to_owned()
                         }
                     })
                     .text_size(px(12.0))
                     .number_of_lines(2)
                     .text_color(move || theme().muted_foreground),
                 )
-                .child(ui::muted("Live session state, not a review status.")),
+                .child(ui::muted("Live chat state, not a review status.")),
         )
         .child(
             view()
                 .flex_row()
                 .gap_2()
                 .child(ui::secondary_button(
-                    "Configure agent",
+                    "Configure bot",
                     move || store.selected_agent.get().is_some(),
                     move || store.open_edit_agent(),
                 ))
                 .child(ui::secondary_button(
                     "Reload",
-                    move || store.selected_session.get().is_some(),
+                    move || store.selected_agent.get().is_some(),
                     move || store.reload_transcript(),
                 )),
         )

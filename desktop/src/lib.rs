@@ -1,5 +1,5 @@
-//! Philo desktop client. The window is Native Shell; sessions live on the
-//! Go server.
+//! Philo desktop client. The window is Native Shell. A bot's chat is restored
+//! from the Go server; the user does not pick a session.
 
 mod client;
 mod model;
@@ -45,12 +45,9 @@ fn install_menu(store: Store) {
             MenuItem::submenu(
                 "File",
                 [
-                    MenuItem::new("New agent")
+                    MenuItem::new("New bot")
                         .shortcut("mod+n")
                         .on_select(move || store.open_new_agent()),
-                    MenuItem::new("New session")
-                        .shortcut("mod+shift+n")
-                        .on_select(move || store.create_session()),
                     MenuItem::separator(),
                     MenuItem::new("Settings").on_select(move || store.show(Route::Settings)),
                     MenuItem::separator(),

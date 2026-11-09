@@ -38,13 +38,15 @@ nsh run --window-size 1024x748
 
 `nsh run` builds NSH's runner for this machine. `cargo run` uses `src/main.rs`.
 
-The window opens as two columns. Details, in the chat header, opens the third column and closes it again. That column holds the live session state, Makez, and the pages that are not available yet. Search and voice are controls only; each one says it is not available.
+The window opens as two columns. The sidebar lists bots. Choosing a bot opens that bot's chat and restores its messages. Creating a bot lands in its chat. There is no session list and no step that asks for a session before a message can be sent. A session stays a server record: the client resumes the newest one for that bot, or creates one the first time.
+
+Details, in the chat header, opens the third column and closes it again. That column holds the live chat state, Makez, and the pages that are not available yet. Search and voice are controls only; each one says it is not available.
 
 Settings shows the server URL. The default is `http://127.0.0.1:8080`. Saving it reconnects the event socket at `ws://127.0.0.1:8080/v1/events`.
 
 ## What the window does
 
-With the dev adapter, the banner says this is not a live model. Create an agent (name, instructions, model id), start a session, and send a message. The assistant reply streams over the WebSocket. Reload reads `GET /v1/sessions/{id}/messages` again. Cancel posts `POST /v1/sessions/{id}/cancel`. Retry appears only after an assistant message is `error` or `canceled`.
+With the dev adapter, the banner says this is not a live model. Create a bot (name, instructions, model id) and send a message. The assistant reply streams over the WebSocket. Switching bots restores each transcript. Reload reads that bot's messages again. Cancel posts `POST /v1/sessions/{id}/cancel` on the resumed server session. Retry appears only after an assistant message is `error` or `canceled`.
 
 A message that starts with `/draft ` asks the dev adapter for one pending approval. Approve and Reject post `POST /v1/approvals/{id}/decision`. Approve is what lets the server complete a `philo-server` task. Reject does not.
 

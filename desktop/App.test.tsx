@@ -6,6 +6,8 @@ test("shows the desktop shell", async () => {
   const text = () => app.texts().join("\n");
   expect(text()).toContain("Philo");
   expect(text()).toContain("Your agent, your friend.");
+  expect(text()).not.toContain("New session");
+  expect(text()).not.toContain("Sessions");
 
   await app.press("Details");
   await app.press("Settings");

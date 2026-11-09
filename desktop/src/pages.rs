@@ -34,9 +34,9 @@ pub fn agent_form(store: Store) -> impl IntoElement {
         .child(
             text(move || {
                 if store.editing_agent.get().is_some() {
-                    "Configure agent".to_owned()
+                    "Configure bot".to_owned()
                 } else {
-                    "New agent".to_owned()
+                    "New bot".to_owned()
                 }
             })
             .text_size(px(22.0))
@@ -55,7 +55,7 @@ pub fn agent_form(store: Store) -> impl IntoElement {
         )
         .child(ui::section_label("Instructions"))
         .child(
-            ui::field("What this agent is for")
+            ui::field("What this bot is for")
                 .value(move || store.form_instructions.get())
                 .on_change(move |text: &str| store.form_instructions.set(text.to_owned()))
                 .multiline(true)
@@ -74,7 +74,7 @@ pub fn agent_form(store: Store) -> impl IntoElement {
                 .gap_2()
                 .pt_2()
                 .child(ui::primary_button(
-                    "Save agent",
+                    "Save bot",
                     move || !store.sending.get(),
                     move || store.save_agent(),
                 ))
@@ -257,9 +257,7 @@ fn empty_transcript(store: Store) -> impl IntoElement {
         .child(
             text(move || {
                 if store.selected_agent.get().is_none() {
-                    "No agent selected".to_owned()
-                } else if store.selected_session.get().is_none() {
-                    "No session yet".to_owned()
+                    "No bot selected".to_owned()
                 } else {
                     "No messages yet".to_owned()
                 }
@@ -270,14 +268,11 @@ fn empty_transcript(store: Store) -> impl IntoElement {
         .child(
             text(move || {
                 if store.selected_agent.get().is_none() {
-                    "Create an agent in the sidebar. Nothing here is a sample.".to_owned()
-                } else if store.selected_session.get().is_none() {
-                    "Start a session for this agent, then send a message.".to_owned()
+                    "Create a bot in the sidebar. Nothing here is a sample.".to_owned()
                 } else if let Some(err) = store.server_error.get().or(store.action_error.get()) {
                     err
                 } else {
-                    "The transcript is loaded from the server. A reload shows the saved messages."
-                        .to_owned()
+                    "Send a message. The chat is saved on the server.".to_owned()
                 }
             })
             .text_size(px(13.0))
@@ -636,7 +631,7 @@ fn composer(store: Store) -> impl IntoElement {
                     move || {
                         !store.sending.get()
                             && !store.streaming()
-                            && store.selected_session.get().is_some()
+                            && store.selected_agent.get().is_some()
                             && !store.draft.get().trim().is_empty()
                     },
                     move || store.send(),
