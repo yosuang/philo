@@ -29,14 +29,16 @@ From this directory:
 cargo run
 ```
 
-That opens a GTK, AppKit, or Win32 window at 1280×800. The same root:
+That opens a GTK, AppKit, or Win32 window at 1024×748. The same root:
 
 ```bash
 nsh run
-nsh run --window-size 1280x800
+nsh run --window-size 1024x748
 ```
 
 `nsh run` builds NSH's runner for this machine. `cargo run` uses `src/main.rs`.
+
+The window opens as two columns. Details, in the chat header, opens the third column and closes it again. That column holds the live session state, Makez, and the pages that are not available yet. Search and voice are controls only; each one says it is not available.
 
 Settings shows the server URL. The default is `http://127.0.0.1:8080`. Saving it reconnects the event socket at `ws://127.0.0.1:8080/v1/events`.
 

@@ -187,61 +187,52 @@ pub fn unavailable(
 
 fn chat_header(store: Store) -> impl IntoElement {
     view()
-        .px_4()
-        .py_3()
-        .gap_2()
-        .border_b_1()
-        .border_color(move || theme().border)
+        .h(px(52.0))
+        .flex_row()
+        .items_center()
+        .px_3()
+        .child(view().flex_1().min_w(px(0.0)))
         .child(
-            text(move || {
-                let name = store.selected_agent_name();
-                if name.is_empty() {
-                    "No agent selected".to_owned()
-                } else {
-                    name
-                }
-            })
-            .text_size(px(18.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .number_of_lines(1),
-        )
-        .child(
-            text(move || {
-                let label = store.selected_session_label();
-                if label.is_empty() {
-                    "No session".to_owned()
-                } else {
-                    label
-                }
-            })
-            .text_size(px(13.0))
-            .text_color(move || theme().muted_foreground)
-            .number_of_lines(1),
+            view()
+                .max_w(px(280.0))
+                .px_3()
+                .py_1()
+                .rounded(px(16.0))
+                .bg(move || theme().muted)
+                .child(
+                    text(move || {
+                        let name = store.selected_agent_name();
+                        if name.is_empty() {
+                            "Philo".to_owned()
+                        } else {
+                            name
+                        }
+                    })
+                    .text_size(px(14.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .number_of_lines(1),
+                ),
         )
         .child(
             view()
+                .flex_1()
+                .min_w(px(0.0))
                 .flex_row()
+                .justify_end()
+                .items_center()
                 .gap_2()
-                .child(ui::secondary_button(
-                    "New session",
-                    move || store.selected_agent.get().is_some() && !store.sending.get(),
-                    move || store.create_session(),
-                ))
-                .child(ui::secondary_button(
-                    "Configure agent",
-                    move || store.selected_agent.get().is_some(),
-                    move || store.open_edit_agent(),
-                ))
-                .child(ui::secondary_button(
-                    "Reload",
-                    move || store.selected_session.get().is_some(),
-                    move || store.reload_transcript(),
-                ))
                 .child(when(
                     move || store.streaming(),
                     move || {
                         ui::secondary_button("Cancel reply", || true, move || store.cancel_reply())
                     },
+                ))
+                .child(ui::round_button(
+                    "Details",
+                    "▣",
+                    false,
+                    || true,
+                    move || store.toggle_details(),
                 )),
         )
 }
@@ -331,7 +322,7 @@ fn user_bubble(messages: Signal<Vec<Message>>, at: Position) -> impl IntoElement
             .max_w(relative(0.78))
             .px_3()
             .py_2()
-            .rounded(px(16.0))
+            .rounded(px(22.0))
             .bg(move || theme().primary)
             .child(
                 text(move || {
@@ -356,7 +347,7 @@ fn assistant_bubble(
             .gap_1()
             .px_3()
             .py_2()
-            .rounded(px(16.0))
+            .rounded(px(22.0))
             .bg(move || theme().muted)
             .child(
                 text(move || {
@@ -589,10 +580,9 @@ fn composer(store: Store) -> impl IntoElement {
     };
     view()
         .px_4()
-        .py_3()
+        .pb_4()
+        .pt_2()
         .gap_2()
-        .border_t_1()
-        .border_color(move || theme().border)
         .bg(move || theme().background)
         .child(when(dev, || {
             ui::muted(
@@ -602,10 +592,24 @@ fn composer(store: Store) -> impl IntoElement {
         .child(
             view()
                 .flex_row()
-                .items_end()
+                .items_center()
                 .gap_2()
+                .px_2()
+                .py_1()
+                .rounded(px(24.0))
+                .bg(move || theme().card)
+                .border_1()
+                .border_color(move || theme().border)
+                .child(ui::round_button(
+                    "Attach",
+                    "+",
+                    false,
+                    || true,
+                    move || store.show(Route::Attachments),
+                ))
                 .child(
-                    ui::field("Message")
+                    nsh_base::input()
+                        .placeholder("Message")
                         .value(move || store.draft.get())
                         .on_change(move |text: &str| store.draft.set(text.to_owned()))
                         .on_submit(move |_: &str| store.send())
@@ -613,11 +617,22 @@ fn composer(store: Store) -> impl IntoElement {
                         .submit_behavior(SubmitBehavior::Submit)
                         .return_key_type(ReturnKeyType::Send)
                         .flex_1()
-                        .max_h(px(120.0))
+                        .max_h(px(96.0))
+                        .border(px(0.0))
+                        .bg(move || theme().card)
                         .test_id("composer"),
                 )
-                .child(ui::primary_button(
+                .child(ui::round_button(
+                    "Voice",
+                    "♪",
+                    false,
+                    || true,
+                    move || store.not_available("Voice chat"),
+                ))
+                .child(ui::round_button(
                     "Send",
+                    "↑",
+                    true,
                     move || {
                         !store.sending.get()
                             && !store.streaming()

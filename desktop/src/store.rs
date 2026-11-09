@@ -95,6 +95,10 @@ pub struct Store {
     pub appearance: Signal<AppearanceChoice>,
     pub sending: Signal<bool>,
     pub socket_label: Signal<String>,
+    /// The third column. Closed matches the two-column chat layout.
+    pub details_open: Signal<bool>,
+    /// Library tab of the details column. Activity is the other tab.
+    pub library_tab: Signal<bool>,
     ws_generation: Signal<u64>,
     transcript_epoch: Signal<u64>,
     ws_out: Stored<Option<UnboundedSender<WsCmd>>>,
@@ -131,6 +135,8 @@ impl Store {
             appearance: signal(AppearanceChoice::System),
             sending: signal(false),
             socket_label: signal("Events: connecting".to_owned()),
+            details_open: signal(false),
+            library_tab: signal(false),
             ws_generation: signal(0),
             transcript_epoch: signal(0),
             ws_out: stored(None),
@@ -160,6 +166,25 @@ impl Store {
             self.server_draft.set(self.server_url.get());
         }
         self.route.set(route);
+    }
+
+    pub fn toggle_details(self) {
+        self.details_open.update(|open| *open = !*open);
+    }
+
+    pub fn set_details(self, open: bool) {
+        self.details_open.set(open);
+    }
+
+    pub fn show_library(self, library: bool) {
+        self.library_tab.set(library);
+        self.details_open.set(true);
+    }
+
+    /// A control that looks available in the reference, but is not connected.
+    pub fn not_available(self, feature: &'static str) {
+        self.action_error
+            .set(Some(format!("{feature} is not available yet.")));
     }
 
     pub fn set_appearance(self, choice: AppearanceChoice) {

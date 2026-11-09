@@ -27,8 +27,8 @@ pub fn App() -> impl IntoElement {
     let store = Store::boot();
     set_title("Philo");
     set_frame(WindowFrame {
-        width: Some(px(1280.0)),
-        height: Some(px(800.0)),
+        width: Some(px(1024.0)),
+        height: Some(px(748.0)),
         ..WindowFrame::default()
     });
     install_menu(store);

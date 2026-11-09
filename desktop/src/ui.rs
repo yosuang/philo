@@ -100,6 +100,50 @@ pub fn secondary_button(
         )
 }
 
+pub fn round_button(
+    label: &'static str,
+    glyph: &'static str,
+    filled: bool,
+    enabled: impl Fn() -> bool + 'static,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    button()
+        .accessibility_label(label)
+        .w(px(34.0))
+        .h(px(34.0))
+        .rounded(px(17.0))
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .bg(move || {
+            if filled {
+                theme().primary
+            } else {
+                theme().card
+            }
+        })
+        .border_1()
+        .border_color(move || {
+            if filled {
+                theme().primary
+            } else {
+                theme().border
+            }
+        })
+        .hover(|style| style.opacity(0.9))
+        .active(|style| style.opacity(0.8))
+        .disabled(move || !enabled())
+        .disabled_style(|style| style.opacity(0.4))
+        .on_press(on_press)
+        .child(text(glyph).text_size(px(16.0)).text_color(move || {
+            if filled {
+                theme().primary_foreground
+            } else {
+                theme().foreground
+            }
+        }))
+}
+
 pub fn card() -> View {
     view()
         .p_3()

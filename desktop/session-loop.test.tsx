@@ -5,7 +5,7 @@ import { expect, open, test } from "nsh/test";
 const pause = () => new Promise((resolve) => setTimeout(resolve, 1200));
 
 test("session loop against the dev adapter", async () => {
-  const app = await open(".", { network: "live", width: 1280, height: 900, platform: "linux" });
+  const app = await open(".", { network: "live", width: 1024, height: 748, platform: "linux" });
   await app.waitFor("Your agent, your friend. Always on for you.");
   await pause();
 
@@ -26,6 +26,9 @@ test("session loop against the dev adapter", async () => {
     { timeout: 15000 },
   );
   await pause();
+  await app.press("Details");
+  await pause();
+  await app.press("Close details");
 
   await app.type("Message", "/draft Ship the note");
   await app.press("Send");
@@ -35,6 +38,7 @@ test("session loop against the dev adapter", async () => {
   await app.waitFor("Status: completed", { timeout: 15000 });
   await pause();
 
+  await app.press("Details");
   await app.press("Connectors");
   await app.waitFor("PHILO_MAKEZ_URL is not set", { timeout: 15000 });
   await pause();

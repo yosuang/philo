@@ -1,5 +1,5 @@
-//! Sidebar and the main column. Navigation is real; unfinished destinations
-//! say so on their page and in the sidebar.
+//! Two columns by default. The details column opens on the right.
+//! Unfinished destinations stay in that column and say they are not available.
 
 use nsh_base::{button, theme};
 use nsh_core::prelude::*;
@@ -14,29 +14,27 @@ pub fn shell(store: Store) -> impl IntoElement {
         .flex_1()
         .flex_row()
         .items_stretch()
+        .overflow_hidden()
+        .bg(move || theme().background)
         .child(sidebar(store))
         .child(main_column(store))
+        .child(details(store))
 }
 
 fn sidebar(store: Store) -> impl IntoElement {
     view()
-        .w(px(288.0))
+        .w(px(248.0))
         .flex_shrink_0()
         .h_full()
+        .overflow_hidden()
         .bg(move || theme().sidebar)
         .border_r_1()
         .border_color(move || theme().sidebar_border)
+        .child(sidebar_tools(store))
         .child(brand())
-        .child(label_row("Agents"))
-        .child(view().px_3().pb_2().child(ui::secondary_button(
-            "New agent",
-            move || !store.sending.get(),
-            move || store.open_new_agent(),
-        )))
         .child(agent_pane(store))
-        .child(label_row("Sessions"))
         .child(session_pane(store))
-        .child(nav(store))
+        .child(sidebar_footer(store))
 }
 
 fn main_column(store: Store) -> impl IntoElement {
@@ -88,25 +86,103 @@ fn main_column(store: Store) -> impl IntoElement {
         ))
 }
 
+fn sidebar_tools(store: Store) -> impl IntoElement {
+    view()
+        .flex_row()
+        .justify_end()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .pt_3()
+        .child(ui::round_button(
+            "Search",
+            "⌕",
+            false,
+            || true,
+            move || store.not_available("Search"),
+        ))
+        .child(ui::round_button(
+            "New agent",
+            "+",
+            false,
+            move || !store.sending.get(),
+            move || store.open_new_agent(),
+        ))
+}
+
 fn brand() -> impl IntoElement {
     view()
-        .px_4()
-        .pt_4()
-        .pb_3()
+        .items_center()
+        .px_3()
+        .pt_3()
+        .pb_2()
         .gap_1()
-        .border_b_1()
-        .border_color(move || theme().sidebar_border)
+        .child(
+            view()
+                .w(px(52.0))
+                .h(px(52.0))
+                .rounded(px(26.0))
+                .items_center()
+                .justify_center()
+                .bg(move || theme().primary)
+                .child(
+                    text("P")
+                        .text_size(px(22.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(move || theme().primary_foreground),
+                ),
+        )
         .child(
             text("Philo")
-                .text_size(px(22.0))
+                .text_size(px(15.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(move || theme().sidebar_foreground),
         )
         .child(
             text("Your agent, your friend. Always on for you.")
-                .text_size(px(12.0))
+                .text_size(px(11.0))
                 .text_color(move || theme().muted_foreground),
         )
+}
+
+fn sidebar_footer(store: Store) -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_3()
+        .border_t_1()
+        .border_color(move || theme().sidebar_border)
+        .child(
+            view()
+                .w(px(28.0))
+                .h(px(28.0))
+                .rounded(px(14.0))
+                .items_center()
+                .justify_center()
+                .bg(move || theme().sidebar_accent)
+                .child(
+                    text("P")
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(move || theme().sidebar_foreground),
+                ),
+        )
+        .child(
+            text("Philo")
+                .flex_1()
+                .number_of_lines(1)
+                .text_size(px(13.0))
+                .text_color(move || theme().sidebar_foreground),
+        )
+        .child(ui::round_button(
+            "More",
+            "▣",
+            false,
+            || true,
+            move || store.toggle_details(),
+        ))
 }
 
 fn label_row(label: &'static str) -> impl IntoElement {
@@ -116,8 +192,7 @@ fn label_row(label: &'static str) -> impl IntoElement {
 fn agent_pane(store: Store) -> impl IntoElement {
     let agents = store.agents;
     view()
-        .flex_1()
-        .min_h(px(72.0))
+        .min_h(px(44.0))
         .px_2()
         .child(when(
             move || agents.with(Vec::is_empty),
@@ -136,8 +211,14 @@ fn session_pane(store: Store) -> impl IntoElement {
     let sessions = store.sessions;
     view()
         .flex_1()
-        .min_h(px(72.0))
+        .min_h(px(64.0))
         .px_2()
+        .child(label_row("Sessions"))
+        .child(view().px_2().pb_1().child(ui::secondary_button(
+            "New session",
+            move || store.selected_agent.get().is_some() && !store.sending.get(),
+            move || store.create_session(),
+        )))
         .child(when(
             move || store.selected_agent.get().is_none() || sessions.with(Vec::is_empty),
             move || {
@@ -167,6 +248,7 @@ fn agent_list(store: Store, agents: Signal<Vec<Agent>>) -> impl IntoElement {
                 .w_full()
                 .flex_row()
                 .items_center()
+                .gap_2()
                 .px_3()
                 .py_2()
                 .rounded(px(8.0))
@@ -190,17 +272,47 @@ fn agent_list(store: Store, agents: Signal<Vec<Agent>>) -> impl IntoElement {
                         store.select_agent(id);
                     }
                 })
-                .child(
-                    text(move || {
-                        agents.with(|list| {
-                            list.get(at.index())
-                                .map(|agent| agent.name.clone())
-                                .unwrap_or_default()
-                        })
+                .child(initial_mark(move || {
+                    agents.with(|list| {
+                        list.get(at.index())
+                            .and_then(|agent| agent.name.chars().next())
+                            .unwrap_or('P')
                     })
-                    .number_of_lines(1)
-                    .text_size(px(14.0))
-                    .text_color(move || theme().sidebar_foreground),
+                }))
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            text(move || {
+                                agents.with(|list| {
+                                    list.get(at.index())
+                                        .map(|agent| agent.name.clone())
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .number_of_lines(1)
+                            .text_size(px(14.0))
+                            .text_color(move || theme().sidebar_foreground),
+                        )
+                        .child(
+                            text(move || {
+                                agents.with(|list| {
+                                    list.get(at.index())
+                                        .map(|agent| {
+                                            if agent.model_id.is_empty() {
+                                                "Agent".to_owned()
+                                            } else {
+                                                agent.model_id.clone()
+                                            }
+                                        })
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .number_of_lines(1)
+                            .text_size(px(11.0))
+                            .text_color(move || theme().muted_foreground),
+                        ),
                 )
         },
     )
@@ -273,41 +385,254 @@ fn session_list(store: Store, sessions: Signal<Vec<crate::model::Session>>) -> i
     .flex_1()
 }
 
-fn nav(store: Store) -> impl IntoElement {
+fn details(store: Store) -> impl IntoElement {
     view()
+        .w(px(268.0))
+        .flex_shrink_0()
+        .h_full()
+        .overflow_hidden()
+        .bg(move || theme().background)
+        .border_l_1()
+        .border_color(move || theme().border)
+        .style_when(move || !store.details_open.get(), |style| style.hidden())
+        .child(details_bar(store))
+        .child(
+            scroll().flex_1().min_h(px(0.0)).child(
+                view()
+                    .px_3()
+                    .pb_4()
+                    .gap_3()
+                    .child(details_identity(store))
+                    .child(details_tabs(store))
+                    .child(
+                        when(move || store.library_tab.get(), move || library_pane())
+                            .otherwise(move || activity_pane(store)),
+                    ),
+            ),
+        )
+}
+
+fn details_bar(store: Store) -> impl IntoElement {
+    view()
+        .flex_row()
+        .justify_end()
         .px_2()
-        .py_2()
-        .gap_1()
-        .border_t_1()
-        .border_color(move || theme().sidebar_border)
-        .child(nav_button(store, Route::Chat, "Chat", false))
-        .child(nav_button(store, Route::Settings, "Settings", false))
-        .child(nav_button(store, Route::Connectors, "Connectors", false))
-        .child(nav_button(store, Route::Attachments, "Attachments", true))
+        .pt_2()
+        .child(ui::round_button(
+            "Close details",
+            "×",
+            false,
+            || true,
+            move || store.set_details(false),
+        ))
+}
+
+fn details_identity(store: Store) -> impl IntoElement {
+    view()
+        .items_center()
+        .gap_2()
+        .pt_1()
+        .child(
+            view()
+                .w(px(64.0))
+                .h(px(64.0))
+                .rounded(px(32.0))
+                .items_center()
+                .justify_center()
+                .bg(move || theme().primary)
+                .child(
+                    text(move || {
+                        let name = store.selected_agent_name();
+                        name.chars()
+                            .next()
+                            .map(|ch| ch.to_string())
+                            .unwrap_or_else(|| "P".to_owned())
+                    })
+                    .text_size(px(26.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(move || theme().primary_foreground),
+                ),
+        )
+        .child(
+            text(move || {
+                let name = store.selected_agent_name();
+                if name.is_empty() {
+                    "Philo".to_owned()
+                } else {
+                    name
+                }
+            })
+            .text_size(px(18.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .number_of_lines(1),
+        )
+}
+
+fn details_tabs(store: Store) -> impl IntoElement {
+    view()
+        .flex_row()
+        .justify_center()
+        .gap_4()
+        .child(tab_button(store, "Activity", false))
+        .child(tab_button(store, "Library", true))
+}
+
+fn tab_button(store: Store, label: &'static str, library: bool) -> impl IntoElement {
+    button()
+        .px_2()
+        .py_1()
+        .rounded(px(8.0))
+        .bg(move || {
+            if store.library_tab.get() == library {
+                theme().muted
+            } else {
+                theme().background
+            }
+        })
+        .on_press(move || store.show_library(library))
+        .child(
+            text(label)
+                .text_size(px(14.0))
+                .text_color(move || theme().foreground),
+        )
+}
+
+fn library_pane() -> impl IntoElement {
+    view()
+        .gap_2()
+        .child(ui::section_label("Library"))
+        .child(ui::body(
+            "Not available yet. Philo does not keep a library of files or prompts in this version.",
+        ))
+}
+
+fn activity_pane(store: Store) -> impl IntoElement {
+    view()
+        .gap_3()
+        .child(ui::section_label("Session"))
+        .child(
+            ui::card()
+                .child(
+                    text(move || {
+                        let name = store.selected_agent_name();
+                        if name.is_empty() {
+                            "No agent".to_owned()
+                        } else {
+                            name
+                        }
+                    })
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(14.0)),
+                )
+                .child(
+                    text(move || {
+                        let label = store.selected_session_label();
+                        if label.is_empty() {
+                            "No session yet".to_owned()
+                        } else if store.streaming() {
+                            format!("{label} · streaming")
+                        } else {
+                            format!("{label} · idle")
+                        }
+                    })
+                    .text_size(px(12.0))
+                    .number_of_lines(2)
+                    .text_color(move || theme().muted_foreground),
+                )
+                .child(ui::muted("Live session state, not a review status.")),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_2()
+                .child(ui::secondary_button(
+                    "Configure agent",
+                    move || store.selected_agent.get().is_some(),
+                    move || store.open_edit_agent(),
+                ))
+                .child(ui::secondary_button(
+                    "Reload",
+                    move || store.selected_session.get().is_some(),
+                    move || store.reload_transcript(),
+                )),
+        )
+        .child(ui::section_label("Suggested"))
+        .child(nav_button(store, Route::Skills, "Skills", true))
+        .child(nav_button(store, Route::Routines, "Routines", true))
+        .child(ui::section_label("Computer"))
+        .child(makez_card(store))
+        .child(ui::section_label("Voice chat"))
+        .child(ui::muted("Voice chat is not available yet."))
+        .child(ui::section_label("More"))
         .child(nav_button(
             store,
             Route::Notifications,
             "Notifications",
             true,
         ))
-        .child(nav_button(store, Route::Skills, "Skills", true))
         .child(nav_button(store, Route::Memory, "Memory", true))
-        .child(nav_button(store, Route::Routines, "Routines", true))
+        .child(nav_button(store, Route::Attachments, "Attachments", true))
         .child(nav_button(store, Route::ToolCalls, "Tool calls", true))
+        .child(nav_button(store, Route::Settings, "Settings", false))
+        .child(nav_button(store, Route::Connectors, "Connectors", false))
+        .child(nav_button(store, Route::Chat, "Chat", false))
+}
+
+fn makez_card(store: Store) -> impl IntoElement {
+    ui::card()
         .child(
-            text(move || store.server_url.get())
-                .number_of_lines(1)
-                .text_size(px(11.0))
-                .text_color(move || theme().muted_foreground)
-                .px_2()
-                .pt_2(),
+            text("Makez")
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(14.0)),
         )
         .child(
-            text(move || store.socket_label.get())
-                .number_of_lines(1)
-                .text_size(px(11.0))
-                .text_color(move || theme().muted_foreground)
-                .px_2(),
+            text(move || {
+                let reported = store.connectors.with(|list| {
+                    list.iter()
+                        .find(|item| {
+                            item.id.eq_ignore_ascii_case("makez")
+                                || item.name.eq_ignore_ascii_case("makez")
+                        })
+                        .map(|item| {
+                            if item.connected {
+                                "Connected".to_owned()
+                            } else if item.reason.trim().is_empty() {
+                                "Not connected".to_owned()
+                            } else {
+                                format!("Not connected. {}", item.reason)
+                            }
+                        })
+                });
+                if let Some(line) = reported {
+                    line
+                } else if store.health.with(|health| {
+                    health
+                        .as_ref()
+                        .is_some_and(|item| item.makez == "disconnected")
+                }) {
+                    "Not connected. Makez is not configured.".to_owned()
+                } else {
+                    "Connector status is not available until the server responds.".to_owned()
+                }
+            })
+            .text_size(px(12.0))
+            .text_color(move || theme().muted_foreground),
+        )
+}
+
+fn initial_mark(letter: impl Fn() -> char + 'static) -> impl IntoElement {
+    view()
+        .w(px(28.0))
+        .h(px(28.0))
+        .rounded(px(14.0))
+        .items_center()
+        .justify_center()
+        .bg(move || theme().primary)
+        .child(
+            text(move || letter().to_string())
+                .text_size(px(13.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(move || theme().primary_foreground),
         )
 }
 
