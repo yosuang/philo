@@ -213,6 +213,102 @@ impl Approval {
         }
         self.kind.clone()
     }
+
+    /// This card is a later stored write than `current`.
+    /// An older decision body, or a live frame with no timestamp, is not.
+    pub fn is_newer_than(&self, current: &Approval) -> bool {
+        match (
+            approval_instant(&self.updated_at),
+            approval_instant(&current.updated_at),
+        ) {
+            (Some(next), Some(prev)) => next > prev,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Nanoseconds since the Unix epoch for an RFC3339 timestamp.
+/// Go emits `RFC3339Nano`, which drops trailing zeros, so the fraction is
+/// not a fixed width and a string compare orders `03Z` after `03.1Z`.
+fn approval_instant(value: &str) -> Option<i128> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year: i32 = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
+    let month: u32 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
+    let day: u32 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
+    let hour: u32 = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
+    let minute: u32 = std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?;
+    let second: u32 = std::str::from_utf8(&bytes[17..19]).ok()?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let mut idx = 19;
+    let mut nanos: u32 = 0;
+    if bytes.get(idx) == Some(&b'.') {
+        idx += 1;
+        let start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        let digits = &bytes[start..idx];
+        if digits.is_empty() || digits.len() > 9 {
+            return None;
+        }
+        let mut scale = 100_000_000u32;
+        for digit in digits {
+            nanos += u32::from(digit - b'0') * scale;
+            scale /= 10;
+        }
+    }
+    let offset = parse_utc_offset(&bytes[idx..])?;
+    let days = days_from_civil(year, month, day)?;
+    let secs = days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second);
+    let utc = secs.checked_sub(i64::from(offset))?;
+    Some(i128::from(utc) * 1_000_000_000 + i128::from(nanos))
+}
+
+fn parse_utc_offset(bytes: &[u8]) -> Option<i32> {
+    if bytes == b"Z" || bytes == b"z" {
+        return Some(0);
+    }
+    if bytes.len() != 6 || (bytes[0] != b'+' && bytes[0] != b'-') || bytes[3] != b':' {
+        return None;
+    }
+    let sign = if bytes[0] == b'-' { -1 } else { 1 };
+    let hour: i32 = std::str::from_utf8(&bytes[1..3]).ok()?.parse().ok()?;
+    let minute: i32 = std::str::from_utf8(&bytes[4..6]).ok()?.parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(sign * (hour * 3_600 + minute * 60))
+}
+
+/// Days since 1970-01-01. Howard Hinnant's civil algorithm.
+fn days_from_civil(mut year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    year -= i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = (year - era * 400) as u32;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(i64::from(era) * 146_097 + i64::from(day_of_era) - 719_468)
 }
 
 #[derive(Clone, Debug, PartialEq, Default, Deserialize)]
@@ -799,6 +895,34 @@ mod tests {
         assert!(!approval.can_decide());
         assert_eq!(approval.status, "");
         assert_eq!(approval.shown_action(), "send the weekly note");
+    }
+
+    #[test]
+    fn a_later_approval_write_is_not_a_string_compare() {
+        let pending = approval_at("pending", "2026-11-10T17:05:03Z");
+        let fraction = approval_at("invalid", "2026-11-10T17:05:03.1Z");
+        let micros = approval_at("invalid", "2026-11-10T17:05:03.051026Z");
+        let shorter = approval_at("approved", "2026-11-10T17:05:03.05Z");
+        assert!(fraction.is_newer_than(&pending));
+        assert!(!pending.is_newer_than(&fraction));
+        assert!(micros.is_newer_than(&shorter));
+        assert!(!shorter.is_newer_than(&micros));
+        assert!(!pending.is_newer_than(&pending));
+        assert!(pending.is_newer_than(&Approval::default()));
+        assert!(!Approval::default().is_newer_than(&pending));
+        assert_eq!(approval_instant("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            approval_instant("1970-01-01T00:00:01Z"),
+            Some(1_000_000_000)
+        );
+    }
+
+    fn approval_at(status: &str, updated_at: &str) -> Approval {
+        Approval {
+            status: status.to_owned(),
+            updated_at: updated_at.to_owned(),
+            ..Approval::default()
+        }
     }
 
     #[test]

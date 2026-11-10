@@ -642,28 +642,29 @@ impl Store {
         self.action_error.set(None);
         let store = self;
         go(async move {
-            match client::decide(&store.server_url.get(), &id, decision).await {
-                Ok(approval) => {
-                    store.upsert_approval(approval);
-                    if let Some(session_id) = store.selected_session.get() {
-                        store.load_transcript(session_id).await;
+            // The response body is the card at decision time. A later edit can
+            // already be stored, so the body is not painted onto the window.
+            // The list is the stored status. A failed call does not leave the
+            // card approved.
+            let decided = client::decide(&store.server_url.get(), &id, decision).await;
+            if let Err(err) = &decided {
+                store.action_error.set(Some(err.clone()));
+            }
+            let Some(session_id) = store.selected_session.get() else {
+                return;
+            };
+            match client::list_approvals(&store.server_url.get(), &session_id).await {
+                Ok(cards) => {
+                    if store.selected_session.get().as_deref() == Some(session_id.as_str()) {
+                        store.merge_approvals(cards);
                     }
                 }
-                Err(err) => {
-                    store.action_error.set(Some(err));
-                    if let Some(session_id) = store.selected_session.get() {
-                        match client::list_approvals(&store.server_url.get(), &session_id).await {
-                            Ok(cards) => {
-                                if store.selected_session.get().as_deref()
-                                    == Some(session_id.as_str())
-                                {
-                                    store.approvals.set(cards);
-                                }
-                            }
-                            Err(reload_err) => log::warn!("approval reload: {reload_err}"),
-                        }
-                    }
-                }
+                Err(reload_err) => log::warn!("approval reload: {reload_err}"),
+            }
+            if decided.is_ok()
+                && store.selected_session.get().as_deref() == Some(session_id.as_str())
+            {
+                store.load_transcript(session_id).await;
             }
         });
     }
@@ -1870,7 +1871,12 @@ impl Store {
                     return;
                 }
                 self.upsert_approval(approval);
-                self.remember_event(&event_id, cursor);
+                // A live approval frame's id is the card id and it has no
+                // business cursor. Recording that id would drop the later
+                // status of the same card. The log row has its own id.
+                if cursor > 0 {
+                    self.remember_event(&event_id, cursor);
+                }
             }
             ServerEvent::Task(task) => self.upsert_task(task),
             ServerEvent::Session(session) => self.upsert_session(session),
@@ -1981,10 +1987,17 @@ impl Store {
             }
             | ServerEvent::Updated {
                 event_id, cursor, ..
-            }
-            | ServerEvent::Approval {
-                event_id, cursor, ..
             } => (event_id, *cursor),
+            ServerEvent::Approval {
+                event_id, cursor, ..
+            } => {
+                // The live socket flattens the card, so `id` is the card id
+                // and `cursor` is absent. That id is not an event id.
+                if *cursor <= 0 {
+                    return false;
+                }
+                (event_id, *cursor)
+            }
             _ => return false,
         };
         if event_inside_snapshot(cursor, self.business_high_water.get()) {
@@ -2057,15 +2070,30 @@ impl Store {
         {
             return;
         }
-        let follow = approval.clone();
+        let mut applied = false;
         self.approvals.update(|list| {
             if let Some(slot) = list.iter_mut().find(|item| item.id == approval.id) {
-                *slot = approval;
+                if approval.is_newer_than(slot) {
+                    *slot = approval.clone();
+                    applied = true;
+                }
             } else {
-                list.push(approval);
+                list.push(approval.clone());
+                applied = true;
             }
         });
-        self.follow_transport(follow);
+        if applied {
+            self.follow_transport(approval);
+        }
+    }
+
+    /// Fold a stored list into the cards on screen.
+    /// A copy that is older than the card already shown does not replace it,
+    /// so a stale read cannot paint an invalidated card approved or pending.
+    fn merge_approvals(self, cards: Vec<Approval>) {
+        for card in cards {
+            self.upsert_approval(card);
+        }
     }
 
     /// When `PHILO_TEST_EDIT_SUMMARY` names a different summary, post one
@@ -2524,6 +2552,186 @@ mod tests {
             assert_eq!(store.message_seq(), 1);
             assert_eq!(content(store), "cedarz");
             assert!(!content(store).contains("nope"));
+        });
+    }
+
+    fn flat_approval(
+        kind: &str,
+        id: &str,
+        status: &str,
+        summary: &str,
+        updated_at: &str,
+    ) -> ServerEvent {
+        crate::model::parse_event(&format!(
+            r#"{{"type":"{kind}","id":"{id}","sessionId":"sess","status":"{status}","updatedAt":"{updated_at}","actionSnapshot":{{"kind":"draft_action","summary":"{summary}"}}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn approval_rows(store: Store) -> Vec<(String, String, bool)> {
+        store.approvals.with(|list| {
+            list.iter()
+                .map(|item| (item.shown_action(), item.status.clone(), item.can_decide()))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_live_edit_replaces_the_pending_card_and_a_stale_frame_does_not() {
+        with_store(|store| {
+            store.selected_session.set(Some("sess".into()));
+            store.business_high_water.set(4);
+            store.ingest_live(flat_approval(
+                "approval.requested",
+                "card-old",
+                "pending",
+                "send the weekly note",
+                "2026-11-10T17:05:01Z",
+            ));
+            assert_eq!(
+                store.business_cursor(),
+                4,
+                "a live card frame moved the cursor"
+            );
+            store.ingest_live(flat_approval(
+                "approval.updated",
+                "card-old",
+                "invalid",
+                "send the weekly note",
+                "2026-11-10T17:05:03.051026Z",
+            ));
+            store.ingest_live(flat_approval(
+                "approval.requested",
+                "card-new",
+                "pending",
+                "send the revised note",
+                "2026-11-10T17:05:03.051026Z",
+            ));
+            // The first frame stored the card id. The later status of that
+            // same card still has to apply, and the old snapshot is not a grant.
+            assert_eq!(
+                approval_rows(store),
+                vec![
+                    (
+                        "Snapshot: send the weekly note".into(),
+                        "invalid".into(),
+                        false
+                    ),
+                    (
+                        "Snapshot: send the revised note".into(),
+                        "pending".into(),
+                        true
+                    ),
+                ]
+            );
+
+            store.ingest_live(flat_approval(
+                "approval.requested",
+                "card-old",
+                "pending",
+                "send the weekly note",
+                "2026-11-10T17:05:01Z",
+            ));
+            store.ingest_live(flat_approval(
+                "approval.updated",
+                "card-old",
+                "approved",
+                "send the weekly note",
+                "2026-11-10T17:05:02Z",
+            ));
+            assert_eq!(
+                approval_rows(store),
+                vec![
+                    (
+                        "Snapshot: send the weekly note".into(),
+                        "invalid".into(),
+                        false
+                    ),
+                    (
+                        "Snapshot: send the revised note".into(),
+                        "pending".into(),
+                        true
+                    ),
+                ]
+            );
+            assert!(!approval_rows(store).iter().any(|row| row.1 == "approved"));
+
+            store.selected_session.set(Some("other".into()));
+            store.approvals.set(Vec::new());
+            store.ingest_live(flat_approval(
+                "approval.requested",
+                "card-old",
+                "pending",
+                "send the weekly note",
+                "2026-11-10T17:05:04Z",
+            ));
+            assert!(store.approvals.with(Vec::is_empty));
+
+            store.selected_session.set(Some("sess".into()));
+            let invalid = match flat_approval(
+                "approval.updated",
+                "card-old",
+                "invalid",
+                "send the weekly note",
+                "2026-11-10T17:05:03.051026Z",
+            ) {
+                ServerEvent::Approval { approval, .. } => approval,
+                _ => panic!("invalid card"),
+            };
+            let revised = match flat_approval(
+                "approval.requested",
+                "card-new",
+                "pending",
+                "send the revised note",
+                "2026-11-10T17:05:03.051026Z",
+            ) {
+                ServerEvent::Approval { approval, .. } => approval,
+                _ => panic!("revised card"),
+            };
+            store.install_snapshot(Vec::new(), vec![invalid, revised], 8);
+            store.ingest_live(flat_approval(
+                "approval.requested",
+                "card-old",
+                "pending",
+                "send the weekly note",
+                "2026-11-10T17:05:01Z",
+            ));
+            store.ingest_live(flat_approval(
+                "approval.updated",
+                "card-old",
+                "approved",
+                "send the weekly note",
+                "2026-11-10T17:05:02Z",
+            ));
+            assert_eq!(store.business_cursor(), 8);
+            assert_eq!(
+                approval_rows(store),
+                vec![
+                    (
+                        "Snapshot: send the weekly note".into(),
+                        "invalid".into(),
+                        false
+                    ),
+                    (
+                        "Snapshot: send the revised note".into(),
+                        "pending".into(),
+                        true
+                    ),
+                ]
+            );
+
+            let logged = crate::model::parse_event(
+                r#"{"type":"approval.updated","id":"event-9","cursor":9,"sessionId":"sess","approval":{"id":"card-old","sessionId":"sess","status":"pending","updatedAt":"2026-11-10T17:05:01Z","actionSnapshot":{"kind":"draft_action","summary":"send the weekly note"}}}"#,
+            )
+            .unwrap();
+            store.ingest_live(logged);
+            assert_eq!(store.business_cursor(), 9);
+            assert!(
+                !approval_rows(store)
+                    .iter()
+                    .any(|row| row.2 && row.0.contains("weekly"))
+            );
+            assert!(approval_rows(store).iter().any(|row| row.1 == "invalid"));
         });
     }
 
