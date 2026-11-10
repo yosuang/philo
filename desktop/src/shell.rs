@@ -457,6 +457,48 @@ fn activity_pane(store: Store) -> impl IntoElement {
                     move || store.reload_transcript(),
                 )),
         )
+        .child(
+            text(move || format!("Business cursor: {}", store.business_cursor()))
+                .text_size(px(12.0))
+                .text_color(move || theme().foreground),
+        )
+        .child(
+            text(move || store.socket_label.get())
+                .text_size(px(12.0))
+                .text_color(move || theme().muted_foreground),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_2()
+                .child(ui::secondary_button(
+                    "Disconnect",
+                    move || store.selected_session.get().is_some(),
+                    move || store.disconnect_events(),
+                ))
+                .child(ui::secondary_button(
+                    "Reconnect",
+                    move || store.selected_session.get().is_some(),
+                    move || store.reconnect_events(),
+                )),
+        )
+        .child(when(
+            move || store.fixture_suffix_available(),
+            move || {
+                view()
+                    .gap_2()
+                    .child(ui::secondary_button(
+                        "Fixture suffix",
+                        move || store.selected_session.get().is_some(),
+                        move || store.post_fixture_suffix(),
+                    ))
+                    .child(
+                        text(move || store.fixture_suffix_note.get())
+                            .text_size(px(12.0))
+                            .text_color(move || theme().muted_foreground),
+                    )
+            },
+        ))
         .child(ui::section_label("Suggested"))
         .child(nav_button(store, Route::Skills, "Skills", true))
         .child(nav_button(store, Route::Routines, "Routines", true))
