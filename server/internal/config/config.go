@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"time"
@@ -15,6 +16,9 @@ const (
 	defaultChunkDelay      = 40 * time.Millisecond
 	// ExecutionFixtureDev is the only value that runs the isolated dev adapter.
 	ExecutionFixtureDev = "dev"
+	// TestMakezBinding is the only label that may call Makez.
+	// It is not a production owner-to-workspace identity.
+	TestMakezBinding = "test-binding"
 )
 
 // Config is the process configuration. Secrets come from the environment only.
@@ -28,6 +32,10 @@ type Config struct {
 	ProviderAPIKey   string
 	ProviderBaseURL  string
 	MakezURL         string
+	MakezAPIURL      string
+	MakezAPIToken    string
+	MakezWorkspaceID string
+	MakezBinding     string
 	DevChunkDelay    time.Duration
 }
 
@@ -49,7 +57,14 @@ func FromEnv() (Config, error) {
 		ProviderAPIKey:   strings.TrimSpace(os.Getenv("PHILO_PROVIDER_API_KEY")),
 		ProviderBaseURL:  getenv("PHILO_PROVIDER_BASE_URL", defaultProviderBaseURL),
 		MakezURL:         strings.TrimSpace(os.Getenv("PHILO_MAKEZ_URL")),
+		MakezAPIURL:      strings.TrimSpace(os.Getenv("PHILO_MAKEZ_API_URL")),
+		MakezAPIToken:    strings.TrimSpace(os.Getenv("PHILO_MAKEZ_API_TOKEN")),
+		MakezWorkspaceID: strings.TrimSpace(os.Getenv("PHILO_MAKEZ_WORKSPACE_ID")),
+		MakezBinding:     strings.TrimSpace(os.Getenv("PHILO_MAKEZ_BINDING")),
 		DevChunkDelay:    defaultChunkDelay,
+	}
+	if err := cfg.LiveMakez(); err != nil {
+		return Config{}, err
 	}
 	if raw := strings.TrimSpace(os.Getenv("PHILO_DEV_CHUNK_DELAY")); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
@@ -71,6 +86,39 @@ func (c Config) HealthAdapter() string {
 		return "dev"
 	}
 	return "unavailable"
+}
+
+// LiveMakez rejects a partial client and any binding other than the test label.
+// An empty client is disabled. Production owner-to-workspace binding is not configured.
+func (c Config) LiveMakez() error {
+	n := 0
+	if c.MakezAPIURL != "" {
+		n++
+	}
+	if c.MakezAPIToken != "" {
+		n++
+	}
+	if c.MakezWorkspaceID != "" {
+		n++
+	}
+	if c.MakezBinding != "" {
+		n++
+	}
+	if n == 0 {
+		return nil
+	}
+	if c.MakezBinding != TestMakezBinding {
+		return errors.New("PHILO_MAKEZ_BINDING must be test-binding; a production owner-to-workspace binding is not configured")
+	}
+	if c.MakezAPIURL == "" || c.MakezAPIToken == "" || c.MakezWorkspaceID == "" {
+		return errors.New("a test Makez binding needs PHILO_MAKEZ_API_URL, PHILO_MAKEZ_API_TOKEN, and PHILO_MAKEZ_WORKSPACE_ID")
+	}
+	return nil
+}
+
+// MakezTestBinding reports whether this process may call Makez under the test label.
+func (c Config) MakezTestBinding() bool {
+	return c.LiveMakez() == nil && c.MakezBinding == TestMakezBinding
 }
 
 func getenv(key, fallback string) string {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,6 +71,34 @@ func TestExplicitFixtureStaysDev(t *testing.T) {
 	}
 	if !cfg.DevFixture() || cfg.HealthAdapter() != "dev" {
 		t.Fatalf("fixture = %q health = %q", cfg.ExecutionFixture, cfg.HealthAdapter())
+	}
+}
+
+func TestLiveMakezBindingGate(t *testing.T) {
+	if err := (Config{}).LiveMakez(); err != nil {
+		t.Fatal(err)
+	}
+	if (Config{}).MakezTestBinding() {
+		t.Fatal("empty config enabled a Makez call")
+	}
+	full := Config{
+		MakezAPIURL:      "http://127.0.0.1:9",
+		MakezAPIToken:    "machine-token-test",
+		MakezWorkspaceID: "ws-test",
+		MakezBinding:     TestMakezBinding,
+	}
+	if err := full.LiveMakez(); err != nil || !full.MakezTestBinding() {
+		t.Fatal(err)
+	}
+	partial := full
+	partial.MakezAPIToken = ""
+	if err := partial.LiveMakez(); err == nil {
+		t.Fatal("partial test binding was accepted")
+	}
+	production := full
+	production.MakezBinding = "owner-workspace"
+	if err := production.LiveMakez(); err == nil || !strings.Contains(err.Error(), "test-binding") {
+		t.Fatal(err)
 	}
 }
 

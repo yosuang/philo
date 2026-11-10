@@ -171,6 +171,17 @@ func (t taskView) capturedFailure() bool {
 		t.WorkspaceID == capturedWorkspaceID &&
 		t.RunID == capturedRunID &&
 		t.ConversationID == capturedConversationID &&
+		t.noKeyFailure()
+}
+
+// noKeyFailure is the public terminal shape from Makez be00c829:
+// pi@1, task FAILED / AGENT_FAILED, run FAILED, exit code 1, empty signal.
+// It does not require the captured fixture ids.
+func (t taskView) noKeyFailure() bool {
+	return t.ID != "" &&
+		t.WorkspaceID != "" &&
+		t.RunID != "" &&
+		t.ConversationID != "" &&
 		t.AgentID == "pi" &&
 		t.AgentVersion == "1" &&
 		t.State == "FAILED" &&
@@ -189,7 +200,7 @@ type parsedCapture struct {
 }
 
 func (p parsedCapture) failure() bool {
-	return p.task != nil && p.task.capturedFailure()
+	return p.task != nil && p.task.noKeyFailure()
 }
 
 func parseCapture(in CaptureInput) (parsedCapture, error) {

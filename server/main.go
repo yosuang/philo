@@ -65,6 +65,8 @@ func main() {
 	execution := "unavailable"
 	if cfg.DevFixture() {
 		execution = "fixture-dev"
+	} else if cfg.MakezTestBinding() {
+		execution = "test-binding"
 	}
 	log.Printf("philo session server listening on %s execution=%s", cfg.HTTPAddr, execution)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
