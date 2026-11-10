@@ -70,6 +70,12 @@ nsh test expired-cursor.test.tsx --target linux
 
 The window receives the HTTP 400 itself, replaces the transcript with that snapshot, and does not append the same text again. `Adapter: unavailable` stays up. That file starts from an empty transcript and `after=0`. It does not reconnect.
 
+`expired-nonzero-cursor.test.tsx` starts from messages that are already on screen and a non-zero business cursor. Set `PHILO_FIXTURE_SUFFIX=1`. Disconnect the socket, stage the labeled fixture so that held cursor is expired, then reconnect. The server returns HTTP 400 with a replacement snapshot. The client replaces the transcript from that snapshot once, then shows the following suffix once. `message.seq` is not the business cursor. The fixture stays labeled. It is not Makez.
+
+```bash
+nsh test expired-nonzero-cursor.test.tsx --target linux
+```
+
 `reconnect-cursor.test.tsx` starts from messages that are already on screen and a non-zero business cursor. Set `PHILO_FIXTURE_SUFFIX=1` so the window can store one later `fixture-business-source` delta. It disconnects the event socket, stores that delta while the socket is down, then reconnects. The client reads with the cursor it still holds, shows that suffix once, and does not append it again. The fixture stays labeled. It is not Makez.
 
 ```bash

@@ -172,6 +172,32 @@ fn parse_snapshot(value: &Value) -> Result<MaterializedSnapshot, String> {
     })
 }
 
+/// Stages an expired non-zero cursor on the labeled fixture. The caller does
+/// not apply the response. The next business read receives the HTTP 400.
+/// This is not Makez.
+pub async fn post_fixture_stage_expired(
+    base: &str,
+    session_id: &str,
+    event_key: &str,
+) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "conversationId": session_id,
+            "eventKey": event_key,
+            "type": "fixture.stage-expired",
+            "messageId": "",
+            "text": "lantern",
+            "status": "",
+            "suffix": "once",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Posts one labeled fixture delta. The caller does not apply the returned
 /// event; the business log is what a later reconnect reads. This is not Makez.
 pub async fn post_fixture_delta(

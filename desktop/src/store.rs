@@ -20,9 +20,62 @@ use crate::model::{
 const SERVER_KEY: &str = "serverUrl";
 const APPEARANCE_KEY: &str = "appearance";
 
+/// A transcript read waits this long for the subscribe ack, then reads anyway.
+const SUBSCRIBE_ACK_BUDGET: Duration = Duration::from_secs(5);
+const SUBSCRIBE_ACK_SLICE: Duration = Duration::from_millis(100);
+
+fn subscribe_ack_polls() -> u32 {
+    let polls = SUBSCRIBE_ACK_BUDGET.as_millis() / SUBSCRIBE_ACK_SLICE.as_millis();
+    u32::try_from(polls).unwrap_or(50)
+}
+
+/// The hub does not deliver a publish until the socket is subscribed. An
+/// event committed after an unsubscribed read is in neither that response
+/// nor the socket. `true` means that event is missing unless something
+/// reads the log again.
+#[cfg(test)]
+fn event_missed_without_another_read(
+    ack_at: Option<Duration>,
+    event_at: Duration,
+    budget: Duration,
+) -> bool {
+    let read_at = match ack_at {
+        Some(ack) if ack <= budget => ack,
+        _ => budget,
+    };
+    let in_read = event_at <= read_at;
+    let on_socket = ack_at.is_some_and(|ack| event_at >= ack);
+    !in_read && !on_socket
+}
+
+/// A second read when the ack arrives after the first read keeps an event
+/// the hub dropped. An ack that never arrives does not.
+#[cfg(test)]
+fn another_read_keeps_event(
+    ack_at: Option<Duration>,
+    event_at: Duration,
+    budget: Duration,
+) -> bool {
+    if !event_missed_without_another_read(ack_at, event_at, budget) {
+        return true;
+    }
+    ack_at.is_some_and(|ack| event_at <= ack)
+}
+
+fn extra_read_after_unready(subscribed_before: bool, subscribed_after: bool) -> bool {
+    !subscribed_before && subscribed_after
+}
+
 struct LiveGate {
     buffering: bool,
+    /// Socket generation that opened this buffer. A newer socket discards it.
+    generation: u64,
     pending: Vec<crate::model::ServerEvent>,
+}
+
+struct ReplayStep {
+    saw_expired: bool,
+    next: Option<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,6 +180,8 @@ pub struct Store {
     socket_held: Signal<bool>,
     /// Session id from the latest `subscribed` ack. Empty when the socket is down.
     live_subscribed: Signal<String>,
+    /// The last business read started before this socket was subscribed.
+    read_unsubscribed: Signal<bool>,
     live_gate: Stored<Arc<std::sync::Mutex<LiveGate>>>,
     catchup_lock: Stored<Arc<Mutex<()>>>,
     business_high_water: Signal<i64>,
@@ -181,8 +236,10 @@ impl Store {
             ws_out: stored(None),
             socket_held: signal(false),
             live_subscribed: signal(String::new()),
+            read_unsubscribed: signal(false),
             live_gate: stored(Arc::new(std::sync::Mutex::new(LiveGate {
                 buffering: false,
+                generation: 0,
                 pending: Vec::new(),
             }))),
             catchup_lock: stored(Arc::new(Mutex::new(()))),
@@ -549,6 +606,37 @@ impl Store {
         self.fixture_suffix.get()
     }
 
+    /// Ask the labeled fixture to replace the retained log so the cursor this
+    /// client holds is expired, and to append one suffix after that snapshot.
+    /// The transcript on screen is left unchanged until the next read.
+    pub fn stage_expired_cursor(self) {
+        let Some(session_id) = self.selected_session.get() else {
+            self.action_error
+                .set(Some("Choose a bot before staging an expired cursor.".to_owned()));
+            return;
+        };
+        self.submit_serial.update(|n| *n += 1);
+        let key = format!("fixture-expire-{}", self.submit_serial.get());
+        self.fixture_suffix_note.set(String::new());
+        self.action_error.set(None);
+        let store = self;
+        go(async move {
+            match client::post_fixture_stage_expired(&store.server_url.get(), &session_id, &key)
+                .await
+            {
+                Ok(()) => {
+                    log::info!("expired cursor staged session={session_id} key={key}");
+                    if store.selected_session.get().as_deref() == Some(session_id.as_str()) {
+                        store
+                            .fixture_suffix_note
+                            .set("Expired cursor staged".to_owned());
+                    }
+                }
+                Err(err) => store.action_error.set(Some(err)),
+            }
+        });
+    }
+
     /// Store one `fixture-business-source` delta on the open message.
     /// The socket does not learn about it. Reconnect reads it from the log.
     pub fn post_fixture_suffix(self) {
@@ -777,27 +865,44 @@ impl Store {
         self.begin_live_buffer();
         if self.live_subscribed.get() != session_id {
             self.subscribe(&session_id);
-            for _ in 0..50 {
+            for _ in 0..subscribe_ack_polls() {
                 if self.live_subscribed.get() == session_id
                     || self.selected_session.get().as_deref() != Some(session_id.as_str())
                 {
                     break;
                 }
-                timer(Duration::from_millis(100)).await;
+                timer(SUBSCRIBE_ACK_SLICE).await;
             }
         }
-        if self.selected_session.get().as_deref() == Some(session_id.as_str()) {
+        if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
+            self.discard_live_buffer();
+            return;
+        }
+        let subscribed_before = self.live_subscribed.get() == session_id;
+        // A read that starts before the ack can miss a publish the hub drops.
+        self.read_unsubscribed.set(!subscribed_before);
+        self.catch_up(session_id.clone()).await;
+        let subscribed_after = self.selected_session.get().as_deref() == Some(session_id.as_str())
+            && self.live_subscribed.get() == session_id;
+        if extra_read_after_unready(subscribed_before, subscribed_after) {
+            self.read_unsubscribed.set(false);
             self.catch_up(session_id.clone()).await;
         }
         if self.selected_session.get().as_deref() == Some(session_id.as_str()) {
             self.finish_live_buffer();
+        } else {
+            self.discard_live_buffer();
         }
     }
 
     async fn catch_up(self, session_id: String) {
         let url = self.server_url.get();
+        let generation = self.ws_generation.get();
         let tasks = client::list_tasks(&url, &session_id).await;
         if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
+            return;
+        }
+        if self.ws_generation.get() != generation {
             return;
         }
         // Ask with the cursor this client still holds. A snapshot high water is
@@ -813,39 +918,24 @@ impl Store {
         let mut after = held;
         let mut saw_expired = false;
         for _ in 0..8 {
-            if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
+            if self.selected_session.get().as_deref() != Some(session_id.as_str())
+                || self.ws_generation.get() != generation
+            {
                 break;
             }
             match client::business_events(&url, &session_id, after).await {
-                Ok(BusinessReplay::Expired(snap)) => {
-                    let high = snap.high_water;
-                    log::info!(
-                        "business cursor {after} expired; replacing transcript with snapshot high_water={high} messages={}",
-                        snap.messages.len()
-                    );
-                    self.install_snapshot(snap.messages, snap.approvals, high);
-                    self.rebuilt_from_snapshot.set(true);
-                    saw_expired = true;
-                    if high <= after {
+                Ok(replay) => {
+                    if self.ws_generation.get() != generation
+                        || self.selected_session.get().as_deref() != Some(session_id.as_str())
+                    {
                         break;
                     }
-                    after = high;
-                }
-                Ok(BusinessReplay::Events(events)) => {
-                    if events.is_empty() {
-                        break;
+                    let step = self.install_replay(replay, after, saw_expired);
+                    saw_expired = step.saw_expired;
+                    match step.next {
+                        Some(next) => after = next,
+                        None => break,
                     }
-                    if !saw_expired {
-                        self.rebuilt_from_snapshot.set(false);
-                    }
-                    for event in events {
-                        self.apply(event);
-                    }
-                    let next = self.business_high_water.get();
-                    if next <= after {
-                        break;
-                    }
-                    after = next;
                 }
                 Err(err) => {
                     log::warn!("business replay: {err}");
@@ -853,6 +943,7 @@ impl Store {
                         if let Ok(snap) = client::snapshot(&url, &session_id).await {
                             if self.selected_session.get().as_deref() == Some(session_id.as_str())
                                 && self.messages.with(Vec::is_empty)
+                                && self.ws_generation.get() == generation
                             {
                                 self.install_snapshot(
                                     snap.messages,
@@ -874,6 +965,42 @@ impl Store {
         self.remember_preview();
     }
 
+    fn install_replay(self, replay: BusinessReplay, after: i64, saw_expired: bool) -> ReplayStep {
+        match replay {
+            BusinessReplay::Expired(snap) => {
+                let high = snap.high_water;
+                log::info!(
+                    "business cursor {after} expired; replacing transcript with snapshot high_water={high} messages={}",
+                    snap.messages.len()
+                );
+                self.install_snapshot(snap.messages, snap.approvals, high);
+                self.rebuilt_from_snapshot.set(true);
+                let next = (high > after).then_some(high);
+                ReplayStep {
+                    saw_expired: true,
+                    next,
+                }
+            }
+            BusinessReplay::Events(events) => {
+                if events.is_empty() {
+                    return ReplayStep {
+                        saw_expired,
+                        next: None,
+                    };
+                }
+                if !saw_expired {
+                    self.rebuilt_from_snapshot.set(false);
+                }
+                for event in events {
+                    self.apply(event);
+                }
+                let next_cursor = self.business_high_water.get();
+                let next = (next_cursor > after).then_some(next_cursor);
+                ReplayStep { saw_expired, next }
+            }
+        }
+    }
+
     fn reconnect(self) {
         self.ws_generation.update(|generation| *generation += 1);
         self.ws_out.replace(None);
@@ -885,8 +1012,22 @@ impl Store {
     }
 
     fn begin_live_buffer(self) {
+        let generation = self.ws_generation.get();
         self.live_gate.with(|gate| {
-            gate.lock().expect("live gate").buffering = true;
+            let mut gate = gate.lock().expect("live gate");
+            if gate.generation != generation {
+                gate.pending.clear();
+            }
+            gate.generation = generation;
+            gate.buffering = true;
+        });
+    }
+
+    fn discard_live_buffer(self) {
+        self.live_gate.with(|gate| {
+            let mut gate = gate.lock().expect("live gate");
+            gate.pending.clear();
+            gate.buffering = false;
         });
     }
 
@@ -899,16 +1040,25 @@ impl Store {
     /// The flag flips off in the same critical section as the last empty take,
     /// so an event cannot sit in the buffer after catch-up has finished.
     fn finish_live_buffer(self) {
+        let generation = self.ws_generation.get();
         loop {
             let batch = self.live_gate.with(|gate| {
                 let mut gate = gate.lock().expect("live gate");
+                if gate.generation != generation {
+                    gate.pending.clear();
+                    gate.buffering = false;
+                    return Vec::new();
+                }
                 let batch = std::mem::take(&mut gate.pending);
                 if batch.is_empty() {
                     gate.buffering = false;
                 }
                 batch
             });
-            if batch.is_empty() {
+            if batch.is_empty() || self.ws_generation.get() != generation {
+                if self.ws_generation.get() != generation {
+                    self.discard_live_buffer();
+                }
                 break;
             }
             let open = self.selected_session.get();
@@ -928,13 +1078,16 @@ impl Store {
     }
 
     fn ingest_live(self, event: crate::model::ServerEvent) {
+        let generation = self.ws_generation.get();
         let mut event = Some(event);
         let queued = self.live_gate.with(|gate| {
             let mut gate = gate.lock().expect("live gate");
-            if gate.buffering {
+            if gate.buffering && gate.generation == generation {
                 if let Some(event) = event.take() {
                     gate.pending.push(event);
                 }
+                true
+            } else if gate.buffering {
                 true
             } else {
                 false
@@ -947,11 +1100,39 @@ impl Store {
         }
     }
 
+    /// A socket callback. An older generation is ignored, so it cannot move
+    /// the business cursor of the conversation that is open now.
+    fn targets_open_chat(self, event: &crate::model::ServerEvent) -> bool {
+        event_session(event).is_some_and(|session_id| {
+            self.selected_session.get().as_deref() == Some(session_id)
+        })
+    }
+
+    fn accept_socket(self, generation: u64, event: crate::model::ServerEvent) {
+        if self.ws_generation.get() != generation {
+            return;
+        }
+        self.note_subscribed(&event);
+        self.ingest_live(event);
+    }
+
     fn note_subscribed(self, event: &crate::model::ServerEvent) {
         if let crate::model::ServerEvent::Ignored(kind) = event {
             if let Some(session_id) = kind.strip_prefix("subscribed ") {
-                if !session_id.is_empty() {
-                    self.live_subscribed.set(session_id.to_owned());
+                if session_id.is_empty()
+                    || self.selected_session.get().as_deref() != Some(session_id)
+                {
+                    return;
+                }
+                let became_ready = self.live_subscribed.get() != session_id;
+                self.live_subscribed.set(session_id.to_owned());
+                if became_ready && self.read_unsubscribed.get() && !self.buffering_live() {
+                    self.read_unsubscribed.set(false);
+                    let store = self;
+                    let session_id = session_id.to_owned();
+                    go(async move {
+                        store.load_transcript(session_id).await;
+                    });
                 }
             }
         }
@@ -1004,8 +1185,7 @@ impl Store {
                             }
                         }
                         Some(WsEvent::Server(event)) => {
-                            store.note_subscribed(&event);
-                            store.ingest_live(event);
+                            store.accept_socket(generation, event);
                         }
                         Some(WsEvent::Closed(reason)) => {
                             store.live_subscribed.set(String::new());
@@ -1040,6 +1220,11 @@ impl Store {
     fn apply(self, event: crate::model::ServerEvent) {
         use crate::model::ServerEvent;
         if self.already_applied(&event) {
+            return;
+        }
+        // `apply_delta` and `set_status` ignore another conversation, but
+        // remembering the cursor afterwards would still move this chat.
+        if cursor_event(&event) && !self.targets_open_chat(&event) {
             return;
         }
         match event {
@@ -1341,6 +1526,267 @@ impl Store {
             }
         });
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use nsh_core::prelude::{Owner, signal, stored};
+
+    use crate::client::BusinessReplay;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::model::{Message, ServerEvent};
+
+    fn with_store(check: impl FnOnce(Store)) {
+        let runtime = nsh_core::element::reactive::Runtime::default();
+        let _entered = runtime.enter();
+        let store = Owner::detached().run(test_store);
+        check(store);
+    }
+
+    fn test_store() -> Store {
+        Store {
+            server_url: signal(crate::model::DEFAULT_SERVER.to_owned()),
+            server_draft: signal(crate::model::DEFAULT_SERVER.to_owned()),
+            health: signal(None),
+            server_error: signal(None),
+            action_error: signal(None),
+            agents: signal(Vec::new()),
+            sessions: signal(Vec::new()),
+            previews: signal(HashMap::new()),
+            messages: signal(Vec::new()),
+            approvals: signal(Vec::new()),
+            tasks: signal(Vec::new()),
+            connectors: signal(Vec::new()),
+            selected_agent: signal(None),
+            selected_session: signal(None),
+            editing_agent: signal(None),
+            route: signal(Route::Chat),
+            draft: signal(String::new()),
+            form_name: signal(String::new()),
+            form_instructions: signal(String::new()),
+            form_model: signal(String::new()),
+            appearance: signal(AppearanceChoice::System),
+            sending: signal(false),
+            socket_label: signal(String::new()),
+            rebuilt_from_snapshot: signal(false),
+            fixture_suffix: signal(false),
+            fixture_suffix_note: signal(String::new()),
+            details_open: signal(false),
+            library_tab: signal(false),
+            ws_generation: signal(0),
+            transcript_epoch: signal(0),
+            open_generation: signal(0),
+            resume_lock: stored(Arc::new(Mutex::new(()))),
+            ws_out: stored(None),
+            socket_held: signal(false),
+            live_subscribed: signal(String::new()),
+            read_unsubscribed: signal(false),
+            live_gate: stored(Arc::new(std::sync::Mutex::new(LiveGate {
+                buffering: false,
+                generation: 0,
+                pending: Vec::new(),
+            }))),
+            catchup_lock: stored(Arc::new(Mutex::new(()))),
+            business_high_water: signal(0),
+            applied_event_ids: stored(HashSet::new()),
+            submit_serial: signal(0),
+            pending_submit: stored(None),
+        }
+    }
+
+    fn open_chat(store: Store) {
+        store.selected_session.set(Some("chat-a".to_owned()));
+        store.messages.set(vec![Message {
+            id: "m".into(),
+            session_id: "chat-a".into(),
+            seq: 1,
+            role: "assistant".into(),
+            content: "cedar".into(),
+            status: "complete".into(),
+            ..Message::default()
+        }]);
+        store.business_high_water.set(3);
+        store.ws_generation.set(1);
+    }
+
+    fn delta(session_id: &str, cursor: i64, text: &str) -> ServerEvent {
+        ServerEvent::Delta {
+            event_id: format!("e{cursor}-{session_id}"),
+            cursor,
+            message_id: "m".into(),
+            session_id: session_id.to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn foreign_session_does_not_move_the_business_cursor_when_not_buffering() {
+        with_store(|store| {
+            open_chat(store);
+            assert!(!store.buffering_live());
+            store.ingest_live(delta("chat-b", 9, "nope"));
+            assert_eq!(store.business_cursor(), 3, "foreign cursor moved this chat");
+            let content = store.messages.with(|list| list[0].content.clone());
+            assert_eq!(content, "cedar");
+        });
+    }
+
+    #[test]
+    fn old_socket_callback_does_not_move_the_business_cursor() {
+        with_store(|store| {
+            open_chat(store);
+            store.begin_live_buffer();
+            store.ingest_live(delta("chat-a", 9, "stale"));
+            store.ws_generation.set(2);
+            store.finish_live_buffer();
+                assert_eq!(store.business_cursor(), 3, "old socket moved this chat");
+            let content = store.messages.with(|list| list[0].content.clone());
+            assert_eq!(content, "cedar");
+        });
+    }
+
+    #[test]
+    fn old_socket_callback_while_idle_does_not_move_the_cursor() {
+        with_store(|store| {
+            open_chat(store);
+            assert!(!store.buffering_live());
+            store.ws_generation.set(2);
+            store.accept_socket(1, delta("chat-a", 9, "stale"));
+            assert_eq!(store.business_cursor(), 3);
+            let content = store.messages.with(|list| list[0].content.clone());
+            assert_eq!(content, "cedar");
+        });
+    }
+
+    #[test]
+    fn business_cursor_is_not_message_seq_or_a_public_cursor() {
+        with_store(|store| {
+            open_chat(store);
+            let event = crate::model::parse_event(
+                r#"{"type":"message.created","id":"e4","cursor":4,"publicSeq":80,"message":{"id":"m2","sessionId":"chat-a","seq":99,"role":"assistant","content":"lantern","status":"complete"}}"#,
+            )
+            .unwrap();
+            store.ingest_live(event);
+            assert_eq!(store.business_cursor(), 4);
+            assert_ne!(store.business_cursor(), 99);
+            assert_ne!(store.business_cursor(), 80);
+            let seq = store
+                .messages
+                .with(|list| list.iter().find(|item| item.id == "m2").unwrap().seq);
+            assert_eq!(seq, 99);
+        });
+    }
+
+    #[test]
+    fn expired_snapshot_replaces_once_then_suffix_is_not_duplicated() {
+        with_store(|store| {
+            open_chat(store);
+            let snapshot = BusinessReplay::Expired(crate::client::MaterializedSnapshot {
+                high_water: 4,
+                messages: vec![Message {
+                    id: "m".into(),
+                    session_id: "chat-a".into(),
+                    seq: 1,
+                    role: "assistant".into(),
+                    content: "lantern".into(),
+                    status: "complete".into(),
+                    ..Message::default()
+                }],
+                approvals: Vec::new(),
+            });
+            let step = store.install_replay(snapshot, 3, false);
+            assert_eq!(step.next, Some(4));
+            assert!(store.rebuilt_from_snapshot.get());
+            assert_eq!(content(store), "lantern");
+            assert_eq!(store.business_cursor(), 4);
+            assert_ne!(store.business_cursor(), 1);
+            let suffix = delta("chat-a", 5, "once");
+            let step = store.install_replay(
+                BusinessReplay::Events(vec![suffix.clone()]),
+                4,
+                true,
+            );
+            assert_eq!(step.next, Some(5));
+            assert_eq!(content(store), "lanternonce");
+            assert_eq!(store.business_cursor(), 5);
+            assert!(store.rebuilt_from_snapshot.get());
+            let step = store.install_replay(BusinessReplay::Events(vec![suffix]), 5, true);
+            assert_eq!(step.next, None);
+            assert_eq!(content(store), "lanternonce");
+            assert_eq!(store.business_cursor(), 5);
+        });
+    }
+
+    #[test]
+    fn business_event_during_replay_is_kept_once() {
+        with_store(|store| {
+            open_chat(store);
+            store.begin_live_buffer();
+            let inside = delta("chat-a", 4, "lantern");
+            let suffix = delta("chat-a", 5, "once");
+            store.ingest_live(inside.clone());
+            store.ingest_live(suffix);
+            store.ingest_live(delta("chat-b", 9, "nope"));
+            store.ingest_live(ServerEvent::Ignored("subscribed chat-a".into()));
+            store.apply(inside);
+            store.finish_live_buffer();
+            assert_eq!(content(store), "cedarlanternonce");
+            assert_eq!(store.business_cursor(), 5);
+            assert!(!content(store).contains("nope"));
+            assert!(!content(store).contains("lanternlantern"));
+            assert!(!content(store).contains("onceonce"));
+        });
+    }
+
+    #[test]
+    fn subscribe_ack_budget_is_five_seconds_and_a_late_ack_rereads() {
+        assert_eq!(SUBSCRIBE_ACK_BUDGET, Duration::from_secs(5));
+        assert_eq!(subscribe_ack_polls(), 50);
+        let budget = SUBSCRIBE_ACK_BUDGET;
+        let late_ack = Some(Duration::from_millis(6000));
+        let during_gap = Duration::from_millis(5500);
+        assert!(event_missed_without_another_read(late_ack, during_gap, budget));
+        assert!(another_read_keeps_event(late_ack, during_gap, budget));
+        assert!(extra_read_after_unready(false, true));
+        assert!(event_missed_without_another_read(None, during_gap, budget));
+        assert!(!another_read_keeps_event(None, during_gap, budget));
+        assert!(!extra_read_after_unready(false, false));
+        let timely = Some(Duration::from_millis(100));
+        assert!(!event_missed_without_another_read(
+            timely,
+            Duration::from_millis(50),
+            budget,
+        ));
+        assert!(!event_missed_without_another_read(
+            timely,
+            Duration::from_millis(200),
+            budget,
+        ));
+        assert!(!extra_read_after_unready(true, true));
+    }
+
+    fn content(store: Store) -> String {
+        store.messages.with(|list| list[0].content.clone())
+    }
+}
+
+fn cursor_event(event: &crate::model::ServerEvent) -> bool {
+    use crate::model::ServerEvent;
+    matches!(
+        event,
+        ServerEvent::Delta { .. }
+            | ServerEvent::Completed { .. }
+            | ServerEvent::Failed { .. }
+            | ServerEvent::Canceled { .. }
+            | ServerEvent::Created { .. }
+            | ServerEvent::Updated { .. }
+    )
 }
 
 fn event_session(event: &crate::model::ServerEvent) -> Option<&str> {
