@@ -5,11 +5,20 @@
 // The fixture speaks the same task and event routes the server resume
 // already reads. A control port kills the Philo process with SIGKILL and
 // starts another on the same database.
+//
+// PHILO_PUBLISH_CRASH=1 changes Start server after the during log is armed.
+// That start runs a process until the resumed row is committed and the
+// publish line is reached, then SIGKILLs it before h.Publish and starts
+// another process on the same database. Delve stops on that source line.
+// The server binary has no pause flag. Leave the variable unset for the
+// other restart test.
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
+import { createConnection } from "node:net";
 import { openSync } from "node:fs";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 const token = "test-fixture-token";
 const workspace = "test-fixture-source";
@@ -21,6 +30,7 @@ const bin = process.env.PHILO_BIN;
 const logDir = process.env.PHILO_HARNESS_LOG_DIR;
 const controlAddr = process.env.PHILO_HARNESS_ADDR || "127.0.0.1:9393";
 const philoAddr = "127.0.0.1:8080";
+const killBeforePublish = process.env.PHILO_PUBLISH_CRASH === "1";
 
 if (!dsn || !bin || !logDir) {
   console.error("PHILO_DATABASE_URL, PHILO_BIN, and PHILO_HARNESS_LOG_DIR are required");
@@ -316,6 +326,131 @@ function arm(name, text) {
   return task;
 }
 
+function dlvClient(socket) {
+  let buf = Buffer.alloc(0);
+  const pending = [];
+  socket.on("data", (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    let nl = buf.indexOf(10);
+    while (nl >= 0) {
+      const raw = buf.slice(0, nl).toString("utf8");
+      buf = buf.slice(nl + 1);
+      nl = buf.indexOf(10);
+      if (!raw.trim()) continue;
+      const msg = JSON.parse(raw);
+      const waiter = pending.shift();
+      if (!waiter) continue;
+      if (msg.error) waiter.reject(new Error(JSON.stringify(msg.error)));
+      else waiter.resolve(msg.result);
+    }
+  });
+  return (method, params) =>
+    new Promise((resolve, reject) => {
+      pending.push({ resolve, reject });
+      socket.write(JSON.stringify({ method, params: [params], id: pending.length }) + "\n");
+    });
+}
+
+function processState(pid) {
+  return readFile(`/proc/${pid}/status`, "utf8").catch(() => "");
+}
+
+// startKilledBeforePublish commits the armed during log, stops on the
+// h.Publish line, and SIGKILLs that process before the call runs. The next
+// process reads the stored public seq and does not insert the log again.
+async function startKilledBeforePublish() {
+  const dlvBin = process.env.PHILO_DLV || "dlv";
+  const publishFile = fileURLToPath(new URL("../server/internal/httpapi/httpapi.go", import.meta.url));
+  const source = await readFile(publishFile, "utf8");
+  const publishLine = source.split("\n").findIndex((line) => line.includes("h.Publish(turn.Binding.ConversationID, item)")) + 1;
+  if (publishLine < 1) throw new Error("publish line not found");
+  const crashedLog = `${logDir}/philo-before-publish.log`;
+  const dlvLog = `${logDir}/dlv.log`;
+  const dlvProc = spawn(
+    dlvBin,
+    [
+      "exec",
+      bin,
+      "--headless",
+      "--api-version=2",
+      "--accept-multiclient",
+      "--check-go-version=false",
+      "--listen=127.0.0.1:0",
+      "--log",
+      `--log-dest=${dlvLog}`,
+      `-r=stdout:${crashedLog}`,
+      `-r=stderr:${crashedLog}`,
+    ],
+    { env: philoEnv(true), stdio: ["ignore", "ignore", "ignore"] },
+  );
+  log(`dlv start pid=${dlvProc.pid} line=${publishLine}`);
+  let socket;
+  try {
+    const apiAddr = await waitFor("dlv listen", async () => {
+      const text = await readFile(dlvLog, "utf8").catch(() => "");
+      const match = text.match(/API server listening at: (\S+)/);
+      return match ? match[1] : "";
+    }).then(async () => {
+      const text = await readFile(dlvLog, "utf8");
+      return text.match(/API server listening at: (\S+)/)[1];
+    });
+    socket = await new Promise((resolve, reject) => {
+      const [host, port] = apiAddr.split(":");
+      const conn = createConnection({ host, port: Number(port) });
+      conn.once("error", reject);
+      conn.once("connect", () => resolve(conn));
+    });
+    const call = dlvClient(socket);
+    const created = await call("RPCServer.CreateBreakpoint", {
+      Breakpoint: { name: "beforePublish", file: publishFile, line: publishLine },
+    });
+    if (!created.Breakpoint?.addrs?.length) throw new Error("publish breakpoint has no address");
+    log(`breakpoint file=${created.Breakpoint.file} line=${created.Breakpoint.line}`);
+    const continued = call("RPCServer.Command", { name: "continue" });
+    continued.catch(() => {});
+    const stopped = await Promise.race([
+      continued,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("publish line was not reached")), 15000)),
+    ]);
+    const pid = stopped.State?.Pid;
+    const goroutineID = stopped.State?.currentGoroutine?.id;
+    if (!pid || !goroutineID) {
+      await writeFile(`${logDir}/stopped-state.json`, JSON.stringify(stopped.State ?? stopped, null, 2));
+      throw new Error("stopped process has no pid or goroutine");
+    }
+    const traced = await call("RPCServer.Stacktrace", { Id: goroutineID, Depth: 8, Full: false });
+    const stack = (traced.Locations || []).map((frame) => `${frame.function?.name || "?"} ${frame.file}:${frame.line}`);
+    await writeFile(`${logDir}/publish-crash-stack.txt`, stack.join("\n") + "\n");
+    const crashedText = await readFile(crashedLog, "utf8").catch(() => "");
+    if (crashedText.includes("startup resume published")) {
+      throw new Error("h.Publish already ran");
+    }
+    const committed = await psql(`SELECT count(*) FROM messages WHERE content = '${duringText}'`);
+    if (committed !== "1") throw new Error(`during rows at the publish line = ${committed}`);
+    const db = await psql(`
+      SELECT 'msg|' || m.role || '|' || m.content || '|' || coalesce(m.turn_id::text, '')
+      FROM messages m ORDER BY m.created_at, m.id;
+      SELECT 'ev|' || cursor || '|' || event_type || '|' || conversation_id FROM business_events ORDER BY conversation_id, cursor;
+      SELECT 'ck|' || applied_public_seq || '|' || task_id FROM source_checkpoints ORDER BY task_id;
+      SELECT 'outbox|' || kind || '|' || count(*) FROM outbox GROUP BY kind ORDER BY kind;
+      SELECT 'users|' || count(*) FROM messages WHERE role = 'user';
+    `);
+    await writeFile(`${logDir}/publish-crash-db.txt`, db + "\n");
+    process.kill(pid, "SIGKILL");
+    log(`kill pid=${pid} requested=SIGKILL phase=before-publish`);
+    await waitFor("killed process", async () => {
+      const status = await processState(pid);
+      return status === "" || status.includes("State:\tZ");
+    });
+    const status = await processState(pid);
+    log(`killed pid=${pid} state=${status.includes("State:\tZ") ? "zombie" : "gone"}`);
+    return pid;
+  } finally {
+    socket?.end();
+    if (dlvProc.exitCode === null && !dlvProc.signalCode) dlvProc.kill("SIGKILL");
+  }
+}
+
 const control = createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/status") {
@@ -335,6 +470,10 @@ const control = createServer(async (req, res) => {
       return;
     }
     if (req.method === "POST" && req.url === "/start") {
+      let killedPid = 0;
+      if (killBeforePublish && tasks[0]?.extras.some((row) => row.text === duringText)) {
+        killedPid = await startKilledBeforePublish();
+      }
       const proc = startPhilo(true);
       await waitFor("listen", healthOk);
       if (tasks[0]?.extras.some((row) => row.text === duringText)) {
@@ -342,8 +481,22 @@ const control = createServer(async (req, res) => {
           const count = await psql(`SELECT count(*) FROM messages WHERE content = '${duringText}'`);
           return count === "1";
         });
+        if (killedPid) {
+          await waitFor("successor passed the stored seq", async () => {
+            const text = await readFile(proc.logPath, "utf8");
+            return text.includes("after=3");
+          });
+          const count = await psql(`SELECT count(*) FROM messages WHERE content = '${duringText}'`);
+          if (count !== "1") throw new Error(`successor changed during rows to ${count}`);
+          const text = await readFile(proc.logPath, "utf8");
+          if (text.includes("startup resume published")) {
+            throw new Error("successor published the log that was already committed");
+          }
+          const users = await psql(`SELECT count(*) FROM messages WHERE role = 'user'`);
+          if (users !== "2") throw new Error(`user rows = ${users}`);
+        }
       }
-      send(res, 200, { pid: proc.pid, mode: "bound" });
+      send(res, 200, { pid: proc.pid, killedPid, mode: "bound" });
       return;
     }
     if (req.method === "POST" && req.url === "/arm/during") {

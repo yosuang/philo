@@ -100,6 +100,12 @@ nsh test reconnect-cursor.test.tsx --target linux
 nsh test client-restart.test.tsx --target linux
 ```
 
+`publish-crash.test.tsx` is the same two bots and the same labeled fixture. After the during log is armed, Start server runs a process that commits that log and is killed on the publish line, before the client is told. Another process listens on the same database. The open client shows the line once on that bot. The other bot's cursor stays where it was. No second user message is sent. Set `PHILO_PUBLISH_CRASH=1` on the harness. `dlv` must be on `PATH`. The server build has no pause flag. Leave `PHILO_EXECUTION_FIXTURE` and `PHILO_MAKEZ_URL` unset.
+
+```bash
+nsh test publish-crash.test.tsx --target linux
+```
+
 ## Contract notes
 
 List bodies are `{"agents":[]}`, `{"sessions":[]}`, `{"messages":[]}`, `{"approvals":[]}`, `{"tasks":[]}`, or `{"connectors":[]}`. A bare array is accepted too. `message.delta` `text` is appended. A stored message `error` is `{ "code", "message" }`. Assistant completion from the server is status `complete`.
