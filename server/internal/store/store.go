@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -20,7 +21,8 @@ var (
 	ErrBusy = errors.New("reply in progress")
 	// ErrNotRetryable means the message cannot be regenerated.
 	ErrNotRetryable = errors.New("not retryable")
-	// ErrNotPending means the approval was already decided.
+	// ErrNotPending means the approval is not an open card. A decided card and
+	// a card invalidated by an edit are both not pending.
 	ErrNotPending = errors.New("not pending")
 	// ErrForbidden means the authenticated owner does not own the record.
 	ErrForbidden = errors.New("forbidden")
@@ -79,16 +81,30 @@ type Message struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// Approval is a draft action waiting for an explicit decision.
+// Approval is one card. It binds an immutable action snapshot and the
+// requester actor from the server-configured bearer. A client-supplied owner
+// is not that actor. Status invalid means the action changed and this card
+// is not a grant.
 type Approval struct {
-	ID        string    `json:"id"`
-	SessionID string    `json:"sessionId"`
-	MessageID string    `json:"messageId"`
-	Kind      string    `json:"kind"`
-	Summary   string    `json:"summary"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID               string          `json:"id"`
+	SessionID        string          `json:"sessionId"`
+	MessageID        string          `json:"messageId"`
+	Kind             string          `json:"kind"`
+	Summary          string          `json:"summary"`
+	Status           string          `json:"status"`
+	RequesterActorID string          `json:"requesterActorId,omitempty"`
+	ActionSnapshot   json.RawMessage `json:"actionSnapshot,omitempty"`
+	CreatedAt        time.Time       `json:"createdAt"`
+	UpdatedAt        time.Time       `json:"updatedAt"`
+}
+
+// WorkerClaim is text returned for a task. Snapshot, Decision, and OwnerID
+// are not grants and are not a client credential.
+type WorkerClaim struct {
+	Text     string
+	Snapshot json.RawMessage
+	Decision string
+	OwnerID  string
 }
 
 // Task is in-server work created only after an approval.

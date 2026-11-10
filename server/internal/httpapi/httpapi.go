@@ -279,6 +279,7 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/sessions/{id}/cancel", s.cancel)
 	mux.HandleFunc("POST /v1/messages/{id}/retry", s.retry)
 	mux.HandleFunc("GET /v1/approvals", s.listApprovals)
+	mux.HandleFunc("POST /v1/approvals/{id}/edit", s.editApproval)
 	mux.HandleFunc("POST /v1/approvals/{id}/decision", s.decide)
 	mux.HandleFunc("GET /v1/tasks", s.listTasks)
 	mux.HandleFunc("GET /v1/connectors", s.connectors)
@@ -722,6 +723,79 @@ func (s *server) retry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, msg)
 }
 
+func (s *server) editApproval(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	current, err := s.store.GetApproval(r.Context(), id)
+	if err != nil {
+		s.storeErr(w, err, "approval not found")
+		return
+	}
+	if _, err := s.store.RequireSession(r.Context(), p.OwnerID, current.SessionID); err != nil {
+		s.storeErr(w, err, "approval not found")
+		return
+	}
+	var body struct {
+		Kind      string `json:"kind"`
+		Summary   string `json:"summary"`
+		Owner     string `json:"owner"`
+		OwnerID   string `json:"owner_id"`
+		Requester string `json:"requester"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	// Owner, OwnerID, and Requester are not credentials.
+	_ = body.Owner
+	_ = body.OwnerID
+	_ = body.Requester
+	kind := strings.TrimSpace(body.Kind)
+	if kind == "" {
+		kind = current.Kind
+	}
+	kind, ok = bounded(w, kind, "kind", maxModelID)
+	if !ok {
+		return
+	}
+	if kind == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "kind is required")
+		return
+	}
+	summary, ok := required(w, body.Summary, "summary", maxContent)
+	if !ok {
+		return
+	}
+	previous, next, changed, err := s.store.ReplaceAction(r.Context(), id, p.ActorID, kind, summary)
+	if errors.Is(err, store.ErrNotPending) {
+		writeError(w, http.StatusConflict, "approval_not_pending", "approval is not pending")
+		return
+	}
+	if err != nil {
+		s.storeErr(w, err, "approval not found")
+		return
+	}
+	if changed {
+		s.publishApproval("approval.updated", previous)
+		s.publishApproval("approval.requested", next)
+	}
+	writeJSON(w, http.StatusOK, next)
+}
+
+func (s *server) publishApproval(eventType string, approval store.Approval) {
+	ev, err := events.WithType(eventType, approval)
+	if err != nil {
+		log.Printf("approval event: %v", err)
+		return
+	}
+	s.hub.Publish(approval.SessionID, ev)
+}
+
 func (s *server) listApprovals(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.principal(w, r)
 	if !ok {
@@ -762,14 +836,28 @@ func (s *server) decide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Decision string `json:"decision"`
+		Decision  string          `json:"decision"`
+		Owner     string          `json:"owner"`
+		OwnerID   string          `json:"owner_id"`
+		Requester string          `json:"requester"`
+		Snapshot  json.RawMessage `json:"actionSnapshot"`
 	}
 	if !decode(w, r, &body) {
 		return
 	}
+	// A client-supplied owner, requester, or snapshot is not authentication
+	// and does not replace the card.
+	_ = body.Owner
+	_ = body.OwnerID
+	_ = body.Requester
+	_ = body.Snapshot
 	decision := strings.TrimSpace(body.Decision)
 	if decision != "approve" && decision != "reject" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "decision must be approve or reject")
+		return
+	}
+	if current.Status == "pending" && (current.RequesterActorID == "" || len(current.ActionSnapshot) == 0) {
+		writeError(w, http.StatusForbidden, "permission_denied", "permission denied")
 		return
 	}
 	approval, err := s.eng.Decide(r.Context(), id, decision)
