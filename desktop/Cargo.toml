@@ -1,0 +1,28 @@
+[package]
+name = "nsh-app-philo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Philo desktop client"
+
+[workspace]
+
+[dependencies]
+nsh-core = "0.4.0"
+nsh-base = "0.4.0"
+env_logger = "0.11"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nsh-platform-linux = { version = "0.4.0", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "0.4.0", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nsh-platform-windows = { version = "0.4.0", default-features = false }

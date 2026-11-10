@@ -1,0 +1,890 @@
+// Package httpapi is the phase-1 HTTP and WebSocket surface.
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/yosuang/philo/server/internal/adapter"
+	"github.com/yosuang/philo/server/internal/adapter/dev"
+	"github.com/yosuang/philo/server/internal/auth"
+	"github.com/yosuang/philo/server/internal/config"
+	"github.com/yosuang/philo/server/internal/engine"
+	"github.com/yosuang/philo/server/internal/events"
+	"github.com/yosuang/philo/server/internal/hub"
+	"github.com/yosuang/philo/server/internal/idempotency"
+	"github.com/yosuang/philo/server/internal/makez"
+	"github.com/yosuang/philo/server/internal/store"
+)
+
+const (
+	maxName         = 200
+	maxInstructions = 20000
+	maxModelID      = 200
+	maxTitle        = 200
+	maxContent      = 100000
+)
+
+// App is the session server handler.
+type App struct {
+	Handler http.Handler
+	engine  *engine.Engine
+}
+
+// Stop cancels in-flight generations.
+func (a *App) Stop() {
+	if a != nil && a.engine != nil {
+		a.engine.Stop()
+	}
+}
+
+type server struct {
+	store *store.Store
+	eng   *engine.Engine
+	hub   *hub.Hub
+	cfg   config.Config
+	authn auth.Authenticator
+	http  *http.Client
+}
+
+// New builds the HTTP handler. The pool must already be migrated.
+// An unknown PHILO_MODEL_ADAPTER is refused. Unset does not select dev.
+// The dev adapter runs only when ExecutionFixture is dev.
+func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
+	ad, err := newAdapter(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if pool == nil {
+		return nil, errors.New("database pool is required")
+	}
+	st := store.New(pool)
+	h := hub.New()
+	eng := engine.New(st, ad, h, cfg.DevFixture())
+	s := &server{
+		store: st,
+		eng:   eng,
+		hub:   h,
+		cfg:   cfg,
+		authn: auth.New(cfg.Credentials),
+		http:  &http.Client{Timeout: 2 * time.Second},
+	}
+	mux := http.NewServeMux()
+	s.routes(mux)
+	return &App{Handler: mux, engine: eng}, nil
+}
+
+func newAdapter(cfg config.Config) (adapter.Adapter, error) {
+	if cfg.DevFixture() {
+		return dev.New(cfg.DevChunkDelay), nil
+	}
+	switch cfg.Adapter {
+	case "", "dev", "provider", "unavailable":
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unknown PHILO_MODEL_ADAPTER %q", cfg.Adapter)
+	}
+}
+
+func (s *server) routes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/health", s.health)
+	mux.HandleFunc("POST /v1/agents", s.createAgent)
+	mux.HandleFunc("GET /v1/agents", s.listAgents)
+	mux.HandleFunc("GET /v1/agents/{id}", s.getAgent)
+	mux.HandleFunc("PATCH /v1/agents/{id}", s.patchAgent)
+	mux.HandleFunc("POST /v1/sessions", s.createSession)
+	mux.HandleFunc("GET /v1/sessions", s.listSessions)
+	mux.HandleFunc("GET /v1/sessions/{id}", s.getSession)
+	mux.HandleFunc("GET /v1/sessions/{id}/messages", s.listMessages)
+	mux.HandleFunc("POST /v1/sessions/{id}/messages", s.postMessage)
+	mux.HandleFunc("POST /v1/sessions/{id}/cancel", s.cancel)
+	mux.HandleFunc("POST /v1/messages/{id}/retry", s.retry)
+	mux.HandleFunc("GET /v1/approvals", s.listApprovals)
+	mux.HandleFunc("POST /v1/approvals/{id}/decision", s.decide)
+	mux.HandleFunc("GET /v1/tasks", s.listTasks)
+	mux.HandleFunc("GET /v1/connectors", s.connectors)
+	mux.HandleFunc("GET /v1/events", s.events)
+	mux.HandleFunc("POST /v1/agents/{id}/conversation", s.openConversation)
+	mux.HandleFunc("GET /v1/agents/{id}/conversation", s.getConversation)
+	mux.HandleFunc("GET /v1/sessions/{id}/snapshot", s.snapshot)
+	mux.HandleFunc("GET /v1/sessions/{id}/business-events", s.businessEvents)
+	if s.cfg.BusinessFixture {
+		mux.HandleFunc("POST /v1/fixture-business-source", s.fixtureBusiness)
+	}
+}
+
+func (s *server) health(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+	err := s.store.Ping(ctx)
+	cancel()
+	status := http.StatusOK
+	ok := true
+	if err != nil {
+		status = http.StatusServiceUnavailable
+		ok = false
+	}
+	conn := s.makezStatus(r.Context())
+	writeJSON(w, status, map[string]any{
+		"ok":      ok,
+		"adapter": s.cfg.HealthAdapter(),
+		"makez":   makez.HealthValue(conn),
+	})
+}
+
+func (s *server) connectors(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.principal(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"connectors": []makez.Connector{s.makezStatus(r.Context())},
+	})
+}
+
+func (s *server) makezStatus(parent context.Context) makez.Connector {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	return makez.Status(ctx, s.cfg.MakezURL, s.http)
+}
+
+func (s *server) events(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	s.hub.Handle(w, r, func(ctx context.Context, id string) (bool, error) {
+		return s.store.SessionOwned(ctx, p.OwnerID, id)
+	})
+}
+
+func (s *server) principal(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
+	p, err := s.authn.Authenticate(r.Header.Get("Authorization"))
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "authentication_required", "authentication is required")
+		return auth.Principal{}, false
+	}
+	if err := s.store.EnsurePrincipal(r.Context(), p); err != nil {
+		s.internal(w, err)
+		return auth.Principal{}, false
+	}
+	return p, true
+}
+
+func (s *server) createAgent(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Name         string `json:"name"`
+		Instructions string `json:"instructions"`
+		ModelID      string `json:"modelId"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	name, ok := required(w, body.Name, "name", maxName)
+	if !ok {
+		return
+	}
+	instructions, ok := bounded(w, body.Instructions, "instructions", maxInstructions)
+	if !ok {
+		return
+	}
+	modelID, ok := required(w, body.ModelID, "modelId", maxModelID)
+	if !ok {
+		return
+	}
+	agent, err := s.store.CreateAgent(r.Context(), p.OwnerID, name, instructions, modelID)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, agent)
+}
+
+func (s *server) listAgents(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	agents, err := s.store.ListAgents(r.Context(), p.OwnerID)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agents": agents})
+}
+
+func (s *server) getAgent(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	agent, err := s.store.RequireAgent(r.Context(), p.OwnerID, id)
+	if err != nil {
+		s.storeErr(w, err, "agent not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, agent)
+}
+
+func (s *server) patchAgent(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Name         *string `json:"name"`
+		Instructions *string `json:"instructions"`
+		ModelID      *string `json:"modelId"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if body.Name == nil && body.Instructions == nil && body.ModelID == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "no fields to update")
+		return
+	}
+	if body.Name != nil {
+		name, ok := required(w, *body.Name, "name", maxName)
+		if !ok {
+			return
+		}
+		body.Name = &name
+	}
+	if body.Instructions != nil {
+		instructions, ok := bounded(w, *body.Instructions, "instructions", maxInstructions)
+		if !ok {
+			return
+		}
+		body.Instructions = &instructions
+	}
+	if body.ModelID != nil {
+		modelID, ok := required(w, *body.ModelID, "modelId", maxModelID)
+		if !ok {
+			return
+		}
+		body.ModelID = &modelID
+	}
+	agent, err := s.store.UpdateAgent(r.Context(), p.OwnerID, id, body.Name, body.Instructions, body.ModelID)
+	if err != nil {
+		s.storeErr(w, err, "agent not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, agent)
+}
+
+func (s *server) createSession(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		AgentID string `json:"agentId"`
+		Title   string `json:"title"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	agentID, ok := uuidParam(w, body.AgentID, "agentId")
+	if !ok {
+		return
+	}
+	title, ok := bounded(w, body.Title, "title", maxTitle)
+	if !ok {
+		return
+	}
+	sess, err := s.store.CreateSession(r.Context(), p.OwnerID, agentID, title)
+	if err != nil {
+		s.storeErr(w, err, "agent not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, sess)
+}
+
+func (s *server) listSessions(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	agentID, ok := uuidParam(w, r.URL.Query().Get("agentId"), "agentId")
+	if !ok {
+		return
+	}
+	sessions, err := s.store.ListSessions(r.Context(), p.OwnerID, agentID)
+	if err != nil {
+		s.storeErr(w, err, "agent not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
+func (s *server) getSession(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	sess, err := s.store.RequireSession(r.Context(), p.OwnerID, id)
+	if err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, sess)
+}
+
+func (s *server) listMessages(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.store.RequireSession(r.Context(), p.OwnerID, id); err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	messages, err := s.store.ListMessages(r.Context(), id)
+	if err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"messages": messages})
+}
+
+func (s *server) postMessage(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.store.RequireSession(r.Context(), p.OwnerID, id); err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	key, ok := idempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	body, ok := decodeSubmit(w, r)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(body.Content) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "content is required")
+		return
+	}
+	if utf8.RuneCountInString(body.Content) > maxContent {
+		writeError(w, http.StatusBadRequest, "invalid_request", "content is too long")
+		return
+	}
+	options, err := idempotency.ParseOptions(body.Options)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "options must be a JSON object")
+		return
+	}
+	hash, err := idempotency.Hash(idempotency.SubmitPayload(body.Content, options))
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	result, err := s.store.AcceptSubmit(r.Context(), store.SubmitInput{
+		OwnerID:        p.OwnerID,
+		ActorID:        p.ActorID,
+		ConversationID: id,
+		Key:            key,
+		Content:        body.Content,
+		Hash:           hash,
+		Fixture:        s.cfg.DevFixture(),
+	})
+	if errors.Is(err, store.ErrBusy) {
+		writeError(w, http.StatusConflict, "reply_in_progress", "this session already has a streaming reply")
+		return
+	}
+	if errors.Is(err, store.ErrIdempotencyConflict) {
+		writeError(w, http.StatusConflict, "idempotency_conflict", "request conflicts with the stored operation")
+		return
+	}
+	if err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	if !result.Replayed {
+		if sess, err := s.store.GetSession(r.Context(), id); err == nil {
+			if ev, err := events.WithType("session.updated", sess); err == nil {
+				s.hub.Publish(sess.ID, ev)
+			}
+		}
+	}
+	if s.cfg.DevFixture() && !result.Replayed && result.Assistant != nil {
+		s.eng.StartFixture(result.Assistant.ID)
+	}
+	execution := "unavailable"
+	if s.cfg.DevFixture() {
+		execution = "fixture"
+	}
+	out := map[string]any{
+		"turnId":      result.TurnID,
+		"replayed":    result.Replayed,
+		"execution":   execution,
+		"userMessage": result.User,
+	}
+	if result.Assistant != nil {
+		out["assistantMessage"] = result.Assistant
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *server) cancel(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.store.RequireSession(r.Context(), p.OwnerID, id); err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	msg, err := s.eng.Cancel(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusConflict, "nothing_to_cancel", "this session has no streaming reply")
+		return
+	}
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, msg)
+}
+
+func (s *server) retry(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if !s.cfg.DevFixture() {
+		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "execution is unavailable")
+		return
+	}
+	msg, err := s.store.GetMessage(r.Context(), id)
+	if err != nil {
+		s.storeErr(w, err, "message not found")
+		return
+	}
+	if _, err := s.store.RequireSession(r.Context(), p.OwnerID, msg.SessionID); err != nil {
+		s.storeErr(w, err, "message not found")
+		return
+	}
+	msg, err = s.eng.Retry(r.Context(), id)
+	if errors.Is(err, store.ErrNotRetryable) {
+		writeError(w, http.StatusConflict, "not_retryable", "only an assistant message in error or canceled can be retried")
+		return
+	}
+	if errors.Is(err, store.ErrBusy) {
+		writeError(w, http.StatusConflict, "reply_in_progress", "this session already has a streaming reply")
+		return
+	}
+	if err != nil {
+		s.storeErr(w, err, "message not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, msg)
+}
+
+func (s *server) listApprovals(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	sessionID, ok := uuidParam(w, r.URL.Query().Get("sessionId"), "sessionId")
+	if !ok {
+		return
+	}
+	if _, err := s.store.RequireSession(r.Context(), p.OwnerID, sessionID); err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	approvals, err := s.store.ListApprovals(r.Context(), sessionID)
+	if err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"approvals": approvals})
+}
+
+func (s *server) decide(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	current, err := s.store.GetApproval(r.Context(), id)
+	if err != nil {
+		s.storeErr(w, err, "approval not found")
+		return
+	}
+	if _, err := s.store.RequireSession(r.Context(), p.OwnerID, current.SessionID); err != nil {
+		s.storeErr(w, err, "approval not found")
+		return
+	}
+	var body struct {
+		Decision string `json:"decision"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	decision := strings.TrimSpace(body.Decision)
+	if decision != "approve" && decision != "reject" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "decision must be approve or reject")
+		return
+	}
+	approval, err := s.eng.Decide(r.Context(), id, decision)
+	if errors.Is(err, store.ErrNotPending) {
+		writeError(w, http.StatusConflict, "approval_not_pending", "approval is not pending")
+		return
+	}
+	if err != nil {
+		s.storeErr(w, err, "approval not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, approval)
+}
+
+func (s *server) listTasks(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	sessionID, ok := uuidParam(w, r.URL.Query().Get("sessionId"), "sessionId")
+	if !ok {
+		return
+	}
+	if _, err := s.store.RequireSession(r.Context(), p.OwnerID, sessionID); err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	tasks, err := s.store.ListTasks(r.Context(), sessionID)
+	if err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})
+}
+
+func (s *server) storeErr(w http.ResponseWriter, err error, notFound string) {
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", notFound)
+		return
+	}
+	if errors.Is(err, store.ErrForbidden) {
+		writeError(w, http.StatusForbidden, "permission_denied", "permission denied")
+		return
+	}
+	if errors.Is(err, store.ErrIdempotencyConflict) {
+		writeError(w, http.StatusConflict, "idempotency_conflict", "request conflicts with the stored operation")
+		return
+	}
+	s.internal(w, err)
+}
+
+func (s *server) internal(w http.ResponseWriter, err error) {
+	log.Printf("request failed: %v", err)
+	writeError(w, http.StatusInternalServerError, "internal", "internal error")
+}
+
+func (s *server) openConversation(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	sess, err := s.store.OpenDefaultConversation(r.Context(), p.OwnerID, id)
+	if err != nil {
+		s.storeErr(w, err, "agent not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, sess)
+}
+
+func (s *server) getConversation(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	sess, err := s.store.DefaultConversation(r.Context(), p.OwnerID, id)
+	if err != nil {
+		s.storeErr(w, err, "conversation not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, sess)
+}
+
+func (s *server) snapshot(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	snap, err := s.store.Snapshot(r.Context(), p.OwnerID, id)
+	if err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+func (s *server) businessEvents(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	raw := strings.TrimSpace(r.URL.Query().Get("after"))
+	if raw == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "after is required")
+		return
+	}
+	after, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || after < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "after must be a non-negative integer")
+		return
+	}
+	events, snap, err := s.store.BusinessEventsAfter(r.Context(), p.OwnerID, id, after)
+	if errors.Is(err, store.ErrCursorExpired) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{
+				"code":    "invalid_request",
+				"message": "business cursor expired",
+			},
+			"snapshot": snap,
+		})
+		return
+	}
+	if err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	out := make([]any, 0, len(events))
+	for _, ev := range events {
+		item, err := ev.MarshalMap()
+		if err != nil {
+			s.internal(w, err)
+			return
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": out})
+}
+
+func (s *server) fixtureBusiness(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.principal(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Source         string `json:"source"`
+		ConversationID string `json:"conversationId"`
+		EventKey       string `json:"eventKey"`
+		Type           string `json:"type"`
+		MessageID      string `json:"messageId"`
+		Text           string `json:"text"`
+		Status         string `json:"status"`
+	}
+	if !decodeStrict(w, r, &body) {
+		return
+	}
+	if body.Source != store.FixtureSource {
+		writeError(w, http.StatusBadRequest, "invalid_request", "fixture source label is required")
+		return
+	}
+	conversationID, ok := uuidParam(w, body.ConversationID, "conversationId")
+	if !ok {
+		return
+	}
+	ev, err := s.store.ApplyFixtureBusiness(r.Context(), store.FixtureInput{
+		Source:         body.Source,
+		OwnerID:        p.OwnerID,
+		ConversationID: conversationID,
+		EventKey:       body.EventKey,
+		Type:           body.Type,
+		MessageID:      body.MessageID,
+		Text:           body.Text,
+		Status:         body.Status,
+	})
+	if err != nil {
+		s.storeErr(w, err, "session not found")
+		return
+	}
+	item, err := ev.MarshalMap()
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func pathID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	return uuidParam(w, r.PathValue("id"), "id")
+}
+
+func uuidParam(w http.ResponseWriter, value, field string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", field+" is required")
+		return "", false
+	}
+	id, err := uuid.Parse(value)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_id", field+" must be a UUID")
+		return "", false
+	}
+	return id.String(), true
+}
+
+func required(w http.ResponseWriter, value, field string, max int) (string, bool) {
+	value, ok := bounded(w, value, field, max)
+	if !ok {
+		return "", false
+	}
+	if value == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", field+" is required")
+		return "", false
+	}
+	return value, true
+}
+
+func bounded(w http.ResponseWriter, value, field string, max int) (string, bool) {
+	value = strings.TrimSpace(value)
+	if utf8.RuneCountInString(value) > max {
+		writeError(w, http.StatusBadRequest, "invalid_request", field+" is too long")
+		return "", false
+	}
+	return value, true
+}
+
+type submitBody struct {
+	Content string          `json:"content"`
+	Options json.RawMessage `json:"options"`
+}
+
+func idempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if len(key) >= 2 && key[0] == '"' && key[len(key)-1] == '"' {
+		key = strings.TrimSpace(key[1 : len(key)-1])
+	}
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Idempotency-Key is required")
+		return "", false
+	}
+	if len(key) > 128 || strings.ContainsAny(key, " \t\r\n") {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Idempotency-Key is invalid")
+		return "", false
+	}
+	return key, true
+}
+
+func decodeSubmit(w http.ResponseWriter, r *http.Request) (submitBody, bool) {
+	var body submitBody
+	if !decodeStrict(w, r, &body) {
+		return submitBody{}, false
+	}
+	return body, true
+}
+
+func decodeStrict(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusBadRequest, "invalid_request", "request body is too large")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_request", "request body has an unknown field or is not JSON")
+		return false
+	}
+	return true
+}
+
+func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusBadRequest, "invalid_request", "request body is too large")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", "request body must be JSON")
+		return false
+	}
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("write json: %v", err)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, map[string]any{
+		"error": map[string]string{
+			"code":    code,
+			"message": message,
+		},
+	})
+}

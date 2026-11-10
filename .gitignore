@@ -1,0 +1,6 @@
+.env
+.env.*
+/philo-server
+/server/philo-server
+*.exe
+*.test
