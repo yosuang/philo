@@ -45,12 +45,17 @@ const (
 )
 
 // TestOSKillResumesFixtureSource kills one Philo OS process and reads the
-// same database from a second process. A second Store in this process is
-// not a kill. SIGKILL, SIGTERM, and an injected fault are separate cases.
+// same database from a second process. Resume is the new process starting.
+// A later POST /v1/sessions/.../messages is not that path. SIGKILL after
+// commit, SIGKILL during an open transaction, SIGTERM, and an injected
+// fault are separate cases.
 func TestOSKillResumesFixtureSource(t *testing.T) {
 	bin := buildPhiloServer(t)
-	t.Run("sigkill", func(t *testing.T) {
+	t.Run("sigkill-after-commit", func(t *testing.T) {
 		resumeFixtureSource(t, bin, syscall.SIGKILL)
+	})
+	t.Run("sigkill-during-transaction", func(t *testing.T) {
+		killDuringTransaction(t, bin)
 	})
 	t.Run("graceful-sigterm", func(t *testing.T) {
 		resumeFixtureSource(t, bin, syscall.SIGTERM)
@@ -98,24 +103,20 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 	if before.applied != 2 || before.processing != fixtureProcessingCursor || before.logs != 2 || before.high != 1 {
 		t.Fatalf("committed view = %+v", before)
 	}
+	if before.turnID != turn || before.userID != user["id"] || before.taskID != src.TaskID || !before.outboxUnsent {
+		t.Fatalf("committed identity = %+v", before)
+	}
 	if before.high == before.applied || strconv.FormatInt(before.high, 10) == before.processing {
 		t.Fatalf("business high-water collapsed into the source checkpoint: %+v", before)
 	}
 	waitResult := stopPhilo(t, first, sig)
 
 	second := startPhiloOS(t, bin, dsn, extra, "test-binding")
+	assertStartupResume(t, second, src)
+	if n := messagePostsTo(second.url); n != 0 {
+		t.Fatalf("replay ran because the harness posted %d messages to the new process", n)
+	}
 	ws2 := dialLive(t, second.url, conv)
-	again := apiSubmit(t, second.url, conv, osKillClientKey, osKillContent)
-	if again["replayed"] != true || again["turnId"] != turn || again["execution"] != "test-binding" {
-		t.Fatalf("resume = %#v", again)
-	}
-	if _, ok := again["assistantMessage"]; ok {
-		t.Fatalf("resume stored an assistant: %#v", again)
-	}
-	third := apiSubmit(t, second.url, conv, osKillClientKey, osKillContent)
-	if third["replayed"] != true || third["turnId"] != turn {
-		t.Fatalf("second resume = %#v", third)
-	}
 	assertNoEngineCursor(t, ws2.drain(t, 300*time.Millisecond), conv, false)
 
 	after := durableView(t, pool, conv, src)
@@ -123,11 +124,11 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 		t.Fatalf("replay changed durable state\nbefore %+v\nafter  %+v", before, after)
 	}
 	cursors := src.eventCursors()
-	if len(cursors) != 3 || cursors[0] != "" || cursors[1] != "2" || cursors[2] != "2" {
-		t.Fatalf("resume cursors = %#v", cursors)
+	if len(cursors) != 2 || cursors[0] != "" || cursors[1] != "2" {
+		t.Fatalf("startup resume cursors = %#v", cursors)
 	}
 	if src.posts() != 1 {
-		t.Fatalf("resume submitted another task, posts=%d", src.posts())
+		t.Fatalf("startup submitted another task, posts=%d", src.posts())
 	}
 	for _, path := range src.paths() {
 		if strings.Contains(path, "/ack") || strings.Contains(path, "launcher") {
@@ -143,8 +144,12 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 	if len(messages) != 1 || messages[0].(map[string]any)["id"] != user["id"] || messages[0].(map[string]any)["content"] != osKillContent {
 		t.Fatalf("messages = %#v", messages)
 	}
+	if n := messagePostsTo(second.url); n != 0 {
+		t.Fatalf("replay ran because the harness posted %d messages to the new process", n)
+	}
 	writeCaseSummary(t, map[string]string{
 		"case":                  t.Name(),
+		"phase":                 "after-commit",
 		"signal":                signalName(sig),
 		"wait":                  waitResult,
 		"pid1":                  strconv.Itoa(first.pid),
@@ -157,13 +162,14 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 		"high_water":            strconv.FormatInt(after.high, 10),
 		"assistant_rows":        "0",
 	})
-	t.Logf("os-kill case=%s signal=%s wait=%s pid1=%d pid2=%d source=%s checkpoint=%d processing=%s cursors=%s high=%d",
-		t.Name(), signalName(sig), waitResult, first.pid, second.pid, fixtureSourceLabel, after.applied, after.processing, strings.Join(cursors, ","), after.high)
+	t.Logf("os-kill case=%s phase=after-commit signal=%s wait=%s pid1=%d pid2=%d source=%s checkpoint=%d processing=%s cursors=%s high=%d turn=%s user=%s outbox=%s",
+		t.Name(), signalName(sig), waitResult, first.pid, second.pid, fixtureSourceLabel, after.applied, after.processing, strings.Join(cursors, ","), after.high, after.turnID, after.userID, after.outboxID)
 }
 
 func killWithExecutionUnavailable(t *testing.T, bin string) {
 	t.Helper()
 	dsn := newProcessDSN(t)
+	decoy := startFixtureSource(t)
 	first := startPhiloOS(t, bin, dsn, nil, "unavailable")
 	agent := apiCreateAgent(t, first.url, "Cedar")
 	conv := apiOpenConversation(t, first.url, agent)
@@ -175,7 +181,6 @@ func killWithExecutionUnavailable(t *testing.T, bin string) {
 	if _, ok := posted["assistantMessage"]; ok {
 		t.Fatalf("unavailable submit stored an assistant: %#v", posted)
 	}
-	turn := posted["turnId"].(string)
 	user := posted["userMessage"].(map[string]any)
 	assertNoEngineCursor(t, ws.drain(t, 750*time.Millisecond), conv, true)
 	assertFixtureUnsetSurface(t, first.url)
@@ -188,12 +193,18 @@ func killWithExecutionUnavailable(t *testing.T, bin string) {
 
 	second := startPhiloOS(t, bin, dsn, nil, "unavailable")
 	assertFixtureUnsetSurface(t, second.url)
-	again := apiSubmit(t, second.url, conv, osKillClientKey, osKillContent)
-	if again["replayed"] != true || again["turnId"] != turn || again["execution"] != "unavailable" {
-		t.Fatalf("replay = %#v", again)
+	secondLog, err := os.ReadFile(second.logPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := again["assistantMessage"]; ok {
-		t.Fatalf("replay stored an assistant: %#v", again)
+	if strings.Contains(string(secondLog), "startup resume") {
+		t.Fatalf("unset binding resumed a source\n%s", secondLog)
+	}
+	if decoy.posts() != 0 || len(decoy.paths()) != 0 || len(decoy.eventCursors()) != 0 {
+		t.Fatalf("unset process used the network posts=%d paths=%v cursors=%v", decoy.posts(), decoy.paths(), decoy.eventCursors())
+	}
+	if n := messagePostsTo(second.url); n != 0 {
+		t.Fatalf("harness posted %d messages to the new process", n)
 	}
 	after := businessView(t, pool, conv)
 	if after != before {
@@ -218,8 +229,194 @@ func killWithExecutionUnavailable(t *testing.T, bin string) {
 		"high_water":     strconv.FormatInt(after.high, 10),
 		"assistant_rows": "0",
 	})
-	t.Logf("os-kill case=%s signal=%s wait=%s pid1=%d pid2=%d source=unset execution=unavailable high=%d",
+	t.Logf("os-kill case=%s signal=%s wait=%s pid1=%d pid2=%d source=unset execution=unavailable high=%d network=0",
 		t.Name(), signalName(syscall.SIGKILL), waitResult, first.pid, second.pid, after.high)
+}
+
+// killDuringTransaction sends SIGKILL while the submit transaction is waiting
+// on a row lock. That transaction must not commit. Startup must not invent a
+// source for it. This is not the after-commit resume.
+func killDuringTransaction(t *testing.T, bin string) {
+	t.Helper()
+	dsn := newProcessDSN(t)
+	src := startFixtureSource(t)
+	extra := map[string]string{
+		"PHILO_MAKEZ_API_URL":      src.URL,
+		"PHILO_MAKEZ_API_TOKEN":    src.Token,
+		"PHILO_MAKEZ_WORKSPACE_ID": src.Workspace,
+		"PHILO_MAKEZ_BINDING":      store.TestBindingLabel,
+	}
+	first := startPhiloOS(t, bin, dsn, extra, "test-binding")
+	agent := apiCreateAgent(t, first.url, "Cedar")
+	conv := apiOpenConversation(t, first.url, agent)
+	pool := connectDSN(t, dsn)
+	ctx := context.Background()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(conn.Release)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rolled := false
+	t.Cleanup(func() {
+		if !rolled {
+			_ = tx.Rollback(ctx)
+		}
+	})
+	var sessionID string
+	if err := tx.QueryRow(ctx, `SELECT id FROM sessions WHERE id = $1 FOR UPDATE`, conv).Scan(&sessionID); err != nil {
+		t.Fatal(err)
+	}
+	var holder int
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holder); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		body := strings.NewReader(`{"content":"Remember the cedar","options":{}}`)
+		req, err := http.NewRequest(http.MethodPost, first.url+"/v1/sessions/"+conv+"/messages", body)
+		if err != nil {
+			done <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		req.Header.Set("Idempotency-Key", "os-kill-open-tx")
+		noteMessagePost(req.URL.String())
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		done <- fmt.Errorf("status %d %s", resp.StatusCode, raw)
+	}()
+	waitUntil(t, func() bool {
+		var n int
+		err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> $1
+			  AND wait_event_type = 'Lock'`, holder).Scan(&n)
+		return err == nil && n >= 1
+	})
+	select {
+	case err := <-done:
+		t.Fatalf("submit finished before SIGKILL: %v", err)
+	default:
+	}
+	if src.posts() != 0 || len(src.eventCursors()) != 0 {
+		t.Fatalf("open transaction reached the fixture posts=%d cursors=%v", src.posts(), src.eventCursors())
+	}
+	var messages, checkpoints int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM messages`).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 0 {
+		t.Fatalf("uncommitted submit is visible, messages=%d", messages)
+	}
+	waitResult := stopPhilo(t, first, syscall.SIGKILL)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("submit did not return after SIGKILL")
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rolled = true
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM messages`).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM source_checkpoints`).Scan(&checkpoints); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 0 || checkpoints != 0 {
+		t.Fatalf("killed transaction committed messages=%d checkpoints=%d", messages, checkpoints)
+	}
+
+	second := startPhiloOS(t, bin, dsn, extra, "test-binding")
+	secondLog, err := os.ReadFile(second.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(secondLog)
+	resumeAt := strings.Index(text, "startup resume linked=0")
+	listenAt := strings.Index(text, "listening on")
+	if resumeAt < 0 || listenAt < 0 || resumeAt > listenAt {
+		t.Fatalf("startup scan was not before listen\n%s", text)
+	}
+	if strings.Contains(text, "after=") {
+		t.Fatalf("startup resumed a source that was not committed\n%s", text)
+	}
+	if src.posts() != 0 || len(src.paths()) != 0 {
+		t.Fatalf("startup called the fixture posts=%d paths=%v", src.posts(), src.paths())
+	}
+	if n := messagePostsTo(second.url); n != 0 {
+		t.Fatalf("harness posted %d messages to the new process", n)
+	}
+	snap := apiSnapshot(t, second.url, conv)
+	if snap["sessionId"] != conv || number(t, snap["highWater"]) != 0 {
+		t.Fatalf("snapshot = %#v", snap)
+	}
+	if msgs, ok := snap["messages"].([]any); ok && len(msgs) != 0 {
+		t.Fatalf("messages = %#v", msgs)
+	}
+	writeCaseSummary(t, map[string]string{
+		"case":           t.Name(),
+		"phase":          "during-transaction",
+		"signal":         signalName(syscall.SIGKILL),
+		"wait":           waitResult,
+		"pid1":           strconv.Itoa(first.pid),
+		"pid2":           strconv.Itoa(second.pid),
+		"source":         fixtureSourceLabel,
+		"checkpoint":     "0",
+		"assistant_rows": "0",
+		"fixture_posts":  "0",
+	})
+	t.Logf("os-kill case=%s phase=during-transaction signal=%s wait=%s pid1=%d pid2=%d source=%s checkpoint=0 fixture_posts=0",
+		t.Name(), signalName(syscall.SIGKILL), waitResult, first.pid, second.pid, fixtureSourceLabel)
+}
+
+func assertStartupResume(t *testing.T, p *philoProc, src *fixtureSource) {
+	t.Helper()
+	raw, err := os.ReadFile(p.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	mark := fmt.Sprintf("startup resume workspace=%s task=%s after=2", fixtureSourceLabel, src.TaskID)
+	resumeAt := strings.Index(text, mark)
+	listenAt := strings.Index(text, "listening on")
+	if resumeAt < 0 || listenAt < 0 || resumeAt > listenAt {
+		t.Fatalf("startup resume was not before listen\n%s", text)
+	}
+	if !strings.Contains(text, "startup resume linked=1") {
+		t.Fatalf("startup did not find the linked turn\n%s", text)
+	}
+	cursors := src.eventCursors()
+	if len(cursors) != 2 || cursors[0] != "" || cursors[1] != "2" {
+		t.Fatalf("startup resume cursors = %#v", cursors)
+	}
+	if src.posts() != 1 {
+		t.Fatalf("startup submitted another task, posts=%d", src.posts())
+	}
+}
+
+func waitUntil(t *testing.T, ready func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if ready() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for the open transaction")
 }
 
 // injectedFaultIsNotAKill rolls a projection back inside this process.
@@ -252,20 +449,27 @@ func injectedFaultIsNotAKill(t *testing.T) {
 }
 
 type durableState struct {
-	applied     int64
-	processing  string
-	logs        int
-	high        int64
-	events      int
-	assistants  int
-	completed   int
-	terminals   int
-	userID      string
-	userContent string
-	hashOne     string
-	hashTwo     string
-	workspace   string
-	runID       string
+	applied        int64
+	processing     string
+	logs           int
+	high           int64
+	events         int
+	assistants     int
+	completed      int
+	terminals      int
+	userID         string
+	userContent    string
+	hashOne        string
+	hashTwo        string
+	workspace      string
+	runID          string
+	turnID         string
+	taskID         string
+	eventID        string
+	outboxID       string
+	checkpointXmin string
+	outboxXmin     string
+	outboxUnsent   bool
 }
 
 func durableView(t *testing.T, pool *pgxpool.Pool, conv string, src *fixtureSource) durableState {
@@ -273,14 +477,16 @@ func durableView(t *testing.T, pool *pgxpool.Pool, conv string, src *fixtureSour
 	ctx := context.Background()
 	var got durableState
 	err := pool.QueryRow(ctx, `
-		SELECT c.applied_public_seq, c.processing_cursor,
+		SELECT c.applied_public_seq, c.processing_cursor, c.task_id, c.xmin::text,
 			(SELECT count(*) FROM source_log_dedup WHERE run_id = c.run_id),
 			s.business_high_water,
 			(SELECT count(*) FROM business_events WHERE conversation_id = s.id),
 			(SELECT count(*) FROM messages WHERE session_id = s.id AND role = 'assistant'),
 			(SELECT count(*) FROM tasks WHERE session_id = s.id AND status = 'completed'),
 			(SELECT count(*) FROM terminal_observations),
-			u.id, u.content, t.makez_workspace_id, t.makez_run_id
+			u.id, u.content, t.id, t.makez_workspace_id, t.makez_run_id,
+			(SELECT id FROM business_events WHERE conversation_id = s.id AND event_type = 'message.created'),
+			o.id, o.xmin::text, (o.published_at IS NULL)
 		FROM sessions s
 		JOIN turns t ON t.conversation_id = s.id
 		JOIN messages u ON u.turn_id = t.id AND u.role = 'user'
@@ -288,16 +494,21 @@ func durableView(t *testing.T, pool *pgxpool.Pool, conv string, src *fixtureSour
 		  ON c.workspace_id = t.makez_workspace_id
 		 AND c.task_id = t.makez_task_id
 		 AND c.run_id = t.makez_run_id
+		JOIN outbox o ON o.turn_id = t.id AND o.kind = 'submit'
 		WHERE s.id = $1`, conv).Scan(
-		&got.applied, &got.processing, &got.logs, &got.high, &got.events,
+		&got.applied, &got.processing, &got.taskID, &got.checkpointXmin, &got.logs, &got.high, &got.events,
 		&got.assistants, &got.completed, &got.terminals,
-		&got.userID, &got.userContent, &got.workspace, &got.runID,
+		&got.userID, &got.userContent, &got.turnID, &got.workspace, &got.runID,
+		&got.eventID, &got.outboxID, &got.outboxXmin, &got.outboxUnsent,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.workspace != fixtureSourceLabel || got.runID != src.RunID {
-		t.Fatalf("link workspace=%s run=%s", got.workspace, got.runID)
+	if got.workspace != fixtureSourceLabel || got.runID != src.RunID || got.taskID != src.TaskID {
+		t.Fatalf("link workspace=%s task=%s run=%s", got.workspace, got.taskID, got.runID)
+	}
+	if !got.outboxUnsent || got.outboxID == "" || got.eventID == "" || got.checkpointXmin == "" {
+		t.Fatalf("identity = %+v", got)
 	}
 	rows, err := pool.Query(ctx, `
 		SELECT public_seq, payload_sha256, failure_text
@@ -1025,9 +1236,9 @@ func writeCaseSummary(t *testing.T, fields map[string]string) {
 	dir := caseLogDir(t)
 	var b strings.Builder
 	for _, key := range []string{
-		"case", "signal", "wait", "pid1", "pid2", "source", "execution", "fault",
+		"case", "phase", "signal", "wait", "pid1", "pid2", "source", "execution", "fault",
 		"checkpoint_applied", "checkpoint_processing", "checkpoint",
-		"event_cursors", "source_rows", "high_water", "assistant_rows",
+		"event_cursors", "source_rows", "high_water", "assistant_rows", "fixture_posts",
 	} {
 		if value, ok := fields[key]; ok {
 			fmt.Fprintf(&b, "%s=%s\n", key, value)
@@ -1145,6 +1356,29 @@ func apiCallOK(t *testing.T, base, method, path string, body any) map[string]any
 	return asMap(t, raw)
 }
 
+var seenMessagePosts struct {
+	sync.Mutex
+	urls []string
+}
+
+func noteMessagePost(rawURL string) {
+	seenMessagePosts.Lock()
+	seenMessagePosts.urls = append(seenMessagePosts.urls, rawURL)
+	seenMessagePosts.Unlock()
+}
+
+func messagePostsTo(base string) int {
+	seenMessagePosts.Lock()
+	defer seenMessagePosts.Unlock()
+	n := 0
+	for _, rawURL := range seenMessagePosts.urls {
+		if strings.HasPrefix(rawURL, base) {
+			n++
+		}
+	}
+	return n
+}
+
 func apiCall(t *testing.T, base, method, path, idem string, body any) (int, []byte) {
 	t.Helper()
 	var reader io.Reader
@@ -1167,6 +1401,9 @@ func apiCall(t *testing.T, base, method, path, idem string, body any) (int, []by
 	}
 	if idem != "" {
 		req.Header.Set("Idempotency-Key", idem)
+	}
+	if method == http.MethodPost && strings.Contains(path, "/messages") {
+		noteMessagePost(base + path)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

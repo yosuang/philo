@@ -57,6 +57,29 @@ func ConsumeNoKey(ctx context.Context, st *store.Store, client *Client, binding 
 		result.Submitted = true
 	}
 	result.TaskID = link.TaskID
+	return readLinked(ctx, st, client, binding, link, result)
+}
+
+// ResumeLinked reads the public log from the stored seq for a task the turn
+// already has. It does not submit a task. A missing link is not a new submit.
+func ResumeLinked(ctx context.Context, st *store.Store, client *Client, binding store.LiveBinding) (ConsumeResult, error) {
+	if st == nil || client == nil {
+		return ConsumeResult{}, errIncomplete
+	}
+	if client.WorkspaceID != binding.WorkspaceID {
+		return ConsumeResult{}, fmt.Errorf("client workspace does not match the test binding")
+	}
+	link, found, err := st.ServiceTask(ctx, binding)
+	if err != nil {
+		return ConsumeResult{}, err
+	}
+	if !found || link.TaskID == "" || link.RunID == "" {
+		return ConsumeResult{}, fmt.Errorf("startup resume has no linked task")
+	}
+	return readLinked(ctx, st, client, binding, link, ConsumeResult{TaskID: link.TaskID, RunID: link.RunID})
+}
+
+func readLinked(ctx context.Context, st *store.Store, client *Client, binding store.LiveBinding, link store.ServiceLink, result ConsumeResult) (ConsumeResult, error) {
 	after, err := st.AppliedPublicSeq(ctx, link)
 	if err != nil {
 		return result, err

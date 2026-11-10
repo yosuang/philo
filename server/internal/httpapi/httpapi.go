@@ -41,6 +41,7 @@ const (
 type App struct {
 	Handler http.Handler
 	engine  *engine.Engine
+	resume  func(context.Context) error
 }
 
 // Stop cancels in-flight generations.
@@ -48,6 +49,15 @@ func (a *App) Stop() {
 	if a != nil && a.engine != nil {
 		a.engine.Stop()
 	}
+}
+
+// ResumeCommitted reads fixture sources already linked on stored turns.
+// It does not submit a task. An unset binding does not dial out.
+func (a *App) ResumeCommitted(ctx context.Context) error {
+	if a == nil || a.resume == nil {
+		return nil
+	}
+	return a.resume(ctx)
 }
 
 type stagedSuffix struct {
@@ -107,6 +117,14 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 		}
 	}
 	st := store.New(pool)
+	var resume func(context.Context) error
+	if live != nil && !cfg.DevFixture() {
+		workspace := cfg.MakezWorkspaceID
+		client := live
+		resume = func(ctx context.Context) error {
+			return resumeCommitted(ctx, st, client, workspace)
+		}
+	}
 	h := hub.New()
 	var hold *subscribeHold
 	if cfg.BusinessFixture {
@@ -129,7 +147,29 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 	}
 	mux := http.NewServeMux()
 	s.routes(mux)
-	return &App{Handler: mux, engine: eng}, nil
+	return &App{Handler: mux, engine: eng, resume: resume}, nil
+}
+
+// resumeCommitted continues each turn that already stores a task in workspace.
+// The owner and the bot are the stored rows. No new owner or binding is created.
+// A turn that has no task is left alone, so startup does not submit one.
+func resumeCommitted(ctx context.Context, st *store.Store, client *makez.Client, workspace string) error {
+	turns, err := st.LinkedTurns(ctx, workspace)
+	if err != nil {
+		return err
+	}
+	log.Printf("startup resume linked=%d", len(turns))
+	for _, turn := range turns {
+		after, err := st.AppliedPublicSeq(ctx, turn.Link)
+		if err != nil {
+			return err
+		}
+		log.Printf("startup resume workspace=%s task=%s after=%d", turn.Link.WorkspaceID, turn.Link.TaskID, after)
+		if _, err := makez.ResumeLinked(ctx, st, client, turn.Binding); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newAdapter(cfg config.Config) (adapter.Adapter, error) {

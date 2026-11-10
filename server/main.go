@@ -46,6 +46,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := app.ResumeCommitted(ctx); err != nil {
+		log.Fatalf("startup resume: %s", err)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
