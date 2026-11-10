@@ -2246,6 +2246,77 @@ mod tests {
         assert!(read_retry_delay(0) * 25 > Duration::from_secs(2));
     }
 
+    /// Callbacks already sitting in the in-process queue. This is not a frame
+    /// read from a TCP connection after that connection has closed, and it is
+    /// not a Makez cursor. `select_agent` does not bump the connection
+    /// generation; the session id is what keeps the previous chat's queued
+    /// delta off the chat that is open now. A later generation drops the
+    /// queue even when the session id still matches. A missing cursor stays
+    /// missing.
+    #[test]
+    fn queued_callback_after_switch_or_obsolete_generation_does_not_apply() {
+        with_store(|store| {
+            open_chat(store);
+            let cursorless = ServerEvent::Delta {
+                event_id: String::new(),
+                cursor: 0,
+                message_id: "m".into(),
+                session_id: "chat-a".into(),
+                text: "queued".into(),
+            };
+            assert_eq!(crate::model::event_business_cursor(&cursorless), None);
+
+            store.begin_live_buffer();
+            store.ingest_live(cursorless.clone());
+            store.ingest_live(delta("chat-a", 9, "moved"));
+            // The open chat changes. The connection generation stays 1,
+            // which is what selecting another bot does.
+            store.selected_session.set(Some("chat-b".into()));
+            store.messages.set(vec![Message {
+                id: "b".into(),
+                session_id: "chat-b".into(),
+                seq: 2,
+                role: "assistant".into(),
+                content: "lark".into(),
+                status: "complete".into(),
+                ..Message::default()
+            }]);
+            store.business_high_water.set(4);
+            store.applied_event_ids.with(|seen| seen.clear());
+            assert_eq!(store.ws_generation.get(), 1);
+            store.finish_live_buffer();
+            assert_eq!(store.business_cursor(), 4);
+            assert_eq!(store.message_seq(), 2);
+            assert_eq!(texts(store), vec!["lark".to_owned()]);
+
+            store.selected_session.set(Some("chat-a".into()));
+            store.messages.set(vec![Message {
+                id: "m".into(),
+                session_id: "chat-a".into(),
+                seq: 1,
+                role: "assistant".into(),
+                content: "cedar".into(),
+                status: "complete".into(),
+                ..Message::default()
+            }]);
+            store.business_high_water.set(3);
+            store.applied_event_ids.with(|seen| seen.clear());
+            store.begin_live_buffer();
+            store.ingest_live(cursorless.clone());
+            store.ingest_live(delta("chat-a", 9, "moved"));
+            store.ws_generation.set(2);
+            store.finish_live_buffer();
+            assert_eq!(store.business_cursor(), 3);
+            assert_eq!(store.message_seq(), 1);
+            assert_eq!(texts(store), vec!["cedar".to_owned()]);
+            store.accept_socket(1, cursorless);
+            store.accept_socket(1, delta("chat-a", 9, "moved"));
+            assert_eq!(store.business_cursor(), 3);
+            assert_eq!(store.message_seq(), 1);
+            assert_eq!(texts(store), vec!["cedar".to_owned()]);
+        });
+    }
+
     #[test]
     fn cursorless_delta_does_not_move_the_business_cursor_or_another_chat() {
         with_store(|store| {
@@ -2276,6 +2347,12 @@ mod tests {
 
     fn content(store: Store) -> String {
         store.messages.with(|list| list[0].content.clone())
+    }
+
+    fn texts(store: Store) -> Vec<String> {
+        store
+            .messages
+            .with(|list| list.iter().map(|message| message.content.clone()).collect())
     }
 }
 
