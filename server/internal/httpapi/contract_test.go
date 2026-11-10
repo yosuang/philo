@@ -467,6 +467,77 @@ func TestT5ExpiredCursorRebuildsSnapshot(t *testing.T) {
 	}
 }
 
+func TestNonZeroExpiredCursorThenSuffix(t *testing.T) {
+	srv, _ := startProduction(t, config.Config{BusinessFixture: true})
+	conversationID := openDefault(t, srv, createAgent(t, srv, "Lark"))
+	seed := fixtureOK(t, srv, conversationID, "seed", "fixture.seed", "", "", "")
+	messageID, _ := seed["messageId"].(string)
+	fixtureOK(t, srv, conversationID, "d1", "message.delta", messageID, "cedar", "")
+	done := fixtureOK(t, srv, conversationID, "done", "message.completed", messageID, "", "")
+	held, _ := done["cursor"].(float64)
+	if held == 0 {
+		t.Fatal("seed cursor is 0")
+	}
+	status, body := getEvents(t, srv, conversationID, int64(held))
+	if status != http.StatusOK || len(asMap(t, body)["events"].([]any)) != 0 {
+		t.Fatalf("caught up %d %s", status, body)
+	}
+
+	code, raw := postFixture(t, srv, map[string]any{
+		"source":         store.FixtureSource,
+		"conversationId": conversationID,
+		"eventKey":       "expire-1",
+		"type":           "fixture.stage-expired",
+		"messageId":      "",
+		"text":           "lantern",
+		"status":         "",
+		"suffix":         "once",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("stage %d %s", code, raw)
+	}
+
+	status, body = getEvents(t, srv, conversationID, int64(held))
+	if status != http.StatusBadRequest || errCode(t, body) != "invalid_request" {
+		t.Fatalf("expired %d %s", status, body)
+	}
+	payload := asMap(t, body)
+	if _, ok := payload["events"]; ok {
+		t.Fatalf("expired response embedded a log: %s", body)
+	}
+	snap := payload["snapshot"].(map[string]any)
+	messages := snap["messages"].([]any)
+	if len(messages) != 1 {
+		t.Fatalf("snapshot messages = %#v", messages)
+	}
+	msg := messages[0].(map[string]any)
+	if msg["content"] != "lantern" {
+		t.Fatalf("snapshot content = %#v", msg["content"])
+	}
+	seq, _ := msg["seq"].(float64)
+	high, _ := snap["highWater"].(float64)
+	if high <= held || seq == high || seq == 0 {
+		t.Fatalf("seq %v high %v held %v", seq, high, held)
+	}
+
+	followed := eventsAfter(t, srv, conversationID, int64(high))
+	if len(followed) != 1 || followed[0]["type"] != "message.delta" || followed[0]["text"] != "once" {
+		t.Fatalf("suffix = %#v", followed)
+	}
+	suffixCursor, _ := followed[0]["cursor"].(float64)
+	if suffixCursor == seq || suffixCursor <= high {
+		t.Fatalf("suffix cursor %v seq %v high %v", suffixCursor, seq, high)
+	}
+	again := eventsAfter(t, srv, conversationID, int64(suffixCursor))
+	if len(again) != 0 {
+		t.Fatalf("events after suffix = %#v", again)
+	}
+	stored := messageList(t, srv, conversationID)
+	if len(stored) != 1 || stored[0]["content"] != "lanternonce" || stored[0]["seq"] == stored[0]["cursor"] {
+		t.Fatalf("stored = %#v", stored)
+	}
+}
+
 func TestT13ConcurrentSnapshotHasNoGap(t *testing.T) {
 	srv, pool := startProduction(t, config.Config{BusinessFixture: true})
 	conversationID := openDefault(t, srv, createAgent(t, srv, "Ada"))

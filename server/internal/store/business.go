@@ -219,6 +219,54 @@ func cursorExpired(after, high int64, oldest *int64) bool {
 	return after < *oldest-1
 }
 
+// StageExpiredReplacement sets the latest message to content, drops the
+// retained business log, and advances the high water by one. A client that
+// still holds the previous high water then receives ErrCursorExpired. The
+// message seq is not changed. This is the labeled fixture, not Makez.
+func (s *Store) StageExpiredReplacement(ctx context.Context, ownerID, conversationID, content string) (string, int64, error) {
+	if _, err := s.RequireSession(ctx, ownerID, conversationID); err != nil {
+		return "", 0, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var messageID string
+	err = tx.QueryRow(ctx, `
+		UPDATE messages
+		SET content = $2, status = 'complete', updated_at = $3
+		WHERE id = (
+			SELECT id FROM messages
+			WHERE session_id = $1
+			ORDER BY seq DESC
+			LIMIT 1
+		)
+		RETURNING id`, conversationID, content, now()).Scan(&messageID)
+	if err != nil {
+		return "", 0, mapErr(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM fixture_business_dedup WHERE conversation_id = $1`, conversationID); err != nil {
+		return "", 0, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM business_events WHERE conversation_id = $1`, conversationID); err != nil {
+		return "", 0, err
+	}
+	var high int64
+	err = tx.QueryRow(ctx, `
+		UPDATE sessions
+		SET business_high_water = business_high_water + 1
+		WHERE id = $1
+		RETURNING business_high_water`, conversationID).Scan(&high)
+	if err != nil {
+		return "", 0, mapErr(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", 0, err
+	}
+	return messageID, high, nil
+}
+
 // ApplyFixtureBusiness applies one explicitly labeled fixture event and the
 // matching business row in one transaction. Repeating the event key does not
 // append again. This source is not Makez and does not complete a run.

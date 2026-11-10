@@ -492,6 +492,11 @@ fn activity_pane(store: Store) -> impl IntoElement {
                         move || store.selected_session.get().is_some(),
                         move || store.post_fixture_suffix(),
                     ))
+                    .child(ui::secondary_button(
+                        "Stage expired cursor",
+                        move || store.selected_session.get().is_some(),
+                        move || store.stage_expired_cursor(),
+                    ))
                     .child(
                         text(move || store.fixture_suffix_note.get())
                             .text_size(px(12.0))

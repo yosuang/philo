@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -49,6 +50,11 @@ func (a *App) Stop() {
 	}
 }
 
+type stagedSuffix struct {
+	messageID string
+	text      string
+}
+
 type server struct {
 	store *store.Store
 	eng   *engine.Engine
@@ -57,6 +63,9 @@ type server struct {
 	authn auth.Authenticator
 	http  *http.Client
 	live  *makez.Client
+
+	suffixMu      sync.Mutex
+	pendingSuffix map[string]stagedSuffix
 }
 
 // New builds the HTTP handler. The pool must already be migrated.
@@ -84,13 +93,14 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 	h := hub.New()
 	eng := engine.New(st, ad, h, cfg.DevFixture())
 	s := &server{
-		store: st,
-		eng:   eng,
-		hub:   h,
-		cfg:   cfg,
-		authn: auth.New(cfg.Credentials),
-		http:  &http.Client{Timeout: 2 * time.Second},
-		live:  live,
+		store:         st,
+		eng:           eng,
+		hub:           h,
+		cfg:           cfg,
+		authn:         auth.New(cfg.Credentials),
+		http:          &http.Client{Timeout: 2 * time.Second},
+		live:          live,
+		pendingSuffix: map[string]stagedSuffix{},
 	}
 	mux := http.NewServeMux()
 	s.routes(mux)
@@ -742,6 +752,27 @@ func (s *server) businessEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	events, snap, err := s.store.BusinessEventsAfter(r.Context(), p.OwnerID, id, after)
 	if errors.Is(err, store.ErrCursorExpired) {
+		// The snapshot above does not include a suffix staged by the fixture.
+		// Appending it now lets the client's next read follow that suffix once.
+		if staged, ok := s.takeStagedSuffix(id); ok {
+			ev, applyErr := s.store.ApplyFixtureBusiness(r.Context(), store.FixtureInput{
+				Source:         store.FixtureSource,
+				OwnerID:        p.OwnerID,
+				ConversationID: id,
+				EventKey:       "staged-suffix-" + uuid.NewString(),
+				Type:           "message.delta",
+				MessageID:      staged.messageID,
+				Text:           staged.text,
+			})
+			if applyErr != nil {
+				s.stageSuffix(id, staged)
+				s.storeErr(w, applyErr, "session not found")
+				return
+			}
+			if item, err := ev.MarshalMap(); err == nil {
+				s.hub.Publish(id, item)
+			}
+		}
 		log.Printf("business cursor expired session=%s after=%d high=%d", id, after, snap.HighWater)
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]string{
@@ -781,6 +812,7 @@ func (s *server) fixtureBusiness(w http.ResponseWriter, r *http.Request) {
 		MessageID      string `json:"messageId"`
 		Text           string `json:"text"`
 		Status         string `json:"status"`
+		Suffix         string `json:"suffix"`
 	}
 	if !decodeStrict(w, r, &body) {
 		return
@@ -791,6 +823,27 @@ func (s *server) fixtureBusiness(w http.ResponseWriter, r *http.Request) {
 	}
 	conversationID, ok := uuidParam(w, body.ConversationID, "conversationId")
 	if !ok {
+		return
+	}
+	if body.Type == "fixture.stage-expired" {
+		if strings.TrimSpace(body.EventKey) == "" || strings.TrimSpace(body.Text) == "" || strings.TrimSpace(body.Suffix) == "" {
+			writeError(w, http.StatusBadRequest, "invalid_request", "eventKey, text, and suffix are required")
+			return
+		}
+		messageID, high, err := s.store.StageExpiredReplacement(r.Context(), p.OwnerID, conversationID, body.Text)
+		if err != nil {
+			s.storeErr(w, err, "session not found")
+			return
+		}
+		s.stageSuffix(conversationID, stagedSuffix{messageID: messageID, text: body.Suffix})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"type":         body.Type,
+			"sessionId":    conversationID,
+			"messageId":    messageID,
+			"highWater":    high,
+			"source":       store.FixtureSource,
+			"suffixStaged": true,
+		})
 		return
 	}
 	ev, err := s.store.ApplyFixtureBusiness(r.Context(), store.FixtureInput{
@@ -813,6 +866,28 @@ func (s *server) fixtureBusiness(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *server) stageSuffix(conversationID string, staged stagedSuffix) {
+	s.suffixMu.Lock()
+	defer s.suffixMu.Unlock()
+	if s.pendingSuffix == nil {
+		s.pendingSuffix = map[string]stagedSuffix{}
+	}
+	s.pendingSuffix[conversationID] = staged
+}
+
+func (s *server) takeStagedSuffix(conversationID string) (stagedSuffix, bool) {
+	s.suffixMu.Lock()
+	defer s.suffixMu.Unlock()
+	staged, ok := s.pendingSuffix[conversationID]
+	if ok {
+		delete(s.pendingSuffix, conversationID)
+	}
+	if !ok || staged.text == "" || staged.messageID == "" {
+		return stagedSuffix{}, false
+	}
+	return staged, true
 }
 
 func pathID(w http.ResponseWriter, r *http.Request) (string, bool) {
