@@ -85,6 +85,25 @@ func TestT2LostResponseReplaysOneTurn(t *testing.T) {
 	if replay["execution"] != "unavailable" {
 		t.Fatalf("execution = %#v", replay["execution"])
 	}
+	user, _ := replay["userMessage"].(map[string]any)
+	if user["role"] != "user" || user["content"] != "Hello" || user["status"] != "complete" {
+		t.Fatalf("user message = %#v", user)
+	}
+	if assistant, ok := replay["assistantMessage"]; ok {
+		t.Fatalf("unavailable submit returned an assistant message: %#v", assistant)
+	}
+	sawUser := false
+	for _, item := range messageList(t, srv, conversationID) {
+		if item["role"] == "assistant" && item["status"] == "complete" {
+			t.Fatalf("assistant success stored: %#v", item)
+		}
+		if item["role"] == "user" && item["content"] == "Hello" && item["status"] == "complete" {
+			sawUser = true
+		}
+	}
+	if !sawUser {
+		t.Fatal("user message was not stored")
+	}
 	after := effectCounts(t, pool, conversationID)
 	if after != before.add(1, 1, 1, 1) {
 		t.Fatalf("effects before %#v after %#v", before, after)
