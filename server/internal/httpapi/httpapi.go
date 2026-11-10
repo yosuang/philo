@@ -40,11 +40,13 @@ const (
 const (
 	// resumeAttemptTimeout bounds one events read, including a body that never ends.
 	resumeAttemptTimeout = 2 * time.Second
-	// resumeInterval is the wait between attempts. The loop does not spin.
+	// resumeInterval is the wait between attempts inside the fast budget. The loop does not spin.
 	resumeInterval = 200 * time.Millisecond
-	// resumeBudget is how long attempts continue after the process starts.
-	// An empty read does not end the budget. The loop does not run for the process lifetime.
+	// resumeBudget is the fast phase. When it ends the process logs startup resume stopped.
+	// It is not the end of reading a source that is still linked.
 	resumeBudget = 12 * time.Second
+	// resumeSlowInterval is the wait after that stop. It is long enough that the loop is not busy.
+	resumeSlowInterval = 2 * time.Second
 )
 
 // App is the session server handler.
@@ -72,14 +74,17 @@ func (a *App) ResumeCommitted(ctx context.Context) (int, error) {
 	return a.resume(ctx)
 }
 
-// WatchCommitted retries ResumeCommitted until the budget ends.
-// It returns immediately when no owned turn is linked. One hung or failed
-// read does not extend past the attempt timeout, and the loop stops at the budget.
+// WatchCommitted reads linked fixture sources beside listen.
+// The first 12 seconds use a short interval. That phase logs startup resume
+// stopped and does not abandon a turn that is still linked. Later reads wait
+// resumeSlowInterval, and each read still stops at resumeAttemptTimeout.
+// No owned turn means stop. An unset binding never enters this loop.
 func (a *App) WatchCommitted(ctx context.Context) {
 	if a == nil || a.resume == nil {
 		return
 	}
 	deadline := time.Now().Add(resumeBudget)
+	slow := false
 	for {
 		attempt, cancel := context.WithTimeout(ctx, resumeAttemptTimeout)
 		n, err := a.resume(attempt)
@@ -87,11 +92,19 @@ func (a *App) WatchCommitted(ctx context.Context) {
 		if err != nil {
 			log.Printf("startup resume: %s", err)
 		}
-		if n == 0 || !time.Now().Before(deadline) || ctx.Err() != nil {
+		if n == 0 || ctx.Err() != nil {
 			log.Printf("startup resume stopped linked=%d", n)
 			return
 		}
-		timer := time.NewTimer(resumeInterval)
+		interval := resumeInterval
+		if !time.Now().Before(deadline) {
+			if !slow {
+				slow = true
+				log.Printf("startup resume stopped linked=%d", n)
+			}
+			interval = resumeSlowInterval
+		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()

@@ -54,13 +54,16 @@ const (
 func TestOSKillResumesFixtureSource(t *testing.T) {
 	bin := buildPhiloServer(t)
 	t.Run("sigkill-after-commit", func(t *testing.T) {
-		resumeFixtureSource(t, bin, syscall.SIGKILL)
+		resumeFixtureSource(t, bin, syscall.SIGKILL, false)
+	})
+	t.Run("sigkill-after-stop", func(t *testing.T) {
+		resumeFixtureSource(t, bin, syscall.SIGKILL, true)
 	})
 	t.Run("sigkill-during-transaction", func(t *testing.T) {
 		killDuringTransaction(t, bin)
 	})
 	t.Run("graceful-sigterm", func(t *testing.T) {
-		resumeFixtureSource(t, bin, syscall.SIGTERM)
+		resumeFixtureSource(t, bin, syscall.SIGTERM, false)
 	})
 	t.Run("fixture-unset", func(t *testing.T) {
 		killWithExecutionUnavailable(t, bin)
@@ -70,7 +73,7 @@ func TestOSKillResumesFixtureSource(t *testing.T) {
 	})
 }
 
-func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
+func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal, afterStop bool) {
 	t.Helper()
 	dsn := newProcessDSN(t)
 	src := startFixtureSource(t)
@@ -114,33 +117,58 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 	waitResult := stopPhilo(t, first, sig)
 	plantForeignBot(t, pool)
 
-	src.hangOne()
-	second := startPhiloOS(t, bin, dsn, extra, "test-binding")
-	waitUntilWithin(t, 4*time.Second, func() bool {
-		if !src.stillHanging() {
-			return false
-		}
-		req, err := http.NewRequest(http.MethodGet, second.url+"/v1/health", nil)
-		if err != nil {
-			return false
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return false
-		}
-		defer resp.Body.Close()
-		return resp.StatusCode == http.StatusOK
-	})
-	src.setFailing(true)
-	src.armSuffix()
-	waitUntilWithin(t, 8*time.Second, func() bool {
-		return src.failures() >= 2
-	})
-	health := apiGet(t, second.url, "/v1/health")
-	if health["ok"] != true {
-		t.Fatalf("health during fixture 500 = %#v", health)
+	phase := "after-commit"
+	if afterStop {
+		phase = "after-stop"
+		src.setFailing(true)
+	} else {
+		src.hangOne()
 	}
-	src.setFailing(false)
+	second := startPhiloOS(t, bin, dsn, extra, "test-binding")
+	if afterStop {
+		waitUntilWithin(t, 20*time.Second, func() bool {
+			raw, err := os.ReadFile(second.logPath)
+			return err == nil && strings.Contains(string(raw), "startup resume stopped linked=1")
+		})
+		if appliedSeq(t, pool, src) != 2 || seqCount(t, pool, src.RunID, 3) != 0 {
+			t.Fatal("a suffix was projected before it existed")
+		}
+		health := apiGet(t, second.url, "/v1/health")
+		if health["ok"] != true {
+			t.Fatalf("health after the fast budget = %#v", health)
+		}
+		if src.failures() < 2 {
+			t.Fatalf("fixture 500s before the stop = %d", src.failures())
+		}
+		src.armSuffix()
+		src.setFailing(false)
+	} else {
+		waitUntilWithin(t, 4*time.Second, func() bool {
+			if !src.stillHanging() {
+				return false
+			}
+			req, err := http.NewRequest(http.MethodGet, second.url+"/v1/health", nil)
+			if err != nil {
+				return false
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return false
+			}
+			defer resp.Body.Close()
+			return resp.StatusCode == http.StatusOK
+		})
+		src.setFailing(true)
+		src.armSuffix()
+		waitUntilWithin(t, 8*time.Second, func() bool {
+			return src.failures() >= 2
+		})
+		health := apiGet(t, second.url, "/v1/health")
+		if health["ok"] != true {
+			t.Fatalf("health during fixture 500 = %#v", health)
+		}
+		src.setFailing(false)
+	}
 	waitUntilWithin(t, 8*time.Second, func() bool {
 		return appliedSeq(t, pool, src) == 3 && seqCount(t, pool, src.RunID, 3) == 1
 	})
@@ -208,7 +236,7 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 	}
 	writeCaseSummary(t, map[string]string{
 		"case":                  t.Name(),
-		"phase":                 "after-commit",
+		"phase":                 phase,
 		"signal":                signalName(sig),
 		"wait":                  waitResult,
 		"pid1":                  strconv.Itoa(first.pid),
@@ -221,8 +249,8 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 		"high_water":            strconv.FormatInt(after.high, 10),
 		"assistant_rows":        "0",
 	})
-	t.Logf("os-kill case=%s phase=after-commit signal=%s wait=%s pid1=%d pid2=%d source=%s checkpoint=%d suffix=1 failures=%d turn=%s user=%s outbox=%s",
-		t.Name(), signalName(sig), waitResult, first.pid, second.pid, fixtureSourceLabel, after.applied, src.failures(), after.turnID, after.userID, after.outboxID)
+	t.Logf("os-kill case=%s phase=%s signal=%s wait=%s pid1=%d pid2=%d source=%s checkpoint=%d suffix=1 failures=%d turn=%s user=%s outbox=%s",
+		t.Name(), phase, signalName(sig), waitResult, first.pid, second.pid, fixtureSourceLabel, after.applied, src.failures(), after.turnID, after.userID, after.outboxID)
 }
 
 func killWithExecutionUnavailable(t *testing.T, bin string) {
