@@ -198,8 +198,124 @@ pub async fn post_fixture_stage_expired(
     Ok(())
 }
 
-/// Posts one labeled fixture delta. The caller does not apply the returned
-/// event; the business log is what a later reconnect reads. This is not Makez.
+pub async fn post_fixture_hold(base: &str, session_id: &str) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "conversationId": session_id,
+            "type": "fixture.hold-subscribe",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn post_fixture_hold_next(base: &str) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "type": "fixture.hold-next-subscribe",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn post_fixture_fail_reads(base: &str, session_id: &str) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "conversationId": session_id,
+            "type": "fixture.fail-reads",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn post_fixture_release_reads(base: &str, session_id: &str) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "conversationId": session_id,
+            "type": "fixture.release-reads",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn post_fixture_release(base: &str) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "type": "fixture.release-subscribe",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Publishes an engine-shaped delta. It has no business cursor and no
+/// business row. This is the fixture stand-in for that engine frame, not a
+/// model reply.
+pub async fn post_engine_delta(
+    base: &str,
+    session_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "conversationId": session_id,
+            "type": "fixture.engine-delta",
+            "messageId": message_id,
+            "text": text,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn post_stage_during_read(
+    base: &str,
+    session_id: &str,
+    message_id: &str,
+    text: &str,
+    event_key: &str,
+) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "conversationId": session_id,
+            "eventKey": event_key,
+            "type": "fixture.stage-during-read",
+            "messageId": message_id,
+            "text": text,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Posts one labeled fixture delta. The business log is what a later read
+/// returns. A socket that is not subscribed does not receive the publish.
+/// This is not Makez.
 pub async fn post_fixture_delta(
     base: &str,
     session_id: &str,

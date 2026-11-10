@@ -48,23 +48,45 @@ fn event_missed_without_another_read(
     !in_read && !on_socket
 }
 
-/// A second read when the ack arrives after the first read keeps an event
-/// the hub dropped. An ack that never arrives does not.
+/// A later read includes an event committed at or before it. The retry is
+/// not gated on the subscribe ack.
 #[cfg(test)]
-fn another_read_keeps_event(
-    ack_at: Option<Duration>,
-    event_at: Duration,
-    budget: Duration,
-) -> bool {
-    if !event_missed_without_another_read(ack_at, event_at, budget) {
-        return true;
-    }
-    ack_at.is_some_and(|ack| event_at <= ack)
+fn retry_read_includes(event_at: Duration, retry_at: Duration) -> bool {
+    event_at <= retry_at
+}
+
+/// `connected` and `recovered` are reported only after a read that started
+/// while this socket was subscribed and that read succeeded. An unsubscribed
+/// read is not that catch-up, even when it returned rows.
+fn report_synced(read_started_subscribed: bool, read_ok: bool) -> bool {
+    read_started_subscribed && read_ok
 }
 
 fn extra_read_after_unready(subscribed_before: bool, subscribed_after: bool) -> bool {
     !subscribed_before && subscribed_after
 }
+
+/// Capped exponential backoff for one failed business read.
+/// The AWS SDK calls the same shape `exponentialDelayWithoutJitter`:
+/// `min(cap, base * 2^retry)`, first retry at the base.
+/// Full jitter can sleep zero, which does not bound a single client's rate.
+/// The base is 1s, the standard-mode delay for a service that is refusing
+/// work. The cap is that mode's 20s maximum.
+const READ_RETRY_BASE: Duration = Duration::from_secs(1);
+const READ_RETRY_CAP: Duration = Duration::from_secs(20);
+
+fn read_retry_delay(retry: u32) -> Duration {
+    let shift = retry.min(16);
+    READ_RETRY_BASE
+        .saturating_mul(1_u32 << shift)
+        .min(READ_RETRY_CAP)
+}
+
+const LABEL_CATCHING_UP: &str = "Events: catching up";
+const LABEL_FAILED: &str = "Events: subscribe failed";
+const LABEL_CONNECTED: &str = "Events: connected";
+const LABEL_RECOVERED: &str = "Events: recovered";
+const LABEL_RECONNECTING: &str = "Events: reconnecting";
 
 struct LiveGate {
     buffering: bool,
@@ -182,6 +204,18 @@ pub struct Store {
     live_subscribed: Signal<String>,
     /// The last business read started before this socket was subscribed.
     read_unsubscribed: Signal<bool>,
+    /// This socket already finished a read that started unsubscribed.
+    subscribe_failed: Signal<bool>,
+    /// Cancels a subscribe retry that has not entered `load_transcript`.
+    retry_ticket: Signal<u64>,
+    /// How many failed business reads are waiting to be retried. Reset
+    /// when a read succeeds, or when this chat is left.
+    read_attempt: Signal<u32>,
+    /// Business-log HTTP calls this process has started. The fixture pane
+    /// shows it so a test can measure the retry rate.
+    business_reads: Signal<u64>,
+    previous_session: Signal<Option<String>>,
+    assistant_ids: Signal<HashMap<String, String>>,
     live_gate: Stored<Arc<std::sync::Mutex<LiveGate>>>,
     catchup_lock: Stored<Arc<Mutex<()>>>,
     business_high_water: Signal<i64>,
@@ -237,6 +271,12 @@ impl Store {
             socket_held: signal(false),
             live_subscribed: signal(String::new()),
             read_unsubscribed: signal(false),
+            subscribe_failed: signal(false),
+            retry_ticket: signal(0),
+            read_attempt: signal(0),
+            business_reads: signal(0),
+            previous_session: signal(None),
+            assistant_ids: signal(HashMap::new()),
             live_gate: stored(Arc::new(std::sync::Mutex::new(LiveGate {
                 buffering: false,
                 generation: 0,
@@ -360,6 +400,12 @@ impl Store {
             return;
         }
         if !same {
+            if let Some(previous) = self.selected_session.get() {
+                self.remember_assistant(&previous);
+                self.previous_session.set(Some(previous));
+            }
+            self.cancel_read_retry();
+            self.subscribe_failed.set(false);
             self.open_generation.update(|generation| *generation += 1);
             self.selected_agent.set(Some(id.clone()));
             self.selected_session.set(None);
@@ -602,8 +648,23 @@ impl Store {
         self.business_high_water.get()
     }
 
+    /// `message.seq` of the newest stored row. This is not the business cursor.
+    pub fn message_seq(self) -> i64 {
+        self.messages.with(|list| {
+            list.iter()
+                .rev()
+                .find(|message| message.seq > 0)
+                .map(|message| message.seq)
+                .unwrap_or(0)
+        })
+    }
+
     pub fn fixture_suffix_available(self) -> bool {
         self.fixture_suffix.get()
+    }
+
+    pub fn business_reads(self) -> u64 {
+        self.business_reads.get()
     }
 
     /// Ask the labeled fixture to replace the retained log so the cursor this
@@ -611,8 +672,9 @@ impl Store {
     /// The transcript on screen is left unchanged until the next read.
     pub fn stage_expired_cursor(self) {
         let Some(session_id) = self.selected_session.get() else {
-            self.action_error
-                .set(Some("Choose a bot before staging an expired cursor.".to_owned()));
+            self.action_error.set(Some(
+                "Choose a bot before staging an expired cursor.".to_owned(),
+            ));
             return;
         };
         self.submit_serial.update(|n| *n += 1);
@@ -638,11 +700,13 @@ impl Store {
     }
 
     /// Store one `fixture-business-source` delta on the open message.
-    /// The socket does not learn about it. Reconnect reads it from the log.
+    /// A socket that is not subscribed does not receive the publish.
+    /// Reconnect reads the row from the log.
     pub fn post_fixture_suffix(self) {
         let Some(session_id) = self.selected_session.get() else {
-            self.action_error
-                .set(Some("Choose a bot before posting a fixture suffix.".to_owned()));
+            self.action_error.set(Some(
+                "Choose a bot before posting a fixture suffix.".to_owned(),
+            ));
             return;
         };
         let message_id = self.messages.with(|list| {
@@ -652,8 +716,9 @@ impl Store {
                 .map(|message| message.id.clone())
         });
         let Some(message_id) = message_id else {
-            self.action_error
-                .set(Some("The chat has no fixture message to extend.".to_owned()));
+            self.action_error.set(Some(
+                "The chat has no fixture message to extend.".to_owned(),
+            ));
             return;
         };
         self.submit_serial.update(|n| *n += 1);
@@ -686,9 +751,272 @@ impl Store {
         });
     }
 
+    pub fn hold_subscribe(self) {
+        let Some(session_id) = self.selected_session.get() else {
+            self.action_error
+                .set(Some("Choose a bot before holding subscribe.".to_owned()));
+            return;
+        };
+        self.fixture_action("Subscribe hold armed", move |store| {
+            let url = store.server_url.get();
+            async move { client::post_fixture_hold(&url, &session_id).await }
+        });
+    }
+
+    pub fn hold_next_subscribe(self) {
+        self.fixture_action("Next subscribe hold armed", |store| {
+            let url = store.server_url.get();
+            async move { client::post_fixture_hold_next(&url).await }
+        });
+    }
+
+    pub fn release_subscribe(self) {
+        self.fixture_action("Subscribe released", |store| {
+            let url = store.server_url.get();
+            async move { client::post_fixture_release(&url).await }
+        });
+    }
+
+    pub fn fail_reads(self) {
+        let Some(session_id) = self.selected_session.get() else {
+            self.action_error
+                .set(Some("Choose a bot before failing reads.".to_owned()));
+            return;
+        };
+        self.fixture_action("Reads failing", move |store| {
+            let url = store.server_url.get();
+            async move { client::post_fixture_fail_reads(&url, &session_id).await }
+        });
+    }
+
+    pub fn release_reads(self) {
+        let Some(session_id) = self.selected_session.get() else {
+            self.action_error
+                .set(Some("Choose a bot before releasing reads.".to_owned()));
+            return;
+        };
+        self.fixture_action("Reads released", move |store| {
+            let url = store.server_url.get();
+            async move { client::post_fixture_release_reads(&url, &session_id).await }
+        });
+    }
+
+    pub fn post_gap_event(self) {
+        self.post_labeled_delta(None, "gaponce", "Gap event posted");
+    }
+
+    pub fn post_foreign_event(self) {
+        let Some(session_id) = self.previous_session.get() else {
+            self.action_error.set(Some(
+                "Open another bot before posting a foreign event.".to_owned(),
+            ));
+            return;
+        };
+        self.post_labeled_delta(Some(session_id), "foreignonce", "Foreign event posted");
+    }
+
+    pub fn post_stream_delta(self) {
+        self.post_engine_text(None, "streambit", "Stream delta posted");
+    }
+
+    pub fn post_old_socket_delta(self) {
+        self.post_engine_text(None, "oldsock", "Old socket delta posted");
+    }
+
+    pub fn post_foreign_stream(self) {
+        let Some(session_id) = self.previous_session.get() else {
+            self.action_error.set(Some(
+                "Open another bot before posting a foreign stream.".to_owned(),
+            ));
+            return;
+        };
+        self.post_engine_text(Some(session_id), "otherbit", "Foreign stream posted");
+    }
+
+    pub fn stage_during_read(self) {
+        let Some(session_id) = self.selected_session.get() else {
+            self.action_error
+                .set(Some("Choose a bot before staging a read.".to_owned()));
+            return;
+        };
+        let Some(message_id) = self.assistant_message_id(Some(&session_id)) else {
+            self.action_error.set(Some(
+                "The chat has no fixture message to extend.".to_owned(),
+            ));
+            return;
+        };
+        self.submit_serial.update(|n| *n += 1);
+        let key = format!("fixture-during-{}", self.submit_serial.get());
+        self.fixture_suffix_note.set(String::new());
+        self.action_error.set(None);
+        let store = self;
+        go(async move {
+            match client::post_stage_during_read(
+                &store.server_url.get(),
+                &session_id,
+                &message_id,
+                "midonce",
+                &key,
+            )
+            .await
+            {
+                Ok(()) => {
+                    log::info!("during read staged session={session_id} key={key}");
+                    store
+                        .fixture_suffix_note
+                        .set("During read staged".to_owned());
+                }
+                Err(err) => store.action_error.set(Some(err)),
+            }
+        });
+    }
+
+    /// The open socket becomes the old one, but it stays up until the next
+    /// frame. That frame is ignored. A new socket opens after it.
+    pub fn abandon_socket(self) {
+        if self.selected_session.get().is_none() {
+            self.action_error.set(Some(
+                "Choose a bot before abandoning the socket.".to_owned(),
+            ));
+            return;
+        }
+        self.live_subscribed.set(String::new());
+        self.ws_generation.update(|generation| *generation += 1);
+        self.socket_label.set(LABEL_RECONNECTING.to_owned());
+        log::info!("socket generation abandoned; the next frame is from the old socket");
+    }
+
+    fn fixture_action<F, Fut>(self, note: &'static str, call: F)
+    where
+        F: FnOnce(Store) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + 'static,
+    {
+        self.fixture_suffix_note.set(String::new());
+        self.action_error.set(None);
+        let store = self;
+        go(async move {
+            match call(store).await {
+                Ok(()) => {
+                    log::info!("{note}");
+                    store.fixture_suffix_note.set(note.to_owned());
+                }
+                Err(err) => store.action_error.set(Some(err)),
+            }
+        });
+    }
+
+    fn post_labeled_delta(
+        self,
+        session_id: Option<String>,
+        text: &'static str,
+        note: &'static str,
+    ) {
+        let Some(session_id) = session_id.or_else(|| self.selected_session.get()) else {
+            self.action_error.set(Some(
+                "Choose a bot before posting a fixture event.".to_owned(),
+            ));
+            return;
+        };
+        let Some(message_id) = self.assistant_message_id(Some(session_id.as_str())) else {
+            self.action_error.set(Some(
+                "The chat has no fixture message to extend.".to_owned(),
+            ));
+            return;
+        };
+        self.submit_serial.update(|n| *n += 1);
+        let key = format!("fixture-gap-{}", self.submit_serial.get());
+        self.clear_fixture_note();
+        self.action_error.set(None);
+        let store = self;
+        go(async move {
+            match client::post_fixture_delta(
+                &store.server_url.get(),
+                &session_id,
+                &message_id,
+                text,
+                &key,
+            )
+            .await
+            {
+                Ok(()) => {
+                    log::info!("fixture delta stored session={session_id} text={text} key={key}");
+                    store.set_fixture_note(note);
+                }
+                Err(err) => store.action_error.set(Some(err)),
+            }
+        });
+    }
+
+    fn post_engine_text(self, session_id: Option<String>, text: &'static str, note: &'static str) {
+        let Some(session_id) = session_id.or_else(|| self.selected_session.get()) else {
+            self.action_error.set(Some(
+                "Choose a bot before posting a stream delta.".to_owned(),
+            ));
+            return;
+        };
+        let message_id = self
+            .assistant_message_id(Some(session_id.as_str()))
+            .unwrap_or_default();
+        self.clear_fixture_note();
+        self.action_error.set(None);
+        let store = self;
+        go(async move {
+            match client::post_engine_delta(&store.server_url.get(), &session_id, &message_id, text)
+                .await
+            {
+                Ok(()) => {
+                    log::info!("fixture engine delta session={session_id} text={text}");
+                    store.set_fixture_note(note);
+                }
+                Err(err) => store.action_error.set(Some(err)),
+            }
+        });
+    }
+
+    fn clear_fixture_note(self) {
+        let current = self.fixture_suffix_note.get();
+        if current == "Foreign frame ignored" || current == "Old socket frame ignored" {
+            return;
+        }
+        self.fixture_suffix_note.set(String::new());
+    }
+
+    fn set_fixture_note(self, note: &str) {
+        let current = self.fixture_suffix_note.get();
+        if current == "Foreign frame ignored" || current == "Old socket frame ignored" {
+            return;
+        }
+        self.fixture_suffix_note.set(note.to_owned());
+    }
+
+    fn remember_assistant(self, session_id: &str) {
+        let Some(message_id) = self.assistant_message_id(None) else {
+            return;
+        };
+        let session_id = session_id.to_owned();
+        self.assistant_ids.update(|map| {
+            map.insert(session_id, message_id);
+        });
+    }
+
+    fn assistant_message_id(self, session_id: Option<&str>) -> Option<String> {
+        if let Some(session_id) = session_id {
+            if self.selected_session.get().as_deref() != Some(session_id) {
+                return self.assistant_ids.with(|map| map.get(session_id).cloned());
+            }
+        }
+        self.messages.with(|list| {
+            list.iter()
+                .rev()
+                .find(|message| message.role != "user" && !message.id.is_empty())
+                .map(|message| message.id.clone())
+        })
+    }
+
     /// Drop the event socket and leave it down so the log can move while
     /// this client is not subscribed.
     pub fn disconnect_events(self) {
+        self.cancel_read_retry();
         self.socket_held.set(true);
         self.live_subscribed.set(String::new());
         self.reconnect();
@@ -803,6 +1131,12 @@ impl Store {
             return;
         }
         let session_id = session.id.clone();
+        if let Some(previous) = self.selected_session.get() {
+            if previous != session_id {
+                self.remember_assistant(&previous);
+                self.previous_session.set(Some(previous));
+            }
+        }
         self.selected_session.set(Some(session_id.clone()));
         // Buffer before subscribe so a delta that arrives with the ack is not
         // applied onto a transcript this load is about to replace.
@@ -853,10 +1187,19 @@ impl Store {
         });
     }
 
+    fn same_session(self, session_id: &str) -> bool {
+        self.selected_session.get().as_deref() == Some(session_id)
+    }
+
+    fn still_live(self, generation: u64) -> bool {
+        self.ws_generation.get() == generation && !self.socket_held.get()
+    }
+
     async fn load_transcript(self, session_id: String) {
         let lock = self.catchup_lock.with(|lock| Arc::clone(lock));
         let _guard = lock.lock().await;
-        if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
+        let generation = self.ws_generation.get();
+        if !self.same_session(&session_id) || !self.still_live(generation) {
             return;
         }
         // Subscribe first, then read. Events that commit after the read and
@@ -867,43 +1210,127 @@ impl Store {
             self.subscribe(&session_id);
             for _ in 0..subscribe_ack_polls() {
                 if self.live_subscribed.get() == session_id
-                    || self.selected_session.get().as_deref() != Some(session_id.as_str())
+                    || !self.same_session(&session_id)
+                    || !self.still_live(generation)
                 {
                     break;
                 }
                 timer(SUBSCRIBE_ACK_SLICE).await;
             }
         }
-        if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
+        if !self.same_session(&session_id) || !self.still_live(generation) {
             self.discard_live_buffer();
             return;
         }
-        let subscribed_before = self.live_subscribed.get() == session_id;
+        let started_subscribed = self.live_subscribed.get() == session_id;
         // A read that starts before the ack can miss a publish the hub drops.
-        self.read_unsubscribed.set(!subscribed_before);
-        self.catch_up(session_id.clone()).await;
-        let subscribed_after = self.selected_session.get().as_deref() == Some(session_id.as_str())
-            && self.live_subscribed.get() == session_id;
-        if extra_read_after_unready(subscribed_before, subscribed_after) {
+        self.read_unsubscribed.set(!started_subscribed);
+        let mut read_ok = self.catch_up(session_id.clone()).await;
+        let ack_during = extra_read_after_unready(
+            started_subscribed,
+            self.same_session(&session_id)
+                && self.still_live(generation)
+                && self.live_subscribed.get() == session_id,
+        );
+        if ack_during {
             self.read_unsubscribed.set(false);
-            self.catch_up(session_id.clone()).await;
+            read_ok = self.catch_up(session_id.clone()).await;
         }
-        if self.selected_session.get().as_deref() == Some(session_id.as_str()) {
+        if self.same_session(&session_id) && self.still_live(generation) {
             self.finish_live_buffer();
         } else {
             self.discard_live_buffer();
+            return;
+        }
+        if !self.same_session(&session_id) || !self.still_live(generation) {
+            return;
+        }
+        if report_synced(started_subscribed || ack_during, read_ok) {
+            self.read_attempt.set(0);
+            self.mark_synced(generation);
+        } else if !read_ok {
+            // The HTTP read failed. Do not keep a success label, and do not
+            // start the next read until the backoff has elapsed.
+            self.mark_subscribe_failed(generation);
+            self.schedule_read_retry(session_id, generation);
+        } else {
+            // The read succeeded before the socket was subscribed. The next
+            // attempt waits for the ack inside `load_transcript`.
+            self.mark_subscribe_failed(generation);
+            self.schedule_subscribe_retry(session_id, generation);
         }
     }
 
-    async fn catch_up(self, session_id: String) {
+    fn mark_synced(self, generation: u64) {
+        if !self.still_live(generation) {
+            return;
+        }
+        self.read_unsubscribed.set(false);
+        self.retry_ticket.update(|ticket| *ticket += 1);
+        let cursor = self.business_high_water.get();
+        if self.subscribe_failed.get() {
+            self.socket_label.set(LABEL_RECOVERED.to_owned());
+            log::info!("subscribe catch-up recovered session after={cursor}");
+        } else {
+            self.socket_label.set(LABEL_CONNECTED.to_owned());
+            log::info!("subscribe catch-up connected session after={cursor}");
+        }
+    }
+
+    fn mark_subscribe_failed(self, generation: u64) {
+        if !self.still_live(generation) {
+            return;
+        }
+        self.subscribe_failed.set(true);
+        self.socket_label.set(LABEL_FAILED.to_owned());
+        let cursor = self.business_high_water.get();
+        log::info!("subscribe catch-up failed session after={cursor}");
+    }
+
+    fn cancel_read_retry(self) {
+        self.retry_ticket.update(|ticket| *ticket += 1);
+        self.read_attempt.set(0);
+    }
+
+    fn schedule_subscribe_retry(self, session_id: String, generation: u64) {
+        self.spawn_read_retry(session_id, generation, Duration::ZERO);
+    }
+
+    fn schedule_read_retry(self, session_id: String, generation: u64) {
+        let attempt = self.read_attempt.get();
+        self.read_attempt.update(|n| *n = n.saturating_add(1));
+        let delay = read_retry_delay(attempt);
+        log::info!(
+            "business read retry in {}ms attempt={attempt}",
+            delay.as_millis()
+        );
+        self.spawn_read_retry(session_id, generation, delay);
+    }
+
+    fn spawn_read_retry(self, session_id: String, generation: u64, delay: Duration) {
+        self.retry_ticket.update(|ticket| *ticket += 1);
+        let ticket = self.retry_ticket.get();
+        let store = self;
+        go(async move {
+            if !delay.is_zero() {
+                timer(delay).await;
+            }
+            if store.retry_ticket.get() != ticket || !store.still_live(generation) {
+                return;
+            }
+            if !store.same_session(&session_id) {
+                return;
+            }
+            store.load_transcript(session_id).await;
+        });
+    }
+
+    async fn catch_up(self, session_id: String) -> bool {
         let url = self.server_url.get();
         let generation = self.ws_generation.get();
         let tasks = client::list_tasks(&url, &session_id).await;
-        if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
-            return;
-        }
-        if self.ws_generation.get() != generation {
-            return;
+        if !self.same_session(&session_id) || !self.still_live(generation) {
+            return false;
         }
         // Ask with the cursor this client still holds. A snapshot high water is
         // not expired, so using it first never receives the replacement 400.
@@ -917,19 +1344,22 @@ impl Store {
         log::info!("business replay session={session_id} after={held}");
         let mut after = held;
         let mut saw_expired = false;
+        let mut read_ok = false;
         for _ in 0..8 {
-            if self.selected_session.get().as_deref() != Some(session_id.as_str())
-                || self.ws_generation.get() != generation
-            {
+            if !self.same_session(&session_id) || !self.still_live(generation) {
                 break;
             }
+            self.business_reads.update(|n| *n += 1);
+            log::info!(
+                "business read call n={} session={session_id} after={after}",
+                self.business_reads.get()
+            );
             match client::business_events(&url, &session_id, after).await {
                 Ok(replay) => {
-                    if self.ws_generation.get() != generation
-                        || self.selected_session.get().as_deref() != Some(session_id.as_str())
-                    {
+                    if !self.same_session(&session_id) || !self.still_live(generation) {
                         break;
                     }
+                    read_ok = true;
                     let step = self.install_replay(replay, after, saw_expired);
                     saw_expired = step.saw_expired;
                     match step.next {
@@ -939,11 +1369,15 @@ impl Store {
                 }
                 Err(err) => {
                     log::warn!("business replay: {err}");
+                    // A snapshot can fill an empty transcript, but this read
+                    // still failed. Connected and recovered wait for a
+                    // business-events response.
+                    read_ok = false;
                     if self.messages.with(Vec::is_empty) {
                         if let Ok(snap) = client::snapshot(&url, &session_id).await {
-                            if self.selected_session.get().as_deref() == Some(session_id.as_str())
+                            if self.same_session(&session_id)
                                 && self.messages.with(Vec::is_empty)
-                                && self.ws_generation.get() == generation
+                                && self.still_live(generation)
                             {
                                 self.install_snapshot(
                                     snap.messages,
@@ -958,11 +1392,12 @@ impl Store {
             }
         }
         if let Ok(tasks) = tasks {
-            if self.selected_session.get().as_deref() == Some(session_id.as_str()) {
+            if self.same_session(&session_id) {
                 self.tasks.set(tasks);
             }
         }
         self.remember_preview();
+        read_ok
     }
 
     fn install_replay(self, replay: BusinessReplay, after: i64, saw_expired: bool) -> ReplayStep {
@@ -1065,6 +1500,7 @@ impl Store {
             for event in batch {
                 if let Some(session_id) = event_session(&event) {
                     if open.as_deref() != Some(session_id) {
+                        self.note_foreign(session_id);
                         continue;
                     }
                 }
@@ -1103,9 +1539,8 @@ impl Store {
     /// A socket callback. An older generation is ignored, so it cannot move
     /// the business cursor of the conversation that is open now.
     fn targets_open_chat(self, event: &crate::model::ServerEvent) -> bool {
-        event_session(event).is_some_and(|session_id| {
-            self.selected_session.get().as_deref() == Some(session_id)
-        })
+        event_session(event)
+            .is_some_and(|session_id| self.selected_session.get().as_deref() == Some(session_id))
     }
 
     fn accept_socket(self, generation: u64, event: crate::model::ServerEvent) {
@@ -1138,6 +1573,14 @@ impl Store {
         }
     }
 
+    fn note_foreign(self, session_id: &str) {
+        log::info!("ignored foreign frame session={session_id}");
+        if self.fixture_suffix.get() {
+            self.fixture_suffix_note
+                .set("Foreign frame ignored".to_owned());
+        }
+    }
+
     fn subscribe(self, session_id: &str) {
         self.ws_out.with(|slot| {
             if let Some(sender) = slot {
@@ -1167,11 +1610,21 @@ impl Store {
                 loop {
                     let event = ev_rx.recv().await;
                     if store.ws_generation.get() != generation || store.socket_held.get() {
+                        if let Some(WsEvent::Server(_)) = &event {
+                            log::info!("ignored old socket frame");
+                            if store.fixture_suffix.get() {
+                                store
+                                    .fixture_suffix_note
+                                    .set("Old socket frame ignored".to_owned());
+                            }
+                        }
                         break;
                     }
                     match event {
                         Some(WsEvent::Open) => {
-                            store.socket_label.set("Events: connected".to_owned());
+                            // The socket is up. Catch-up has not happened yet.
+                            store.subscribe_failed.set(false);
+                            store.socket_label.set(LABEL_CATCHING_UP.to_owned());
                             if let Some(session_id) = store.selected_session.get() {
                                 // The ack has to be for this socket, not the one that just died.
                                 store.live_subscribed.set(String::new());
@@ -1225,6 +1678,9 @@ impl Store {
         // `apply_delta` and `set_status` ignore another conversation, but
         // remembering the cursor afterwards would still move this chat.
         if cursor_event(&event) && !self.targets_open_chat(&event) {
+            if let Some(session_id) = event_session(&event) {
+                self.note_foreign(session_id);
+            }
             return;
         }
         match event {
@@ -1377,12 +1833,7 @@ impl Store {
         self.remember_preview();
     }
 
-    fn install_snapshot(
-        self,
-        messages: Vec<Message>,
-        approvals: Vec<Approval>,
-        high_water: i64,
-    ) {
+    fn install_snapshot(self, messages: Vec<Message>, approvals: Vec<Approval>, high_water: i64) {
         let mut installed = Vec::new();
         replace_transcript(&mut installed, messages);
         self.messages.set(installed);
@@ -1587,6 +2038,12 @@ mod tests {
             socket_held: signal(false),
             live_subscribed: signal(String::new()),
             read_unsubscribed: signal(false),
+            subscribe_failed: signal(false),
+            retry_ticket: signal(0),
+            read_attempt: signal(0),
+            business_reads: signal(0),
+            previous_session: signal(None),
+            assistant_ids: signal(HashMap::new()),
             live_gate: stored(Arc::new(std::sync::Mutex::new(LiveGate {
                 buffering: false,
                 generation: 0,
@@ -1645,7 +2102,7 @@ mod tests {
             store.ingest_live(delta("chat-a", 9, "stale"));
             store.ws_generation.set(2);
             store.finish_live_buffer();
-                assert_eq!(store.business_cursor(), 3, "old socket moved this chat");
+            assert_eq!(store.business_cursor(), 3, "old socket moved this chat");
             let content = store.messages.with(|list| list[0].content.clone());
             assert_eq!(content, "cedar");
         });
@@ -1707,11 +2164,7 @@ mod tests {
             assert_eq!(store.business_cursor(), 4);
             assert_ne!(store.business_cursor(), 1);
             let suffix = delta("chat-a", 5, "once");
-            let step = store.install_replay(
-                BusinessReplay::Events(vec![suffix.clone()]),
-                4,
-                true,
-            );
+            let step = store.install_replay(BusinessReplay::Events(vec![suffix.clone()]), 4, true);
             assert_eq!(step.next, Some(5));
             assert_eq!(content(store), "lanternonce");
             assert_eq!(store.business_cursor(), 5);
@@ -1745,18 +2198,28 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_ack_budget_is_five_seconds_and_a_late_ack_rereads() {
+    fn subscribe_ack_budget_is_five_seconds_and_an_unsubscribed_read_is_not_synced() {
         assert_eq!(SUBSCRIBE_ACK_BUDGET, Duration::from_secs(5));
         assert_eq!(subscribe_ack_polls(), 50);
         let budget = SUBSCRIBE_ACK_BUDGET;
         let late_ack = Some(Duration::from_millis(6000));
         let during_gap = Duration::from_millis(5500);
-        assert!(event_missed_without_another_read(late_ack, during_gap, budget));
-        assert!(another_read_keeps_event(late_ack, during_gap, budget));
-        assert!(extra_read_after_unready(false, true));
+        // The first read, taken when the ack is late or missing, does not
+        // contain the event. This predicate does not sleep.
+        assert!(event_missed_without_another_read(
+            late_ack, during_gap, budget
+        ));
         assert!(event_missed_without_another_read(None, during_gap, budget));
-        assert!(!another_read_keeps_event(None, during_gap, budget));
+        // The retry read is not gated on the ack.
+        assert!(retry_read_includes(during_gap, Duration::from_secs(10)));
+        assert!(retry_read_includes(during_gap, late_ack.unwrap()));
+        assert!(extra_read_after_unready(false, true));
         assert!(!extra_read_after_unready(false, false));
+        assert!(!extra_read_after_unready(true, true));
+        // A successful unsubscribed read is not connected or recovered.
+        assert!(!report_synced(false, true));
+        assert!(!report_synced(true, false));
+        assert!(report_synced(true, true));
         let timely = Some(Duration::from_millis(100));
         assert!(!event_missed_without_another_read(
             timely,
@@ -1768,7 +2231,47 @@ mod tests {
             Duration::from_millis(200),
             budget,
         ));
-        assert!(!extra_read_after_unready(true, true));
+    }
+
+    #[test]
+    fn failed_read_backoff_is_capped_exponential() {
+        assert_eq!(read_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(read_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(read_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(read_retry_delay(3), Duration::from_secs(8));
+        assert_eq!(read_retry_delay(4), Duration::from_secs(16));
+        assert_eq!(read_retry_delay(5), READ_RETRY_CAP);
+        assert_eq!(read_retry_delay(20), READ_RETRY_CAP);
+        // One second is the floor, so two seconds cannot hold the old 25/s loop.
+        assert!(read_retry_delay(0) * 25 > Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cursorless_delta_does_not_move_the_business_cursor_or_another_chat() {
+        with_store(|store| {
+            open_chat(store);
+            store.ingest_live(ServerEvent::Delta {
+                event_id: String::new(),
+                cursor: 0,
+                message_id: "m".into(),
+                session_id: "chat-a".into(),
+                text: "z".into(),
+            });
+            assert_eq!(store.business_cursor(), 3);
+            assert_eq!(store.message_seq(), 1);
+            assert_eq!(content(store), "cedarz");
+            store.ingest_live(ServerEvent::Delta {
+                event_id: String::new(),
+                cursor: 0,
+                message_id: "m".into(),
+                session_id: "chat-b".into(),
+                text: "nope".into(),
+            });
+            assert_eq!(store.business_cursor(), 3);
+            assert_eq!(store.message_seq(), 1);
+            assert_eq!(content(store), "cedarz");
+            assert!(!content(store).contains("nope"));
+        });
     }
 
     fn content(store: Store) -> String {

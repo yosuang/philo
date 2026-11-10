@@ -463,6 +463,11 @@ fn activity_pane(store: Store) -> impl IntoElement {
                 .text_color(move || theme().foreground),
         )
         .child(
+            text(move || format!("Message seq: {}", store.message_seq()))
+                .text_size(px(12.0))
+                .text_color(move || theme().foreground),
+        )
+        .child(
             text(move || store.socket_label.get())
                 .text_size(px(12.0))
                 .text_color(move || theme().muted_foreground),
@@ -496,6 +501,71 @@ fn activity_pane(store: Store) -> impl IntoElement {
                         "Stage expired cursor",
                         move || store.selected_session.get().is_some(),
                         move || store.stage_expired_cursor(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Hold subscribe",
+                        move || store.selected_session.get().is_some(),
+                        move || store.hold_subscribe(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Hold next subscribe",
+                        move || true,
+                        move || store.hold_next_subscribe(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Release subscribe",
+                        move || true,
+                        move || store.release_subscribe(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Fail reads",
+                        move || store.selected_session.get().is_some(),
+                        move || store.fail_reads(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Release reads",
+                        move || store.selected_session.get().is_some(),
+                        move || store.release_reads(),
+                    ))
+                    .child(
+                        text(move || format!("Business reads: {}", store.business_reads()))
+                            .text_size(px(12.0))
+                            .text_color(move || theme().foreground),
+                    )
+                    .child(ui::secondary_button(
+                        "Gap event",
+                        move || store.selected_session.get().is_some(),
+                        move || store.post_gap_event(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Stage during read",
+                        move || store.selected_session.get().is_some(),
+                        move || store.stage_during_read(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Stream delta",
+                        move || store.selected_session.get().is_some(),
+                        move || store.post_stream_delta(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Abandon socket",
+                        move || store.selected_session.get().is_some(),
+                        move || store.abandon_socket(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Old socket delta",
+                        move || store.selected_session.get().is_some(),
+                        move || store.post_old_socket_delta(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Foreign event",
+                        move || true,
+                        move || store.post_foreign_event(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Foreign stream",
+                        move || true,
+                        move || store.post_foreign_stream(),
                     ))
                     .child(
                         text(move || store.fixture_suffix_note.get())
