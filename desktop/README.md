@@ -12,16 +12,7 @@ Slogan: **Your agent, your friend.** Always on for you.
 
 ## Run
 
-Start the session server from the `philo/session-api` branch (do not copy it into this branch):
-
-```bash
-git fetch origin philo/session-api
-git worktree add ../philo-session-api origin/philo/session-api
-cd ../philo-session-api
-docker compose up --build
-```
-
-The API listens on `http://127.0.0.1:8080`. `PHILO_MODEL_ADAPTER` defaults to `dev`. Leave `PHILO_MAKEZ_URL` unset so Makez stays disconnected.
+Start the session server from this repository. `server/README.md` has the command. The API listens on `http://127.0.0.1:8080`. Leave `PHILO_EXECUTION_FIXTURE` unset. `PHILO_MODEL_ADAPTER=dev` does not turn the fixture on. Leave `PHILO_MAKEZ_URL` unset so Makez stays disconnected. Set `PHILO_ACTOR_TOKEN` to the bearer token in `PHILO_AUTH_CREDENTIALS`.
 
 From this directory:
 
@@ -46,9 +37,9 @@ Settings shows the server URL. The default is `http://127.0.0.1:8080`. Saving it
 
 ## What the window does
 
-With the dev adapter, the banner says this is not a live model. Create a bot (name, instructions, model id) and send a message. The assistant reply streams over the WebSocket. Switching bots restores each transcript. Reload reads that bot's messages again. Cancel posts `POST /v1/sessions/{id}/cancel` on the resumed server session. Retry appears only after an assistant message is `error` or `canceled`.
+With the fixture unset, the banner says `Adapter: unavailable`. Create a bot (name, instructions, model id) and send a message. The user message stays in the transcript and the window says `Execution is unavailable.` There is no assistant reply. Switching bots restores each transcript. Reload reads that bot's messages again. Cancel posts `POST /v1/sessions/{id}/cancel` on the resumed server session. Retry appears only after an assistant message is `error` or `canceled`.
 
-A message that starts with `/draft ` asks the dev adapter for one pending approval. Approve and Reject post `POST /v1/approvals/{id}/decision`. Approve is what lets the server complete a `philo-server` task. Reject does not.
+`PHILO_EXECUTION_FIXTURE=dev` is the isolated fixture. That process shows the development-adapter banner and streams a fixed local reply. It is not a production success. A message that starts with `/draft ` asks that fixture for one pending approval. Approve and Reject post `POST /v1/approvals/{id}/decision`. On the fixture, approve is what lets the server complete a `philo-server` task. Reject does not. Production does not create that approval.
 
 Connectors shows Makez as not connected, with the server's reason, unless `PHILO_MAKEZ_URL` is set and healthy. Attachments, notifications, skills, memory, routines, tool-call transcripts, and connector sign-in are real pages that say they are not available yet.
 
@@ -63,13 +54,13 @@ nsh test App.test.tsx
 
 `cargo test --lib` covers JSON parsing for the HTTP and WebSocket contract. `App.test.tsx` opens the shell headless: slogan, settings, the theme control, and a page that is not available yet.
 
-With the server running, the GTK window loop is `session-loop.test.tsx`:
+With a production server running and `PHILO_EXECUTION_FIXTURE` unset, the GTK window loop is `session-loop.test.tsx`:
 
 ```bash
 nsh test session-loop.test.tsx --target linux
 ```
 
-That test needs `network: "live"` and the server on port 8080. `nsh test` with no file also runs it, so start the server first or pass `App.test.tsx` only.
+That test needs `network: "live"`, `PHILO_ACTOR_TOKEN`, and the server on port 8080. It checks that a send stays `Execution is unavailable.` and does not show a dev-adapter reply. `nsh test` with no file also runs it, so start the server first or pass `App.test.tsx` only.
 
 ## Contract notes
 
