@@ -66,6 +66,22 @@ fn extra_read_after_unready(subscribed_before: bool, subscribed_after: bool) -> 
     !subscribed_before && subscribed_after
 }
 
+/// Capped exponential backoff for one failed business read.
+/// The AWS SDK calls the same shape `exponentialDelayWithoutJitter`:
+/// `min(cap, base * 2^retry)`, first retry at the base.
+/// Full jitter can sleep zero, which does not bound a single client's rate.
+/// The base is 1s, the standard-mode delay for a service that is refusing
+/// work. The cap is that mode's 20s maximum.
+const READ_RETRY_BASE: Duration = Duration::from_secs(1);
+const READ_RETRY_CAP: Duration = Duration::from_secs(20);
+
+fn read_retry_delay(retry: u32) -> Duration {
+    let shift = retry.min(16);
+    READ_RETRY_BASE
+        .saturating_mul(1_u32 << shift)
+        .min(READ_RETRY_CAP)
+}
+
 const LABEL_CATCHING_UP: &str = "Events: catching up";
 const LABEL_FAILED: &str = "Events: subscribe failed";
 const LABEL_CONNECTED: &str = "Events: connected";
@@ -192,6 +208,12 @@ pub struct Store {
     subscribe_failed: Signal<bool>,
     /// Cancels a subscribe retry that has not entered `load_transcript`.
     retry_ticket: Signal<u64>,
+    /// How many failed business reads are waiting to be retried. Reset
+    /// when a read succeeds, or when this chat is left.
+    read_attempt: Signal<u32>,
+    /// Business-log HTTP calls this process has started. The fixture pane
+    /// shows it so a test can measure the retry rate.
+    business_reads: Signal<u64>,
     previous_session: Signal<Option<String>>,
     assistant_ids: Signal<HashMap<String, String>>,
     live_gate: Stored<Arc<std::sync::Mutex<LiveGate>>>,
@@ -251,6 +273,8 @@ impl Store {
             read_unsubscribed: signal(false),
             subscribe_failed: signal(false),
             retry_ticket: signal(0),
+            read_attempt: signal(0),
+            business_reads: signal(0),
             previous_session: signal(None),
             assistant_ids: signal(HashMap::new()),
             live_gate: stored(Arc::new(std::sync::Mutex::new(LiveGate {
@@ -380,6 +404,8 @@ impl Store {
                 self.remember_assistant(&previous);
                 self.previous_session.set(Some(previous));
             }
+            self.cancel_read_retry();
+            self.subscribe_failed.set(false);
             self.open_generation.update(|generation| *generation += 1);
             self.selected_agent.set(Some(id.clone()));
             self.selected_session.set(None);
@@ -637,6 +663,10 @@ impl Store {
         self.fixture_suffix.get()
     }
 
+    pub fn business_reads(self) -> u64 {
+        self.business_reads.get()
+    }
+
     /// Ask the labeled fixture to replace the retained log so the cursor this
     /// client holds is expired, and to append one suffix after that snapshot.
     /// The transcript on screen is left unchanged until the next read.
@@ -744,6 +774,30 @@ impl Store {
         self.fixture_action("Subscribe released", |store| {
             let url = store.server_url.get();
             async move { client::post_fixture_release(&url).await }
+        });
+    }
+
+    pub fn fail_reads(self) {
+        let Some(session_id) = self.selected_session.get() else {
+            self.action_error
+                .set(Some("Choose a bot before failing reads.".to_owned()));
+            return;
+        };
+        self.fixture_action("Reads failing", move |store| {
+            let url = store.server_url.get();
+            async move { client::post_fixture_fail_reads(&url, &session_id).await }
+        });
+    }
+
+    pub fn release_reads(self) {
+        let Some(session_id) = self.selected_session.get() else {
+            self.action_error
+                .set(Some("Choose a bot before releasing reads.".to_owned()));
+            return;
+        };
+        self.fixture_action("Reads released", move |store| {
+            let url = store.server_url.get();
+            async move { client::post_fixture_release_reads(&url, &session_id).await }
         });
     }
 
@@ -962,6 +1016,7 @@ impl Store {
     /// Drop the event socket and leave it down so the log can move while
     /// this client is not subscribed.
     pub fn disconnect_events(self) {
+        self.cancel_read_retry();
         self.socket_held.set(true);
         self.live_subscribed.set(String::new());
         self.reconnect();
@@ -1191,8 +1246,16 @@ impl Store {
             return;
         }
         if report_synced(started_subscribed || ack_during, read_ok) {
+            self.read_attempt.set(0);
             self.mark_synced(generation);
+        } else if !read_ok {
+            // The HTTP read failed. Do not keep a success label, and do not
+            // start the next read until the backoff has elapsed.
+            self.mark_subscribe_failed(generation);
+            self.schedule_read_retry(session_id, generation);
         } else {
+            // The read succeeded before the socket was subscribed. The next
+            // attempt waits for the ack inside `load_transcript`.
             self.mark_subscribe_failed(generation);
             self.schedule_subscribe_retry(session_id, generation);
         }
@@ -1218,25 +1281,40 @@ impl Store {
         if !self.still_live(generation) {
             return;
         }
-        if self.socket_label.get() == LABEL_RECOVERED || self.socket_label.get() == LABEL_CONNECTED
-        {
-            if self.live_subscribed.get() == self.selected_session.get().unwrap_or_default()
-                && !self.read_unsubscribed.get()
-            {
-                return;
-            }
-        }
         self.subscribe_failed.set(true);
         self.socket_label.set(LABEL_FAILED.to_owned());
         let cursor = self.business_high_water.get();
         log::info!("subscribe catch-up failed session after={cursor}");
     }
 
+    fn cancel_read_retry(self) {
+        self.retry_ticket.update(|ticket| *ticket += 1);
+        self.read_attempt.set(0);
+    }
+
     fn schedule_subscribe_retry(self, session_id: String, generation: u64) {
+        self.spawn_read_retry(session_id, generation, Duration::ZERO);
+    }
+
+    fn schedule_read_retry(self, session_id: String, generation: u64) {
+        let attempt = self.read_attempt.get();
+        self.read_attempt.update(|n| *n = n.saturating_add(1));
+        let delay = read_retry_delay(attempt);
+        log::info!(
+            "business read retry in {}ms attempt={attempt}",
+            delay.as_millis()
+        );
+        self.spawn_read_retry(session_id, generation, delay);
+    }
+
+    fn spawn_read_retry(self, session_id: String, generation: u64, delay: Duration) {
         self.retry_ticket.update(|ticket| *ticket += 1);
         let ticket = self.retry_ticket.get();
         let store = self;
         go(async move {
+            if !delay.is_zero() {
+                timer(delay).await;
+            }
             if store.retry_ticket.get() != ticket || !store.still_live(generation) {
                 return;
             }
@@ -1271,6 +1349,11 @@ impl Store {
             if !self.same_session(&session_id) || !self.still_live(generation) {
                 break;
             }
+            self.business_reads.update(|n| *n += 1);
+            log::info!(
+                "business read call n={} session={session_id} after={after}",
+                self.business_reads.get()
+            );
             match client::business_events(&url, &session_id, after).await {
                 Ok(replay) => {
                     if !self.same_session(&session_id) || !self.still_live(generation) {
@@ -1286,6 +1369,10 @@ impl Store {
                 }
                 Err(err) => {
                     log::warn!("business replay: {err}");
+                    // A snapshot can fill an empty transcript, but this read
+                    // still failed. Connected and recovered wait for a
+                    // business-events response.
+                    read_ok = false;
                     if self.messages.with(Vec::is_empty) {
                         if let Ok(snap) = client::snapshot(&url, &session_id).await {
                             if self.same_session(&session_id)
@@ -1297,7 +1384,6 @@ impl Store {
                                     snap.approvals,
                                     snap.high_water,
                                 );
-                                read_ok = true;
                             }
                         }
                     }
@@ -1954,6 +2040,8 @@ mod tests {
             read_unsubscribed: signal(false),
             subscribe_failed: signal(false),
             retry_ticket: signal(0),
+            read_attempt: signal(0),
+            business_reads: signal(0),
             previous_session: signal(None),
             assistant_ids: signal(HashMap::new()),
             live_gate: stored(Arc::new(std::sync::Mutex::new(LiveGate {
@@ -2143,6 +2231,19 @@ mod tests {
             Duration::from_millis(200),
             budget,
         ));
+    }
+
+    #[test]
+    fn failed_read_backoff_is_capped_exponential() {
+        assert_eq!(read_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(read_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(read_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(read_retry_delay(3), Duration::from_secs(8));
+        assert_eq!(read_retry_delay(4), Duration::from_secs(16));
+        assert_eq!(read_retry_delay(5), READ_RETRY_CAP);
+        assert_eq!(read_retry_delay(20), READ_RETRY_CAP);
+        // One second is the floor, so two seconds cannot hold the old 25/s loop.
+        assert!(read_retry_delay(0) * 25 > Duration::from_secs(2));
     }
 
     #[test]

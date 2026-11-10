@@ -518,6 +518,21 @@ fn activity_pane(store: Store) -> impl IntoElement {
                         move || store.release_subscribe(),
                     ))
                     .child(ui::secondary_button(
+                        "Fail reads",
+                        move || store.selected_session.get().is_some(),
+                        move || store.fail_reads(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Release reads",
+                        move || store.selected_session.get().is_some(),
+                        move || store.release_reads(),
+                    ))
+                    .child(
+                        text(move || format!("Business reads: {}", store.business_reads()))
+                            .text_size(px(12.0))
+                            .text_color(move || theme().foreground),
+                    )
+                    .child(ui::secondary_button(
                         "Gap event",
                         move || store.selected_session.get().is_some(),
                         move || store.post_gap_event(),

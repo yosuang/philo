@@ -225,6 +225,34 @@ pub async fn post_fixture_hold_next(base: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub async fn post_fixture_fail_reads(base: &str, session_id: &str) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "conversationId": session_id,
+            "type": "fixture.fail-reads",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn post_fixture_release_reads(base: &str, session_id: &str) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "conversationId": session_id,
+            "type": "fixture.release-reads",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn post_fixture_release(base: &str) -> Result<(), String> {
     let _ = send_json(
         "POST",

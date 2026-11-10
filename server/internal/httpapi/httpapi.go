@@ -71,6 +71,9 @@ type server struct {
 
 	duringMu   sync.Mutex
 	duringRead map[string]parkedDelta
+
+	failMu    sync.Mutex
+	failReads map[string]struct{}
 }
 
 // parkedDelta is one fixture business event applied while a read is in
@@ -122,6 +125,7 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 		pendingSuffix: map[string]stagedSuffix{},
 		hold:          hold,
 		duringRead:    map[string]parkedDelta{},
+		failReads:     map[string]struct{}{},
 	}
 	mux := http.NewServeMux()
 	s.routes(mux)
@@ -771,6 +775,11 @@ func (s *server) businessEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "after must be a non-negative integer")
 		return
 	}
+	if s.readsFailed(id) {
+		log.Printf("business events http 500 session=%s after=%d", id, after)
+		writeError(w, http.StatusInternalServerError, "internal", "business read failed")
+		return
+	}
 	events, snap, err := s.store.BusinessEventsAfter(r.Context(), p.OwnerID, id, after)
 	if errors.Is(err, store.ErrCursorExpired) {
 		// The snapshot above does not include a suffix staged by the fixture.
@@ -948,6 +957,31 @@ func (s *server) fixtureControl(w http.ResponseWriter, body *struct {
 		log.Printf("fixture hold next subscribe")
 		writeJSON(w, http.StatusOK, map[string]any{"type": body.Type, "held": true})
 		return true
+	case "fixture.fail-reads":
+		id, ok := uuidParam(w, body.ConversationID, "conversationId")
+		if !ok {
+			return true
+		}
+		s.failMu.Lock()
+		if s.failReads == nil {
+			s.failReads = map[string]struct{}{}
+		}
+		s.failReads[id] = struct{}{}
+		s.failMu.Unlock()
+		log.Printf("fixture fail reads session=%s", id)
+		writeJSON(w, http.StatusOK, map[string]any{"type": body.Type, "sessionId": id, "failing": true})
+		return true
+	case "fixture.release-reads":
+		id, ok := uuidParam(w, body.ConversationID, "conversationId")
+		if !ok {
+			return true
+		}
+		s.failMu.Lock()
+		delete(s.failReads, id)
+		s.failMu.Unlock()
+		log.Printf("fixture release reads session=%s", id)
+		writeJSON(w, http.StatusOK, map[string]any{"type": body.Type, "sessionId": id, "failing": false})
+		return true
 	case "fixture.release-subscribe":
 		if strings.TrimSpace(body.ConversationID) == "" {
 			s.hold.Release("")
@@ -1016,6 +1050,13 @@ func (s *server) fixtureControl(w http.ResponseWriter, body *struct {
 	default:
 		return false
 	}
+}
+
+func (s *server) readsFailed(sessionID string) bool {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	_, ok := s.failReads[sessionID]
+	return ok
 }
 
 func (s *server) stageDuringRead(conversationID string, parked parkedDelta) {

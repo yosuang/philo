@@ -158,6 +158,35 @@ func TestBusinessEventDuringReadIsOutsideTheResponse(t *testing.T) {
 	}
 }
 
+func TestBusinessReadHTTP500ThenRelease(t *testing.T) {
+	srv, _ := startProduction(t, config.Config{BusinessFixture: true})
+	conversationID := openDefault(t, srv, createAgent(t, srv, "Reed"))
+	code, body := postFixture(t, srv, map[string]any{
+		"source":         store.FixtureSource,
+		"type":           "fixture.fail-reads",
+		"conversationId": conversationID,
+	})
+	if code != 200 {
+		t.Fatalf("fail %d %s", code, body)
+	}
+	status, raw := getEvents(t, srv, conversationID, 0)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d %s", status, raw)
+	}
+	code, body = postFixture(t, srv, map[string]any{
+		"source":         store.FixtureSource,
+		"type":           "fixture.release-reads",
+		"conversationId": conversationID,
+	})
+	if code != 200 {
+		t.Fatalf("release %d %s", code, body)
+	}
+	status, raw = getEvents(t, srv, conversationID, 0)
+	if status != http.StatusOK {
+		t.Fatalf("after release %d %s", status, raw)
+	}
+}
+
 func TestFixtureHoldRouteIsAbsentWithoutTheFixture(t *testing.T) {
 	srv, _ := startProduction(t, config.Config{})
 	code, body := postFixture(t, srv, map[string]any{
