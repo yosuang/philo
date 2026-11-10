@@ -42,6 +42,8 @@ const (
 	fixtureSourceLogTwo     = "test-fixture-source:seq:2"
 	osKillClientKey         = "os-kill-submit"
 	osKillContent           = "Remember the cedar"
+	fixtureSourceLogThree   = "test-fixture-source:seq:3"
+	foreignBotTask          = "foreign-bot-task"
 )
 
 // TestOSKillResumesFixtureSource kills one Philo OS process and reads the
@@ -110,9 +112,45 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 		t.Fatalf("business high-water collapsed into the source checkpoint: %+v", before)
 	}
 	waitResult := stopPhilo(t, first, sig)
+	plantForeignBot(t, pool)
 
+	src.hangOne()
 	second := startPhiloOS(t, bin, dsn, extra, "test-binding")
-	assertStartupResume(t, second, src)
+	waitUntilWithin(t, 4*time.Second, func() bool {
+		if !src.stillHanging() {
+			return false
+		}
+		req, err := http.NewRequest(http.MethodGet, second.url+"/v1/health", nil)
+		if err != nil {
+			return false
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+	src.setFailing(true)
+	src.armSuffix()
+	waitUntilWithin(t, 8*time.Second, func() bool {
+		return src.failures() >= 2
+	})
+	health := apiGet(t, second.url, "/v1/health")
+	if health["ok"] != true {
+		t.Fatalf("health during fixture 500 = %#v", health)
+	}
+	src.setFailing(false)
+	waitUntilWithin(t, 8*time.Second, func() bool {
+		return appliedSeq(t, pool, src) == 3 && seqCount(t, pool, src.RunID, 3) == 1
+	})
+	time.Sleep(500 * time.Millisecond)
+	if seqCount(t, pool, src.RunID, 1) != 1 || seqCount(t, pool, src.RunID, 2) != 1 || seqCount(t, pool, src.RunID, 3) != 1 {
+		t.Fatalf("source seq counts changed after the suffix")
+	}
+	if appliedSeq(t, pool, src) != 3 {
+		t.Fatalf("checkpoint = %d", appliedSeq(t, pool, src))
+	}
 	if n := messagePostsTo(second.url); n != 0 {
 		t.Fatalf("replay ran because the harness posted %d messages to the new process", n)
 	}
@@ -120,12 +158,33 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 	assertNoEngineCursor(t, ws2.drain(t, 300*time.Millisecond), conv, false)
 
 	after := durableView(t, pool, conv, src)
-	if after != before {
-		t.Fatalf("replay changed durable state\nbefore %+v\nafter  %+v", before, after)
+	if after.turnID != before.turnID || after.userID != before.userID || after.outboxID != before.outboxID || after.eventID != before.eventID {
+		t.Fatalf("row ids changed\nbefore %+v\nafter  %+v", before, after)
+	}
+	if after.outboxXmin != before.outboxXmin || !after.outboxUnsent {
+		t.Fatalf("outbox changed\nbefore %+v\nafter  %+v", before, after)
+	}
+	if after.applied != 3 || after.logs != 3 || after.assistants != 0 || after.high != before.high || after.taskID != before.taskID {
+		t.Fatalf("suffix view = %+v", after)
 	}
 	cursors := src.eventCursors()
-	if len(cursors) != 2 || cursors[0] != "" || cursors[1] != "2" {
-		t.Fatalf("startup resume cursors = %#v", cursors)
+	emptyReads := 0
+	resumedAt2 := false
+	for _, cursor := range cursors {
+		if cursor == "" {
+			emptyReads++
+		}
+		if cursor == "2" {
+			resumedAt2 = true
+		}
+	}
+	if emptyReads != 1 || !resumedAt2 {
+		t.Fatalf("resume cursors = %#v", cursors)
+	}
+	for _, path := range src.paths() {
+		if strings.Contains(path, foreignBotTask) {
+			t.Fatalf("foreign bot was dialed: %s", path)
+		}
 	}
 	if src.posts() != 1 {
 		t.Fatalf("startup submitted another task, posts=%d", src.posts())
@@ -155,15 +214,15 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal) {
 		"pid1":                  strconv.Itoa(first.pid),
 		"pid2":                  strconv.Itoa(second.pid),
 		"source":                fixtureSourceLabel,
-		"checkpoint_applied":    strconv.FormatInt(after.applied, 10),
+		"checkpoint_applied":    "3",
 		"checkpoint_processing": after.processing,
 		"event_cursors":         strings.Join(cursors, ","),
 		"source_rows":           strconv.Itoa(after.logs),
 		"high_water":            strconv.FormatInt(after.high, 10),
 		"assistant_rows":        "0",
 	})
-	t.Logf("os-kill case=%s phase=after-commit signal=%s wait=%s pid1=%d pid2=%d source=%s checkpoint=%d processing=%s cursors=%s high=%d turn=%s user=%s outbox=%s",
-		t.Name(), signalName(sig), waitResult, first.pid, second.pid, fixtureSourceLabel, after.applied, after.processing, strings.Join(cursors, ","), after.high, after.turnID, after.userID, after.outboxID)
+	t.Logf("os-kill case=%s phase=after-commit signal=%s wait=%s pid1=%d pid2=%d source=%s checkpoint=%d suffix=1 failures=%d turn=%s user=%s outbox=%s",
+		t.Name(), signalName(sig), waitResult, first.pid, second.pid, fixtureSourceLabel, after.applied, src.failures(), after.turnID, after.userID, after.outboxID)
 }
 
 func killWithExecutionUnavailable(t *testing.T, bin string) {
@@ -340,16 +399,15 @@ func killDuringTransaction(t *testing.T, bin string) {
 	}
 
 	second := startPhiloOS(t, bin, dsn, extra, "test-binding")
-	secondLog, err := os.ReadFile(second.logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(secondLog)
-	resumeAt := strings.Index(text, "startup resume linked=0")
-	listenAt := strings.Index(text, "listening on")
-	if resumeAt < 0 || listenAt < 0 || resumeAt > listenAt {
-		t.Fatalf("startup scan was not before listen\n%s", text)
-	}
+	var text string
+	waitUntilWithin(t, 3*time.Second, func() bool {
+		raw, err := os.ReadFile(second.logPath)
+		if err != nil {
+			return false
+		}
+		text = string(raw)
+		return strings.Contains(text, "listening on") && strings.Contains(text, "startup resume linked=0")
+	})
 	if strings.Contains(text, "after=") {
 		t.Fatalf("startup resumed a source that was not committed\n%s", text)
 	}
@@ -382,41 +440,77 @@ func killDuringTransaction(t *testing.T, bin string) {
 		t.Name(), signalName(syscall.SIGKILL), waitResult, first.pid, second.pid, fixtureSourceLabel)
 }
 
-func assertStartupResume(t *testing.T, p *philoProc, src *fixtureSource) {
-	t.Helper()
-	raw, err := os.ReadFile(p.logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(raw)
-	mark := fmt.Sprintf("startup resume workspace=%s task=%s after=2", fixtureSourceLabel, src.TaskID)
-	resumeAt := strings.Index(text, mark)
-	listenAt := strings.Index(text, "listening on")
-	if resumeAt < 0 || listenAt < 0 || resumeAt > listenAt {
-		t.Fatalf("startup resume was not before listen\n%s", text)
-	}
-	if !strings.Contains(text, "startup resume linked=1") {
-		t.Fatalf("startup did not find the linked turn\n%s", text)
-	}
-	cursors := src.eventCursors()
-	if len(cursors) != 2 || cursors[0] != "" || cursors[1] != "2" {
-		t.Fatalf("startup resume cursors = %#v", cursors)
-	}
-	if src.posts() != 1 {
-		t.Fatalf("startup submitted another task, posts=%d", src.posts())
-	}
-}
-
 func waitUntil(t *testing.T, ready func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	waitUntilWithin(t, 5*time.Second, ready)
+}
+
+func waitUntilWithin(t *testing.T, d time.Duration, ready func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		if ready() {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("timed out waiting for the open transaction")
+	t.Fatal("timed out")
+}
+
+func appliedSeq(t *testing.T, pool *pgxpool.Pool, src *fixtureSource) int64 {
+	t.Helper()
+	var n int64
+	err := pool.QueryRow(context.Background(), `
+		SELECT applied_public_seq FROM source_checkpoints
+		WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3`,
+		fixtureSourceLabel, src.TaskID, src.RunID).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func seqCount(t *testing.T, pool *pgxpool.Pool, runID string, seq int64) int {
+	t.Helper()
+	var n int
+	err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM source_log_dedup WHERE run_id = $1 AND public_seq = $2`,
+		runID, seq).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func plantForeignBot(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	agentID := uuid.NewString()
+	sessionID := uuid.NewString()
+	turnID := uuid.NewString()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO owners (id, created_at) VALUES ('other-owner', now())
+		ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO agents (id, name, instructions, model_id, owner_id, created_at, updated_at)
+		VALUES ($1, 'Other', 'no', 'dev-local', 'other-owner', now(), now())`, agentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO sessions (id, agent_id, title, is_default, created_at, updated_at)
+		VALUES ($1, $2, 'other', false, now(), now())`, sessionID, agentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO turns (
+			id, owner_id, conversation_id, created_at,
+			makez_workspace_id, makez_task_id, makez_run_id
+		) VALUES ($1, $2, $3, now(), $4, $5, 'foreign-bot-run')`,
+		turnID, testOwner, sessionID, fixtureSourceLabel, foreignBotTask); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // injectedFaultIsNotAKill rolls a projection back inside this process.
@@ -533,14 +627,18 @@ func durableView(t *testing.T, pool *pgxpool.Pool, conv string, src *fixtureSour
 			got.hashOne = hash
 		case 2:
 			got.hashTwo = hash
+		case 3:
+			if hash != fixtureLogHash(fixtureSourceLogThree) {
+				t.Fatalf("suffix hash = %s", hash)
+			}
+		default:
+			t.Fatalf("unexpected source seq %d", seq)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(seqs) != 2 || seqs[0] != 1 || seqs[1] != 2 ||
-		got.hashOne != fixtureLogHash(fixtureSourceLogOne) ||
-		got.hashTwo != fixtureLogHash(fixtureSourceLogTwo) {
+	if got.hashOne != fixtureLogHash(fixtureSourceLogOne) || got.hashTwo != fixtureLogHash(fixtureSourceLogTwo) {
 		t.Fatalf("logs seqs=%v hashes=%s %s", seqs, got.hashOne, got.hashTwo)
 	}
 	if got.userContent != osKillContent || got.assistants != 0 || got.completed != 0 || got.terminals != 0 {
@@ -721,6 +819,12 @@ type fixtureSource struct {
 	key        string
 	states     []string
 	labeledAll bool
+	hangLeft   int
+	hanging    int
+	hangDone   int
+	failing    bool
+	failCount  int
+	suffix     bool
 }
 
 func startFixtureSource(t *testing.T) *fixtureSource {
@@ -816,6 +920,7 @@ func (s *fixtureSource) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.PathValue("id") != s.TaskID {
+		s.note(r.Method + " " + r.URL.Path)
 		http.NotFound(w, r)
 		return
 	}
@@ -833,6 +938,7 @@ func (s *fixtureSource) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.PathValue("id") != s.TaskID {
+		s.note(r.Method + " " + r.URL.Path)
 		http.NotFound(w, r)
 		return
 	}
@@ -844,7 +950,29 @@ func (s *fixtureSource) events(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.cursors = append(s.cursors, cursor)
 	s.seen = append(s.seen, r.Method+" "+r.URL.RequestURI())
+	hang := s.hangLeft > 0
+	if hang {
+		s.hangLeft--
+		s.hanging++
+	}
+	fail := s.failing
+	if fail {
+		s.failCount++
+	}
+	includeSuffix := s.suffix
 	s.mu.Unlock()
+	if hang {
+		<-r.Context().Done()
+		s.mu.Lock()
+		s.hanging--
+		s.hangDone++
+		s.mu.Unlock()
+		return
+	}
+	if fail {
+		http.Error(w, "fixture unavailable", http.StatusInternalServerError)
+		return
+	}
 	after := int64(0)
 	if cursor != "" {
 		n, err := strconv.ParseInt(cursor, 10, 64)
@@ -856,13 +984,20 @@ func (s *fixtureSource) events(w http.ResponseWriter, r *http.Request) {
 	}
 	s.label(w)
 	w.Header().Set("Content-Type", "text/event-stream")
-	for _, row := range []struct {
+	rows := []struct {
 		seq  int64
 		text string
 	}{
 		{1, fixtureSourceLogOne},
 		{2, fixtureSourceLogTwo},
-	} {
+	}
+	if includeSuffix {
+		rows = append(rows, struct {
+			seq  int64
+			text string
+		}{3, fixtureSourceLogThree})
+	}
+	for _, row := range rows {
 		if row.seq <= after {
 			continue
 		}
@@ -882,6 +1017,36 @@ func (s *fixtureSource) events(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, "id: %d\nevent: log\ndata: %s\n\n", row.seq, payload)
 	}
+}
+
+func (s *fixtureSource) hangOne() {
+	s.mu.Lock()
+	s.hangLeft++
+	s.mu.Unlock()
+}
+
+func (s *fixtureSource) stillHanging() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hanging > 0
+}
+
+func (s *fixtureSource) setFailing(on bool) {
+	s.mu.Lock()
+	s.failing = on
+	s.mu.Unlock()
+}
+
+func (s *fixtureSource) failures() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failCount
+}
+
+func (s *fixtureSource) armSuffix() {
+	s.mu.Lock()
+	s.suffix = true
+	s.mu.Unlock()
 }
 
 func (s *fixtureSource) taskBody(state string) []byte {

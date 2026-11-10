@@ -37,11 +37,21 @@ const (
 	maxContent      = 100000
 )
 
+const (
+	// resumeAttemptTimeout bounds one events read, including a body that never ends.
+	resumeAttemptTimeout = 2 * time.Second
+	// resumeInterval is the wait between attempts. The loop does not spin.
+	resumeInterval = 200 * time.Millisecond
+	// resumeBudget is how long attempts continue after the process starts.
+	// An empty read does not end the budget. The loop does not run for the process lifetime.
+	resumeBudget = 12 * time.Second
+)
+
 // App is the session server handler.
 type App struct {
 	Handler http.Handler
 	engine  *engine.Engine
-	resume  func(context.Context) error
+	resume  func(context.Context) (int, error)
 }
 
 // Stop cancels in-flight generations.
@@ -53,11 +63,42 @@ func (a *App) Stop() {
 
 // ResumeCommitted reads fixture sources already linked on stored turns.
 // It does not submit a task. An unset binding does not dial out.
-func (a *App) ResumeCommitted(ctx context.Context) error {
+// The count is how many owned turns were eligible. A source error is logged
+// and does not discard the rest of the list.
+func (a *App) ResumeCommitted(ctx context.Context) (int, error) {
 	if a == nil || a.resume == nil {
-		return nil
+		return 0, nil
 	}
 	return a.resume(ctx)
+}
+
+// WatchCommitted retries ResumeCommitted until the budget ends.
+// It returns immediately when no owned turn is linked. One hung or failed
+// read does not extend past the attempt timeout, and the loop stops at the budget.
+func (a *App) WatchCommitted(ctx context.Context) {
+	if a == nil || a.resume == nil {
+		return
+	}
+	deadline := time.Now().Add(resumeBudget)
+	for {
+		attempt, cancel := context.WithTimeout(ctx, resumeAttemptTimeout)
+		n, err := a.resume(attempt)
+		cancel()
+		if err != nil {
+			log.Printf("startup resume: %s", err)
+		}
+		if n == 0 || !time.Now().Before(deadline) || ctx.Err() != nil {
+			log.Printf("startup resume stopped linked=%d", n)
+			return
+		}
+		timer := time.NewTimer(resumeInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 
 type stagedSuffix struct {
@@ -117,11 +158,11 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 		}
 	}
 	st := store.New(pool)
-	var resume func(context.Context) error
+	var resume func(context.Context) (int, error)
 	if live != nil && !cfg.DevFixture() {
 		workspace := cfg.MakezWorkspaceID
-		client := live
-		resume = func(ctx context.Context) error {
+		client := live.WithTimeout(resumeAttemptTimeout)
+		resume = func(ctx context.Context) (int, error) {
 			return resumeCommitted(ctx, st, client, workspace)
 		}
 	}
@@ -150,26 +191,37 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 	return &App{Handler: mux, engine: eng, resume: resume}, nil
 }
 
-// resumeCommitted continues each turn that already stores a task in workspace.
+// resumeCommitted continues each owned turn that already stores a task in workspace.
 // The owner and the bot are the stored rows. No new owner or binding is created.
 // A turn that has no task is left alone, so startup does not submit one.
-func resumeCommitted(ctx context.Context, st *store.Store, client *makez.Client, workspace string) error {
+// A bot owned by someone else is not dialed. A source error does not stop the others.
+func resumeCommitted(ctx context.Context, st *store.Store, client *makez.Client, workspace string) (int, error) {
 	turns, err := st.LinkedTurns(ctx, workspace)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	log.Printf("startup resume linked=%d", len(turns))
 	for _, turn := range turns {
+		owned, err := st.AgentOwnedBy(ctx, turn.Binding.BotID, turn.Binding.OwnerID)
+		if err != nil {
+			log.Printf("startup resume owner check task=%s: %s", turn.Link.TaskID, err)
+			continue
+		}
+		if !owned {
+			log.Printf("startup resume skipped foreign bot task=%s", turn.Link.TaskID)
+			continue
+		}
 		after, err := st.AppliedPublicSeq(ctx, turn.Link)
 		if err != nil {
-			return err
+			log.Printf("startup resume checkpoint task=%s: %s", turn.Link.TaskID, err)
+			continue
 		}
 		log.Printf("startup resume workspace=%s task=%s after=%d", turn.Link.WorkspaceID, turn.Link.TaskID, after)
 		if _, err := makez.ResumeLinked(ctx, st, client, turn.Binding); err != nil {
-			return err
+			log.Printf("startup resume task=%s: %s", turn.Link.TaskID, err)
 		}
 	}
-	return nil
+	return len(turns), nil
 }
 
 func newAdapter(cfg config.Config) (adapter.Adapter, error) {

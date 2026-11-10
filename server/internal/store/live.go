@@ -142,11 +142,13 @@ func (s *Store) LinkedTurns(ctx context.Context, workspaceID string) ([]LinkedTu
 		return nil, fmt.Errorf("workspace is required")
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT t.owner_id, t.conversation_id, t.id, s.agent_id,
+		SELECT t.owner_id, t.conversation_id, t.id, a.id,
 		       t.makez_workspace_id, t.makez_task_id, t.makez_run_id
 		FROM turns t
 		JOIN sessions s ON s.id = t.conversation_id
+		JOIN agents a ON a.id = s.agent_id AND a.owner_id = t.owner_id
 		WHERE t.makez_workspace_id = $1
+		  AND t.owner_id <> ''
 		  AND t.makez_task_id IS NOT NULL
 		  AND t.makez_run_id IS NOT NULL
 		ORDER BY t.created_at, t.id`, workspaceID)
@@ -173,6 +175,19 @@ func (s *Store) LinkedTurns(ctx context.Context, workspaceID string) ([]LinkedTu
 		})
 	}
 	return out, rows.Err()
+}
+
+// AgentOwnedBy reports whether the bot row belongs to ownerID.
+// A missing bot or a different owner is false. This does not create an owner.
+func (s *Store) AgentOwnedBy(ctx context.Context, botID, ownerID string) (bool, error) {
+	if botID == "" || ownerID == "" {
+		return false, nil
+	}
+	var owned bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND owner_id = $2)`,
+		botID, ownerID).Scan(&owned)
+	return owned, err
 }
 
 // AppliedPublicSeq is the Makez public log seq stored for this run.
