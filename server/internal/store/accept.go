@@ -171,6 +171,9 @@ func submitEffect(ctx context.Context, tx pgx.Tx, in SubmitInput) (AcceptResult,
 	if err != nil {
 		return AcceptResult{}, err
 	}
+	// A running task is another scope. It does not reject this user message,
+	// and this submit does not change that task. The dev fixture only refuses
+	// a second turn while an assistant row is still streaming.
 	if in.Fixture {
 		var streaming bool
 		if err := tx.QueryRow(ctx, `

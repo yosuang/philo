@@ -108,8 +108,14 @@ nsh test approval-reconnect.test.tsx --target linux
 
 `approval-unset.test.tsx` leaves `PHILO_EXECUTION_FIXTURE` unset. A draft stays `Execution is unavailable.` and the chat has no approval card.
 
+`worker-message.test.tsx` uses `PHILO_EXECUTION_FIXTURE=worker`. That label is not Makez. The desktop sends `/draft`, then Approve. The server stores the pending card from that reply and the running `philo-server` task from the decision route. The task stays `running` while a `philo-fixture-worker` process is alive. The desktop then sends another message through the composer. The same snapshot, requester, and task id stay on that bot. The other bot does not show them. When that process exits, the task shows the fixture result, which is not a model reply. Leave `PHILO_TEST_EDIT_SUMMARY` unset. There is no editor.
+
 ```bash
 nsh test approval-unset.test.tsx --target linux
+```
+
+```bash
+nsh test worker-message.test.tsx --target linux
 ```
 
 `client-restart.test.tsx` opens one bot chat, then kills the Philo process with SIGKILL after the labeled fixture source is committed and starts another process on the same database. The open client catches up by itself. It does not send the message again and it does not press Reconnect. A log armed while the process is down and a log armed after the new process is listening each show once in that bot's chat. The other bot's business cursor stays where it was. The source is `test-fixture-source`, the fixture the server resume already reads. It is not live Makez. Leave `PHILO_EXECUTION_FIXTURE` and `PHILO_MAKEZ_URL` unset. The desktop process needs `PHILO_ACTOR_TOKEN` and `PHILO_RESTART_URL` pointing at `restart-harness.mjs`. Production does not set that URL, so those controls are not in the shipping window. A second test in the same file starts Philo with the fixture unset and checks that a send stays `Execution is unavailable.`

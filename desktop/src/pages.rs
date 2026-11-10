@@ -482,6 +482,17 @@ fn approval_card(store: Store, approval: ReadSignal<Approval>) -> impl IntoEleme
                 .text_color(move || theme().muted_foreground),
         )
         .child(when(
+            move || !approval.with(|item| item.requester_actor_id.is_empty()),
+            move || {
+                text(move || {
+                    let actor = approval.with(|item| item.requester_actor_id.clone());
+                    format!("Requester: {actor}")
+                })
+                .text_size(px(12.0))
+                .text_color(move || theme().muted_foreground)
+            },
+        ))
+        .child(when(
             move || approval.with(Approval::can_decide),
             move || {
                 view()
@@ -516,6 +527,17 @@ fn task_card(task: ReadSignal<Task>) -> impl IntoElement {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_size(px(13.0)),
         )
+        .child(when(
+            move || !task.with(|item| item.id.is_empty()),
+            move || {
+                text(move || {
+                    let id = task.with(|item| item.id.clone());
+                    format!("Task id: {id}")
+                })
+                .text_size(px(12.0))
+                .text_color(move || theme().muted_foreground)
+            },
+        ))
         .child(
             text(move || {
                 let source = task.with(|item| {

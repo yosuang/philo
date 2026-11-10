@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"log"
+	"os/exec"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,6 +19,14 @@ import (
 
 const taskDelay = 150 * time.Millisecond
 
+// fixtureWorkerHold is how long the labeled worker fixture stays unfinished.
+// The dev fixture's 150ms completion is a different path.
+const fixtureWorkerHold = 20 * time.Second
+
+// FixtureWorkerResult is stored when the fixture-worker process exits.
+// It is not a model reply and not a Makez result.
+const FixtureWorkerResult = "fixture-worker finished; not a live model and not Makez"
+
 // errStopped means the row is no longer streaming, usually because it was canceled.
 var errStopped = errors.New("message is no longer streaming")
 
@@ -26,20 +36,27 @@ type Engine struct {
 	ad    adapter.Adapter
 	hub   *hub.Hub
 
-	mu      sync.Mutex
-	runs    map[string]context.CancelFunc
-	fixture bool
+	mu            sync.Mutex
+	runs          map[string]context.CancelFunc
+	workers       []*exec.Cmd
+	fixture       bool
+	finishTasks   bool
+	workerFixture bool
 }
 
 // New builds an engine. ad is the isolated fixture adapter when fixture is set.
-// Production does not call it and does not complete tasks from this process.
-func New(st *store.Store, ad adapter.Adapter, h *hub.Hub, fixture bool) *Engine {
+// finishTasks is only the dev fixture's short completion. workerFixture starts
+// the labeled fixture-worker process and finishes the task when that process exits.
+// Production does not call the adapter and does not start that process.
+func New(st *store.Store, ad adapter.Adapter, h *hub.Hub, fixture, finishTasks, workerFixture bool) *Engine {
 	return &Engine{
-		store:   st,
-		ad:      ad,
-		hub:     h,
-		runs:    map[string]context.CancelFunc{},
-		fixture: fixture,
+		store:         st,
+		ad:            ad,
+		hub:           h,
+		runs:          map[string]context.CancelFunc{},
+		fixture:       fixture,
+		finishTasks:   finishTasks,
+		workerFixture: workerFixture,
 	}
 }
 
@@ -101,7 +118,9 @@ func (e *Engine) Cancel(ctx context.Context, sessionID string) (store.Message, e
 
 // Decide records approve or reject. Approve stores a local philo-server task.
 // The dev fixture may later store a result. That result does not change the
-// card. Production does not complete the task. Reject creates no task.
+// card. The worker fixture starts a fixture-worker process and stores its
+// result only when that process exits. Production does not start it.
+// Reject creates no task. This does not cancel an in-flight task.
 func (e *Engine) Decide(ctx context.Context, approvalID, decision string) (store.Approval, error) {
 	res, err := e.store.Decide(ctx, approvalID, decision)
 	if err != nil {
@@ -110,14 +129,18 @@ func (e *Engine) Decide(ctx context.Context, approvalID, decision string) (store
 	e.publishApproval("approval.updated", res.Approval)
 	if res.Task != nil {
 		e.publishTask(*res.Task)
-		if e.fixture {
+		switch {
+		case e.finishTasks:
 			go e.completeTask(res.Task.ID, res.Approval.Summary)
+		case e.workerFixture:
+			go e.runFixtureWorker(res.Task.ID)
 		}
 	}
 	return res.Approval, nil
 }
 
-// Stop cancels every in-flight generation.
+// Stop cancels every in-flight generation and stops fixture-worker processes.
+// A killed fixture process does not store a result.
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -125,6 +148,12 @@ func (e *Engine) Stop() {
 		cancel()
 		delete(e.runs, id)
 	}
+	for _, cmd := range e.workers {
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
+	e.workers = nil
 }
 
 // StartFixture starts the isolated dev adapter for one assistant row.
@@ -345,6 +374,64 @@ func (e *Engine) fail(messageID, sessionID string, cause error) {
 		Message:   message,
 		Code:      code,
 	})
+}
+
+// runFixtureWorker starts the labeled hold process for one philo-server task.
+// The task stays running while that process is alive. When the process exits
+// on its own, the fixture stores FixtureWorkerResult. A kill does not.
+// This process does not call a model and does not call Makez.
+func (e *Engine) runFixtureWorker(taskID string) {
+	seconds := int(fixtureWorkerHold / time.Second)
+	cmd := exec.Command("/bin/bash", "-c", "exec -a philo-fixture-worker sleep "+strconv.Itoa(seconds))
+	if err := cmd.Start(); err != nil {
+		log.Printf("fixture worker start task=%s: %v", taskID, err)
+		return
+	}
+	pid := cmd.Process.Pid
+	e.mu.Lock()
+	e.workers = append(e.workers, cmd)
+	e.mu.Unlock()
+	log.Printf("fixture worker started task=%s pid=%d hold=%s source=philo-server", taskID, pid, fixtureWorkerHold)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	sessionID, sessionErr := e.store.OpenFixtureWorkerSession(ctx, taskID)
+	cancel()
+	if sessionErr != nil {
+		log.Printf("fixture worker session task=%s: %v", taskID, sessionErr)
+	} else {
+		log.Printf("fixture worker session task=%s id=%s pin=%s", taskID, sessionID, store.FixtureWorkerPin)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	if task, err := e.store.TouchRunningTask(ctx, taskID); err != nil {
+		log.Printf("fixture worker touch task=%s: %v", taskID, err)
+	} else {
+		e.publishTask(task)
+	}
+	cancel()
+
+	waitErr := cmd.Wait()
+	e.mu.Lock()
+	var next []*exec.Cmd
+	for _, running := range e.workers {
+		if running != cmd {
+			next = append(next, running)
+		}
+	}
+	e.workers = next
+	e.mu.Unlock()
+	if waitErr != nil {
+		log.Printf("fixture worker stopped task=%s pid=%d: %v", taskID, pid, waitErr)
+		return
+	}
+	log.Printf("fixture worker finished task=%s pid=%d", taskID, pid)
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	task, err := e.store.RecordWorkerResult(ctx, taskID, store.WorkerClaim{Text: FixtureWorkerResult})
+	if err != nil {
+		log.Printf("fixture worker result task=%s: %v", taskID, err)
+		return
+	}
+	e.publishTask(task)
 }
 
 func (e *Engine) completeTask(taskID, summary string) {

@@ -18,6 +18,7 @@ var (
 	// ErrNotFound means the row does not exist.
 	ErrNotFound = errors.New("not found")
 	// ErrBusy means the session already has a streaming reply.
+	// A running task is not a streaming reply and is not this error.
 	ErrBusy = errors.New("reply in progress")
 	// ErrNotRetryable means the message cannot be regenerated.
 	ErrNotRetryable = errors.New("not retryable")
