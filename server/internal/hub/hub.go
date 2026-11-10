@@ -16,10 +16,21 @@ import (
 // SessionLookup reports whether a session id exists.
 type SessionLookup func(ctx context.Context, sessionID string) (bool, error)
 
+// SubscribeAcker can delay the subscribed ack. A nil acker acknowledges
+// immediately. Production does not install one.
+type SubscribeAcker interface {
+	// Delayed reports whether this subscribe must wait before the socket is
+	// marked subscribed. A true result does not acknowledge yet.
+	Delayed(sessionID string) bool
+	// Ready waits until the ack may be sent. False means do not subscribe.
+	Ready(ctx context.Context, sessionID string) bool
+}
+
 // Hub is the in-process event fanout. Persisted rows, not this hub, are the history.
 type Hub struct {
 	mu      sync.Mutex
 	clients map[*client]struct{}
+	acker   SubscribeAcker
 }
 
 type client struct {
@@ -36,6 +47,14 @@ func New() *Hub {
 	return &Hub{clients: map[*client]struct{}{}}
 }
 
+// SetAcker installs a fixture ack gate. Nil keeps the immediate ack.
+// Call it before serving. It is not a production control.
+func (h *Hub) SetAcker(acker SubscribeAcker) {
+	h.mu.Lock()
+	h.acker = acker
+	h.mu.Unlock()
+}
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
@@ -50,6 +69,8 @@ func (h *Hub) Handle(w http.ResponseWriter, r *http.Request, sessions SessionLoo
 	conn.SetReadLimit(1 << 20)
 	c := h.add(conn)
 	defer h.remove(c)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	for {
 		_, data, err := conn.ReadMessage()
@@ -87,9 +108,37 @@ func (h *Hub) Handle(w http.ResponseWriter, r *http.Request, sessions SessionLoo
 			h.enqueue(c, errorEvent("not_found", "session not found"))
 			continue
 		}
-		c.setSession(in.SessionID)
-		h.enqueue(c, map[string]string{"type": "subscribed", "sessionId": in.SessionID})
+		h.acknowledge(ctx, c, in.SessionID)
 	}
+}
+
+// acknowledge marks the socket subscribed and sends the ack.
+// A delayed acker does neither until Ready. Publishes before that are not
+// delivered on this socket.
+func (h *Hub) acknowledge(ctx context.Context, c *client, sessionID string) {
+	h.mu.Lock()
+	acker := h.acker
+	h.mu.Unlock()
+	send := func() {
+		if ctx.Err() != nil {
+			return
+		}
+		c.setSession(sessionID)
+		h.enqueue(c, map[string]string{"type": "subscribed", "sessionId": sessionID})
+		log.Printf("subscribe acknowledged session=%s", sessionID)
+	}
+	if acker == nil || !acker.Delayed(sessionID) {
+		send()
+		return
+	}
+	log.Printf("subscribe ack held session=%s", sessionID)
+	go func() {
+		if !acker.Ready(ctx, sessionID) {
+			log.Printf("subscribe ack dropped session=%s", sessionID)
+			return
+		}
+		send()
+	}()
 }
 
 // Publish sends one event to subscribers of sessionID.

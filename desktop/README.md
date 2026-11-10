@@ -78,6 +78,12 @@ nsh test expired-nonzero-cursor.test.tsx --target linux
 
 `reconnect-cursor.test.tsx` starts from messages that are already on screen and a non-zero business cursor. Set `PHILO_FIXTURE_SUFFIX=1` so the window can store one later `fixture-business-source` delta. It disconnects the event socket, stores that delta while the socket is down, then reconnects. The client reads with the cursor it still holds, shows that suffix once, and does not append it again. The fixture stays labeled. It is not Makez.
 
+`subscribe-gap.test.tsx` holds the real subscribe ack. The window says `Events: catching up` when the socket opens and `Events: subscribe failed` when the 5 second budget ends without an ack. It does not say `Events: connected` or `Events: recovered` for that unsubscribed read. A fixture event committed after that read is missing until the client reads again. After the ack is released, the window says `Events: recovered` and the event is still there once. `Message seq` stays separate from `Business cursor`. A business event published while a read is in progress is shown once. A cursorless fixture delta, the same shape as an engine stream frame, does not move the business cursor. A frame on the socket generation that was abandoned is ignored. A frame for the other bot is ignored. The fixture stays labeled. It is not Makez.
+
+```bash
+nsh test subscribe-gap.test.tsx --target linux
+```
+
 ```bash
 nsh test reconnect-cursor.test.tsx --target linux
 ```

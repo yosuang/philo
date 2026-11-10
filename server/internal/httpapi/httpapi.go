@@ -66,6 +66,20 @@ type server struct {
 
 	suffixMu      sync.Mutex
 	pendingSuffix map[string]stagedSuffix
+
+	hold *subscribeHold
+
+	duringMu   sync.Mutex
+	duringRead map[string]parkedDelta
+}
+
+// parkedDelta is one fixture business event applied while a read is in
+// progress. The read's response was already queried, so the event is not in
+// that body. It is published on the socket instead.
+type parkedDelta struct {
+	key       string
+	messageID string
+	text      string
 }
 
 // New builds the HTTP handler. The pool must already be migrated.
@@ -91,6 +105,11 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 	}
 	st := store.New(pool)
 	h := hub.New()
+	var hold *subscribeHold
+	if cfg.BusinessFixture {
+		hold = newSubscribeHold()
+		h.SetAcker(hold)
+	}
 	eng := engine.New(st, ad, h, cfg.DevFixture())
 	s := &server{
 		store:         st,
@@ -101,6 +120,8 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 		http:          &http.Client{Timeout: 2 * time.Second},
 		live:          live,
 		pendingSuffix: map[string]stagedSuffix{},
+		hold:          hold,
+		duringRead:    map[string]parkedDelta{},
 	}
 	mux := http.NewServeMux()
 	s.routes(mux)
@@ -787,6 +808,27 @@ func (s *server) businessEvents(w http.ResponseWriter, r *http.Request) {
 		s.storeErr(w, err, "session not found")
 		return
 	}
+	// A fixture event armed for this read is committed after the query, so
+	// this response does not contain it. The socket publish is the copy the
+	// client keeps from the live buffer.
+	if parked, ok := s.takeDuringRead(id); ok {
+		ev, applyErr := s.store.ApplyFixtureBusiness(r.Context(), store.FixtureInput{
+			Source:         store.FixtureSource,
+			OwnerID:        p.OwnerID,
+			ConversationID: id,
+			EventKey:       parked.key,
+			Type:           "message.delta",
+			MessageID:      parked.messageID,
+			Text:           parked.text,
+		})
+		if applyErr != nil {
+			log.Printf("business event during read: %v", applyErr)
+			s.stageDuringRead(id, parked)
+		} else if item, err := ev.MarshalMap(); err == nil {
+			s.hub.Publish(id, item)
+			log.Printf("business event during read session=%s cursor=%d", id, ev.Cursor)
+		}
+	}
 	out := make([]any, 0, len(events))
 	for _, ev := range events {
 		item, err := ev.MarshalMap()
@@ -796,6 +838,7 @@ func (s *server) businessEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, item)
 	}
+	log.Printf("business events session=%s after=%d n=%d", id, after, len(out))
 	writeJSON(w, http.StatusOK, map[string]any{"events": out})
 }
 
@@ -819,6 +862,9 @@ func (s *server) fixtureBusiness(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Source != store.FixtureSource {
 		writeError(w, http.StatusBadRequest, "invalid_request", "fixture source label is required")
+		return
+	}
+	if s.fixtureControl(w, &body) {
 		return
 	}
 	conversationID, ok := uuidParam(w, body.ConversationID, "conversationId")
@@ -865,7 +911,133 @@ func (s *server) fixtureBusiness(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
+	// A subscribed socket learns about the committed row. An unsubscribed
+	// socket does not; the client has to read the log again.
+	s.hub.Publish(conversationID, item)
 	writeJSON(w, http.StatusOK, item)
+}
+
+// fixtureControl handles fixture ack and delivery commands. True means the
+// response was written. These commands do not append a business row, except
+// staging one to be committed on the next read.
+func (s *server) fixtureControl(w http.ResponseWriter, body *struct {
+	Source         string `json:"source"`
+	ConversationID string `json:"conversationId"`
+	EventKey       string `json:"eventKey"`
+	Type           string `json:"type"`
+	MessageID      string `json:"messageId"`
+	Text           string `json:"text"`
+	Status         string `json:"status"`
+	Suffix         string `json:"suffix"`
+}) bool {
+	if s.hold == nil {
+		return false
+	}
+	switch body.Type {
+	case "fixture.hold-subscribe":
+		id, ok := uuidParam(w, body.ConversationID, "conversationId")
+		if !ok {
+			return true
+		}
+		s.hold.Hold(id)
+		log.Printf("fixture hold subscribe session=%s", id)
+		writeJSON(w, http.StatusOK, map[string]any{"type": body.Type, "sessionId": id, "held": true})
+		return true
+	case "fixture.hold-next-subscribe":
+		s.hold.ArmNext()
+		log.Printf("fixture hold next subscribe")
+		writeJSON(w, http.StatusOK, map[string]any{"type": body.Type, "held": true})
+		return true
+	case "fixture.release-subscribe":
+		if strings.TrimSpace(body.ConversationID) == "" {
+			s.hold.Release("")
+			log.Printf("fixture release subscribe all")
+			writeJSON(w, http.StatusOK, map[string]any{"type": body.Type, "released": true})
+			return true
+		}
+		id, ok := uuidParam(w, body.ConversationID, "conversationId")
+		if !ok {
+			return true
+		}
+		s.hold.Release(id)
+		log.Printf("fixture release subscribe session=%s", id)
+		writeJSON(w, http.StatusOK, map[string]any{"type": body.Type, "sessionId": id, "released": true})
+		return true
+	case "fixture.engine-delta":
+		id, ok := uuidParam(w, body.ConversationID, "conversationId")
+		if !ok {
+			return true
+		}
+		text := strings.TrimSpace(body.Text)
+		if text == "" {
+			writeError(w, http.StatusBadRequest, "invalid_request", "text is required")
+			return true
+		}
+		// Same shape as the engine stream delta: no business cursor and no
+		// business row. The cursor is not invented here.
+		s.hub.Publish(id, events.Delta{
+			Type:      "message.delta",
+			MessageID: strings.TrimSpace(body.MessageID),
+			SessionID: id,
+			Text:      text,
+		})
+		log.Printf("fixture engine delta session=%s cursorless=true", id)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"type":       "message.delta",
+			"sessionId":  id,
+			"messageId":  strings.TrimSpace(body.MessageID),
+			"text":       text,
+			"cursorless": true,
+			"source":     store.FixtureSource,
+		})
+		return true
+	case "fixture.stage-during-read":
+		id, ok := uuidParam(w, body.ConversationID, "conversationId")
+		if !ok {
+			return true
+		}
+		if strings.TrimSpace(body.EventKey) == "" || strings.TrimSpace(body.Text) == "" || strings.TrimSpace(body.MessageID) == "" {
+			writeError(w, http.StatusBadRequest, "invalid_request", "eventKey, messageId, and text are required")
+			return true
+		}
+		s.stageDuringRead(id, parkedDelta{
+			key:       strings.TrimSpace(body.EventKey),
+			messageID: strings.TrimSpace(body.MessageID),
+			text:      body.Text,
+		})
+		log.Printf("fixture stage during read session=%s", id)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"type":      body.Type,
+			"sessionId": id,
+			"staged":    true,
+			"source":    store.FixtureSource,
+		})
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *server) stageDuringRead(conversationID string, parked parkedDelta) {
+	s.duringMu.Lock()
+	defer s.duringMu.Unlock()
+	if s.duringRead == nil {
+		s.duringRead = map[string]parkedDelta{}
+	}
+	s.duringRead[conversationID] = parked
+}
+
+func (s *server) takeDuringRead(conversationID string) (parkedDelta, bool) {
+	s.duringMu.Lock()
+	defer s.duringMu.Unlock()
+	parked, ok := s.duringRead[conversationID]
+	if ok {
+		delete(s.duringRead, conversationID)
+	}
+	if !ok || parked.text == "" || parked.messageID == "" || parked.key == "" {
+		return parkedDelta{}, false
+	}
+	return parked, true
 }
 
 func (s *server) stageSuffix(conversationID string, staged stagedSuffix) {
