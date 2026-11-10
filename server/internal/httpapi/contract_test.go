@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -65,7 +66,7 @@ func TestT2LostResponseReplaysOneTurn(t *testing.T) {
 		t.Fatalf("first %d %s", status, body)
 	}
 	first := asMap(t, body)
-	_ = first
+	firstTurn, _ := first["turnId"].(string)
 	status, body = postSubmit(t, srv, testToken, conversationID, key, "Hello")
 	if status != http.StatusOK {
 		t.Fatalf("replay %d %s", status, body)
@@ -74,8 +75,8 @@ func TestT2LostResponseReplaysOneTurn(t *testing.T) {
 	if replay["replayed"] != true {
 		t.Fatalf("replayed = %#v", replay["replayed"])
 	}
-	if replay["turnId"] == key || replay["turnId"] == "" {
-		t.Fatalf("turn id = %#v", replay["turnId"])
+	if replay["turnId"] != firstTurn || replay["turnId"] == key || replay["turnId"] == "" {
+		t.Fatalf("turn id = %#v first = %s", replay["turnId"], firstTurn)
 	}
 	thirdStatus, thirdBody := postSubmit(t, srv, testToken, conversationID, key, "Hello")
 	if replay["turnId"] != asMap(t, mustRead(t, thirdStatus, thirdBody))["turnId"] {
@@ -87,6 +88,17 @@ func TestT2LostResponseReplaysOneTurn(t *testing.T) {
 	after := effectCounts(t, pool, conversationID)
 	if after != before.add(1, 1, 1, 1) {
 		t.Fatalf("effects before %#v after %#v", before, after)
+	}
+	status, body = postSubmitBody(t, srv, testToken, conversationID, key, []byte(`{"options":{},"content":"Hello"}`))
+	if status != http.StatusOK {
+		t.Fatalf("reordered keys %d %s", status, body)
+	}
+	reordered := asMap(t, body)
+	if reordered["turnId"] != firstTurn || reordered["replayed"] != true {
+		t.Fatalf("reordered keys = %#v", reordered)
+	}
+	if effectCounts(t, pool, conversationID) != after {
+		t.Fatal("same canonical payload added a message, wake, or outbox row")
 	}
 	status, body = postSubmit(t, srv, testToken, conversationID, "other-key", "Hello")
 	if status != http.StatusOK {
@@ -161,8 +173,9 @@ func TestT10ConflictAndConcurrentPayloads(t *testing.T) {
 	if wins != 1 || conflicts != 1 {
 		t.Fatalf("wins %d conflicts %d", wins, conflicts)
 	}
-	if effectCounts(t, pool, other).turns != 1 || effectCounts(t, pool, other).messages != 1 {
-		t.Fatalf("race effects %#v", effectCounts(t, pool, other))
+	race := effectCounts(t, pool, other)
+	if race.turns != 1 || race.messages != 1 || race.wakes != 1 || race.outbox != 1 {
+		t.Fatalf("race effects %#v", race)
 	}
 	if winner != "P1" && winner != "P2" {
 		t.Fatalf("winner %q", winner)
@@ -316,11 +329,15 @@ func TestT9RestartKeepsMapping(t *testing.T) {
 		taskID, conversationID, approvalID, now); err != nil {
 		t.Fatal(err)
 	}
+	beforeRestart := effectCounts(t, pool, conversationID)
 	app, err := New(pool, config.Config{Credentials: testCredentials()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	app.Stop()
+	if effectCounts(t, pool, conversationID) != beforeRestart {
+		t.Fatal("startup added a message, wake, outbox row, or turn")
+	}
 	var taskStatus, messageStatus string
 	if err := pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id = $1`, taskID).Scan(&taskStatus); err != nil {
 		t.Fatal(err)
@@ -358,7 +375,7 @@ func TestT3ResumeFromHighWater(t *testing.T) {
 	fixtureOK(t, srv, conversationID, "d2", "message.delta", messageID, "green", "")
 	fixtureOK(t, srv, conversationID, "done", "message.completed", messageID, "", "")
 	again := fixtureOK(t, srv, conversationID, "d2", "message.delta", messageID, "green", "")
-	if again["id"] != fixtureEventID(t, srv, conversationID, int64(cursor), "d2") && again["type"] != "message.delta" {
+	if again["id"] != fixtureEventID(t, srv, conversationID, int64(cursor), "d2") || again["type"] != "message.delta" {
 		t.Fatalf("repeat = %#v", again)
 	}
 
@@ -436,43 +453,87 @@ func TestT13ConcurrentSnapshotHasNoGap(t *testing.T) {
 	conversationID := openDefault(t, srv, createAgent(t, srv, "Ada"))
 	seed := fixtureOK(t, srv, conversationID, "seed", "fixture.seed", "", "", "")
 	messageID, _ := seed["messageId"].(string)
-	stop := make(chan struct{})
-	var writer sync.WaitGroup
-	writer.Add(1)
-	go func() {
-		defer writer.Done()
-		for i := 0; i < 25; i++ {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			fixtureOK(t, srv, conversationID, "c"+itoa(i), "message.delta", messageID, "x", "")
-		}
-	}()
-
+	for i := 0; i < 4; i++ {
+		fixtureOK(t, srv, conversationID, "pre"+itoa(i), "message.delta", messageID, "a", "")
+	}
 	st := store.New(pool)
-	var saved store.Snapshot
-	var savedReflected []store.BusinessEvent
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && saved.HighWater == 0 {
+	saved, savedReflected, err := st.ConsistentView(context.Background(), testOwner, conversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshotMatches(saved, savedReflected, messageID) {
+		t.Fatalf("baseline snapshot high %d mismatched", saved.HighWater)
+	}
+
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		<-release
+		for i := 0; i < 12; i++ {
+			raw, err := json.Marshal(map[string]any{
+				"source":         store.FixtureSource,
+				"conversationId": conversationID,
+				"eventKey":       "race" + itoa(i),
+				"type":           "message.delta",
+				"messageId":      messageID,
+				"text":           "x",
+				"status":         "",
+			})
+			if err != nil {
+				done <- err
+				return
+			}
+			req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/fixture-business-source", bytes.NewReader(raw))
+			if err != nil {
+				done <- err
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+testToken)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				done <- err
+				return
+			}
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				done <- fmt.Errorf("fixture status %d %s", resp.StatusCode, respBody)
+				return
+			}
+		}
+		done <- nil
+	}()
+	close(release)
+
+	sawAdvance := false
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
 		snap, reflected, err := st.ConsistentView(context.Background(), testOwner, conversationID)
 		if err != nil {
-			close(stop)
-			writer.Wait()
 			t.Fatal(err)
 		}
 		if !snapshotMatches(snap, reflected, messageID) {
-			close(stop)
-			writer.Wait()
 			t.Fatalf("snapshot high %d does not match reflected events", snap.HighWater)
 		}
-		saved = snap
-		savedReflected = reflected
-		time.Sleep(2 * time.Millisecond)
+		if snap.HighWater > saved.HighWater {
+			sawAdvance = true
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			goto written
+		default:
+			time.Sleep(2 * time.Millisecond)
+		}
 	}
-	close(stop)
-	writer.Wait()
+	t.Fatal("timed out while events were committing")
+written:
+	if !sawAdvance {
+		t.Fatal("no snapshot was read while a later event had committed")
+	}
 	finalSnap, finalEvents, err := st.ConsistentView(context.Background(), testOwner, conversationID)
 	if err != nil {
 		t.Fatal(err)
@@ -480,36 +541,14 @@ func TestT13ConcurrentSnapshotHasNoGap(t *testing.T) {
 	if !snapshotMatches(finalSnap, finalEvents, messageID) {
 		t.Fatal("final snapshot mismatched its high water")
 	}
+	if finalSnap.HighWater <= saved.HighWater {
+		t.Fatalf("final high water %d did not pass saved %d", finalSnap.HighWater, saved.HighWater)
+	}
 	base := ""
 	for _, message := range saved.Messages {
 		if message.ID == messageID {
 			base = message.Content
 		}
-	}
-	_ = savedReflected
-	extra := ""
-	seen := map[string]bool{}
-	apply := func() {
-		for _, ev := range finalEvents {
-			if ev.Cursor <= saved.HighWater || ev.Type != "message.delta" || ev.MessageID != messageID {
-				continue
-			}
-			if seen[ev.ID] {
-				continue
-			}
-			seen[ev.ID] = true
-			var payload map[string]any
-			if err := json.Unmarshal(ev.Payload, &payload); err != nil {
-				t.Fatal(err)
-			}
-			extra += str(payload["text"])
-		}
-	}
-	apply()
-	once := extra
-	apply()
-	if extra != once {
-		t.Fatal("reapplying an event appended twice")
 	}
 	want := ""
 	for _, message := range finalSnap.Messages {
@@ -517,13 +556,24 @@ func TestT13ConcurrentSnapshotHasNoGap(t *testing.T) {
 			want = message.Content
 		}
 	}
-	if base+extra != want {
-		t.Fatalf("replay %q + base %q != final %q", extra, base, want)
+	replay := eventsAfter(t, srv, conversationID, saved.HighWater)
+	view := newView()
+	view.byID[messageID] = &viewMessage{content: base, status: "streaming"}
+	view.rows = 1
+	view.applyAll(replay)
+	once := view.byID[messageID].content
+	view.applyAll(replay)
+	if view.byID[messageID].content != once || view.rows != 1 {
+		t.Fatalf("reapply content %q rows %d", view.byID[messageID].content, view.rows)
+	}
+	if once != want {
+		t.Fatalf("replay %q != final %q", once, want)
 	}
 	have := map[int64]bool{}
-	for _, ev := range finalEvents {
-		if ev.Cursor > saved.HighWater {
-			have[ev.Cursor] = true
+	for _, ev := range replay {
+		cursor := int64(num(ev["cursor"]))
+		if cursor > saved.HighWater {
+			have[cursor] = true
 		}
 	}
 	for cursor := saved.HighWater + 1; cursor <= finalSnap.HighWater; cursor++ {
@@ -596,6 +646,52 @@ func TestBusinessRoutesRequireActor(t *testing.T) {
 	if status != http.StatusOK || asMap(t, raw)["adapter"] != "unavailable" {
 		t.Fatalf("health %d %s", status, raw)
 	}
+
+	wrong, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/agents", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong.Header.Set("Authorization", "Bearer not-the-configured-token")
+	wrongResp, err := http.DefaultClient.Do(wrong)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wrongResp.Body.Close()
+	wrongBody, _ := io.ReadAll(wrongResp.Body)
+	if wrongResp.StatusCode != http.StatusUnauthorized || errCode(t, wrongBody) != "authentication_required" {
+		t.Fatalf("wrong bearer %d %s", wrongResp.StatusCode, wrongBody)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM agents`).Scan(&agents); err != nil {
+		t.Fatal(err)
+	}
+	if agents != 0 {
+		t.Fatalf("wrong bearer created agents = %d", agents)
+	}
+
+	status, raw = do(t, srv, http.MethodGet, "/v1/agents", nil)
+	if status != http.StatusOK {
+		t.Fatalf("configured bearer %d %s", status, raw)
+	}
+	openID := createAgent(t, srv, "Ada")
+	conversationID := openDefault(t, srv, openID)
+	noAuth, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/sessions/"+conversationID+"/messages", bytes.NewReader([]byte(`{"content":"Hello","options":{}}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	noAuth.Header.Set("Content-Type", "application/json")
+	noAuth.Header.Set("Idempotency-Key", "missing-actor")
+	noAuthResp, err := http.DefaultClient.Do(noAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer noAuthResp.Body.Close()
+	noAuthBody, _ := io.ReadAll(noAuthResp.Body)
+	if noAuthResp.StatusCode != http.StatusUnauthorized || errCode(t, noAuthBody) != "authentication_required" {
+		t.Fatalf("submit without actor %d %s", noAuthResp.StatusCode, noAuthBody)
+	}
+	if effectCounts(t, pool, conversationID) != (effectCount{}) {
+		t.Fatalf("unauthenticated submit stored %#v", effectCounts(t, pool, conversationID))
+	}
 }
 
 type effectCount struct {
@@ -649,6 +745,11 @@ func postSubmit(t *testing.T, srv *httptest.Server, token, conversationID, key, 
 	if err != nil {
 		t.Fatal(err)
 	}
+	return postSubmitBody(t, srv, token, conversationID, key, raw)
+}
+
+func postSubmitBody(t *testing.T, srv *httptest.Server, token, conversationID, key string, raw []byte) (int, []byte) {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/sessions/"+conversationID+"/messages", bytes.NewReader(raw))
 	if err != nil {
 		t.Fatal(err)
