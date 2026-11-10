@@ -56,9 +56,13 @@ type ServiceLink struct {
 // ServiceRead is one consume of the public task routes.
 // AuthoritativeGET is the raw GET /v1/tasks/:id body.
 // SSE status frames are not that body.
+// SurfaceLogs is set by startup resume. Each plain log newly stored by this
+// read becomes one business event on the bound conversation. It does not
+// submit a task and does not mark a run complete.
 type ServiceRead struct {
 	SSE              []byte
 	AuthoritativeGET []byte
+	SurfaceLogs      bool
 }
 
 // LinkServiceTask stores the task id, and the run id when the service has one.
@@ -256,7 +260,7 @@ func (s *Store) ProjectServiceRead(ctx context.Context, binding LiveBinding, rea
 	if err != nil {
 		return ProjectResult{}, err
 	}
-	return s.applyProjection(ctx, binding.test(), parsed, fault)
+	return s.applyProjection(ctx, binding.test(), parsed, fault, read.SurfaceLogs)
 }
 
 func parseService(read ServiceRead, binding LiveBinding) (parsedCapture, error) {

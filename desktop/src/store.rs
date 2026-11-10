@@ -187,6 +187,10 @@ pub struct Store {
     fixture_suffix: Signal<bool>,
     /// Set after that control's POST is stored. The transcript is unchanged.
     pub fixture_suffix_note: Signal<String>,
+    /// `PHILO_RESTART_URL` shows the process-restart controls. Production leaves it unset.
+    restart_on: Signal<bool>,
+    /// What the last restart control finished. Empty until one does.
+    pub restart_note: Signal<String>,
     /// The third column. Closed matches the two-column chat layout.
     pub details_open: Signal<bool>,
     /// Library tab of the details column. Activity is the other tab.
@@ -261,6 +265,8 @@ impl Store {
                 std::env::var("PHILO_FIXTURE_SUFFIX").ok().as_deref() == Some("1"),
             ),
             fixture_suffix_note: signal(String::new()),
+            restart_on: signal(restart_url().is_some()),
+            restart_note: signal(String::new()),
             details_open: signal(false),
             library_tab: signal(false),
             ws_generation: signal(0),
@@ -1011,6 +1017,84 @@ impl Store {
                 .find(|message| message.role != "user" && !message.id.is_empty())
                 .map(|message| message.id.clone())
         })
+    }
+
+    /// The process-restart controls are on only when a test set
+    /// `PHILO_RESTART_URL`. Production leaves it unset, so this is not a
+    /// control in the shipping window.
+    pub fn restart_enabled(self) -> bool {
+        self.restart_on.get()
+    }
+
+    pub fn kill_server(self) {
+        self.post_restart("/kill", "Server killed");
+    }
+
+    pub fn start_server(self) {
+        self.post_restart("/start", "Server started");
+    }
+
+    pub fn arm_during_log(self) {
+        self.post_restart("/arm/during", "During log armed");
+    }
+
+    pub fn arm_after_log(self) {
+        self.post_restart("/arm/after", "After log armed");
+    }
+
+    pub fn unset_fixture(self) {
+        self.post_restart("/unset", "Fixture unset");
+    }
+
+    /// Ask the test harness to kill, start, or arm a log. The desktop does
+    /// not re-POST the chat message. Curl runs off the UI task so a slow
+    /// start does not stall the socket reconnect.
+    fn post_restart(self, path: &'static str, note: &'static str) {
+        let Some(base) = restart_url() else {
+            self.action_error
+                .set(Some("PHILO_RESTART_URL is not set.".to_owned()));
+            return;
+        };
+        let url = format!("{base}{path}");
+        self.restart_note.set(String::new());
+        self.action_error.set(None);
+        let store = self;
+        go(async move {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = std::process::Command::new("curl")
+                    .args(["-sf", "-m", "30", "-X", "POST", &url])
+                    .output();
+                let _ = tx.send(result);
+            });
+            let result = loop {
+                match rx.try_recv() {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        timer(Duration::from_millis(50)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        store
+                            .action_error
+                            .set(Some("restart helper stopped".to_owned()));
+                        return;
+                    }
+                }
+            };
+            match result {
+                Ok(output) if output.status.success() => {
+                    store.restart_note.set(note.to_owned());
+                }
+                Ok(output) => {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    let body = String::from_utf8_lossy(&output.stdout);
+                    store
+                        .action_error
+                        .set(Some(format!("restart {path}: {err}{body}")));
+                }
+                Err(err) => store.action_error.set(Some(err.to_string())),
+            }
+        });
     }
 
     /// Drop the event socket and leave it down so the log can move while
@@ -2028,6 +2112,8 @@ mod tests {
             rebuilt_from_snapshot: signal(false),
             fixture_suffix: signal(false),
             fixture_suffix_note: signal(String::new()),
+            restart_on: signal(restart_url().is_some()),
+            restart_note: signal(String::new()),
             details_open: signal(false),
             library_tab: signal(false),
             ws_generation: signal(0),
@@ -2353,6 +2439,16 @@ mod tests {
         store
             .messages
             .with(|list| list.iter().map(|message| message.content.clone()).collect())
+    }
+}
+
+fn restart_url() -> Option<String> {
+    let raw = std::env::var("PHILO_RESTART_URL").ok()?;
+    let trimmed = raw.trim().trim_end_matches('/').to_owned();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 

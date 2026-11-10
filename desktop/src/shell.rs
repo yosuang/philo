@@ -488,6 +488,43 @@ fn activity_pane(store: Store) -> impl IntoElement {
                 )),
         )
         .child(when(
+            move || store.restart_enabled(),
+            move || {
+                view()
+                    .gap_2()
+                    .child(ui::secondary_button(
+                        "Kill server",
+                        move || true,
+                        move || store.kill_server(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Start server",
+                        move || true,
+                        move || store.start_server(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Arm during log",
+                        move || true,
+                        move || store.arm_during_log(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Arm after log",
+                        move || true,
+                        move || store.arm_after_log(),
+                    ))
+                    .child(ui::secondary_button(
+                        "Unset fixture",
+                        move || true,
+                        move || store.unset_fixture(),
+                    ))
+                    .child(
+                        text(move || store.restart_note.get())
+                            .text_size(px(12.0))
+                            .text_color(move || theme().muted_foreground),
+                    )
+            },
+        ))
+        .child(when(
             move || store.fixture_suffix_available(),
             move || {
                 view()
