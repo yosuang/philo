@@ -20,6 +20,11 @@ use crate::model::{
 const SERVER_KEY: &str = "serverUrl";
 const APPEARANCE_KEY: &str = "appearance";
 
+struct LiveGate {
+    buffering: bool,
+    pending: Vec<crate::model::ServerEvent>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Route {
     Chat,
@@ -103,6 +108,10 @@ pub struct Store {
     pub socket_label: Signal<String>,
     /// Set when this chat was replaced from an expired-cursor snapshot.
     pub rebuilt_from_snapshot: Signal<bool>,
+    /// `PHILO_FIXTURE_SUFFIX=1` shows the labeled fixture control. Not Makez.
+    fixture_suffix: Signal<bool>,
+    /// Set after that control's POST is stored. The transcript is unchanged.
+    pub fixture_suffix_note: Signal<String>,
     /// The third column. Closed matches the two-column chat layout.
     pub details_open: Signal<bool>,
     /// Library tab of the details column. Activity is the other tab.
@@ -114,6 +123,12 @@ pub struct Store {
     /// One open at a time, so two local callers share the server default conversation.
     resume_lock: Stored<Arc<Mutex<()>>>,
     ws_out: Stored<Option<UnboundedSender<WsCmd>>>,
+    /// When set, the supervisor leaves the socket down until reconnect.
+    socket_held: Signal<bool>,
+    /// Session id from the latest `subscribed` ack. Empty when the socket is down.
+    live_subscribed: Signal<String>,
+    live_gate: Stored<Arc<std::sync::Mutex<LiveGate>>>,
+    catchup_lock: Stored<Arc<Mutex<()>>>,
     business_high_water: Signal<i64>,
     applied_event_ids: Stored<HashSet<String>>,
     submit_serial: Signal<u64>,
@@ -153,6 +168,10 @@ impl Store {
             sending: signal(false),
             socket_label: signal("Events: connecting".to_owned()),
             rebuilt_from_snapshot: signal(false),
+            fixture_suffix: signal(
+                std::env::var("PHILO_FIXTURE_SUFFIX").ok().as_deref() == Some("1"),
+            ),
+            fixture_suffix_note: signal(String::new()),
             details_open: signal(false),
             library_tab: signal(false),
             ws_generation: signal(0),
@@ -160,6 +179,13 @@ impl Store {
             open_generation: signal(0),
             resume_lock: stored(Arc::new(Mutex::new(()))),
             ws_out: stored(None),
+            socket_held: signal(false),
+            live_subscribed: signal(String::new()),
+            live_gate: stored(Arc::new(std::sync::Mutex::new(LiveGate {
+                buffering: false,
+                pending: Vec::new(),
+            }))),
+            catchup_lock: stored(Arc::new(Mutex::new(()))),
             business_high_water: signal(0),
             applied_event_ids: stored(HashSet::new()),
             submit_serial: signal(0),
@@ -515,6 +541,80 @@ impl Store {
         });
     }
 
+    pub fn business_cursor(self) -> i64 {
+        self.business_high_water.get()
+    }
+
+    pub fn fixture_suffix_available(self) -> bool {
+        self.fixture_suffix.get()
+    }
+
+    /// Store one `fixture-business-source` delta on the open message.
+    /// The socket does not learn about it. Reconnect reads it from the log.
+    pub fn post_fixture_suffix(self) {
+        let Some(session_id) = self.selected_session.get() else {
+            self.action_error
+                .set(Some("Choose a bot before posting a fixture suffix.".to_owned()));
+            return;
+        };
+        let message_id = self.messages.with(|list| {
+            list.iter()
+                .rev()
+                .find(|message| message.role != "user" && !message.id.is_empty())
+                .map(|message| message.id.clone())
+        });
+        let Some(message_id) = message_id else {
+            self.action_error
+                .set(Some("The chat has no fixture message to extend.".to_owned()));
+            return;
+        };
+        self.submit_serial.update(|n| *n += 1);
+        let key = format!("fixture-suffix-{}", self.submit_serial.get());
+        self.fixture_suffix_note.set(String::new());
+        self.action_error.set(None);
+        let store = self;
+        go(async move {
+            match client::post_fixture_delta(
+                &store.server_url.get(),
+                &session_id,
+                &message_id,
+                "suffixonce",
+                &key,
+            )
+            .await
+            {
+                Ok(()) => {
+                    log::info!(
+                        "fixture suffix stored session={session_id} message={message_id} key={key}"
+                    );
+                    if store.selected_session.get().as_deref() == Some(session_id.as_str()) {
+                        store
+                            .fixture_suffix_note
+                            .set("Fixture suffix posted".to_owned());
+                    }
+                }
+                Err(err) => store.action_error.set(Some(err)),
+            }
+        });
+    }
+
+    /// Drop the event socket and leave it down so the log can move while
+    /// this client is not subscribed.
+    pub fn disconnect_events(self) {
+        self.socket_held.set(true);
+        self.live_subscribed.set(String::new());
+        self.reconnect();
+        self.socket_label.set("Events: disconnected".to_owned());
+    }
+
+    /// Open the socket again. The open path reads the business log from the
+    /// cursor this client still holds.
+    pub fn reconnect_events(self) {
+        self.socket_held.set(false);
+        self.live_subscribed.set(String::new());
+        self.reconnect();
+    }
+
     pub fn reload_transcript(self) {
         let Some(agent_id) = self.selected_agent.get() else {
             self.action_error
@@ -616,6 +716,9 @@ impl Store {
         }
         let session_id = session.id.clone();
         self.selected_session.set(Some(session_id.clone()));
+        // Buffer before subscribe so a delta that arrives with the ack is not
+        // applied onto a transcript this load is about to replace.
+        self.begin_live_buffer();
         self.subscribe(&session_id);
         self.load_transcript(session_id).await;
     }
@@ -663,8 +766,36 @@ impl Store {
     }
 
     async fn load_transcript(self, session_id: String) {
+        let lock = self.catchup_lock.with(|lock| Arc::clone(lock));
+        let _guard = lock.lock().await;
+        if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
+            return;
+        }
+        // Subscribe first, then read. Events that commit after the read and
+        // were published on the socket stay in the buffer until the snapshot
+        // or suffix is installed, so that window is not dropped.
+        self.begin_live_buffer();
+        if self.live_subscribed.get() != session_id {
+            self.subscribe(&session_id);
+            for _ in 0..50 {
+                if self.live_subscribed.get() == session_id
+                    || self.selected_session.get().as_deref() != Some(session_id.as_str())
+                {
+                    break;
+                }
+                timer(Duration::from_millis(100)).await;
+            }
+        }
+        if self.selected_session.get().as_deref() == Some(session_id.as_str()) {
+            self.catch_up(session_id.clone()).await;
+        }
+        if self.selected_session.get().as_deref() == Some(session_id.as_str()) {
+            self.finish_live_buffer();
+        }
+    }
+
+    async fn catch_up(self, session_id: String) {
         let url = self.server_url.get();
-        let epoch = self.transcript_epoch.get();
         let tasks = client::list_tasks(&url, &session_id).await;
         if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
             return;
@@ -678,59 +809,60 @@ impl Store {
         } else {
             self.business_high_water.get()
         };
-        if self.transcript_epoch.get() != epoch
-            || self.selected_session.get().as_deref() != Some(session_id.as_str())
-        {
-            return;
-        }
-        match client::business_events(&url, &session_id, held).await {
-            Ok(BusinessReplay::Expired(snap)) => {
-                if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
-                    return;
+        log::info!("business replay session={session_id} after={held}");
+        let mut after = held;
+        let mut saw_expired = false;
+        for _ in 0..8 {
+            if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
+                break;
+            }
+            match client::business_events(&url, &session_id, after).await {
+                Ok(BusinessReplay::Expired(snap)) => {
+                    let high = snap.high_water;
+                    log::info!(
+                        "business cursor {after} expired; replacing transcript with snapshot high_water={high} messages={}",
+                        snap.messages.len()
+                    );
+                    self.install_snapshot(snap.messages, snap.approvals, high);
+                    self.rebuilt_from_snapshot.set(true);
+                    saw_expired = true;
+                    if high <= after {
+                        break;
+                    }
+                    after = high;
                 }
-                let high = snap.high_water;
-                log::info!(
-                    "business cursor {held} expired; replacing transcript with snapshot high_water={high} messages={}",
-                    snap.messages.len()
-                );
-                self.install_snapshot(snap.messages, snap.approvals, high);
-                self.rebuilt_from_snapshot.set(true);
-                // The snapshot already includes every event at or before `high`.
-                // Only a later suffix is applied, so the snapshot text is not appended twice.
-                if let Ok(BusinessReplay::Events(events)) =
-                    client::business_events(&url, &session_id, high).await
-                {
-                    if self.selected_session.get().as_deref() == Some(session_id.as_str())
-                        && self.transcript_epoch.get() == epoch
-                    {
-                        for event in events {
-                            self.apply(event);
+                Ok(BusinessReplay::Events(events)) => {
+                    if events.is_empty() {
+                        break;
+                    }
+                    if !saw_expired {
+                        self.rebuilt_from_snapshot.set(false);
+                    }
+                    for event in events {
+                        self.apply(event);
+                    }
+                    let next = self.business_high_water.get();
+                    if next <= after {
+                        break;
+                    }
+                    after = next;
+                }
+                Err(err) => {
+                    log::warn!("business replay: {err}");
+                    if self.messages.with(Vec::is_empty) {
+                        if let Ok(snap) = client::snapshot(&url, &session_id).await {
+                            if self.selected_session.get().as_deref() == Some(session_id.as_str())
+                                && self.messages.with(Vec::is_empty)
+                            {
+                                self.install_snapshot(
+                                    snap.messages,
+                                    snap.approvals,
+                                    snap.high_water,
+                                );
+                            }
                         }
                     }
-                }
-            }
-            Ok(BusinessReplay::Events(events)) => {
-                if self.selected_session.get().as_deref() != Some(session_id.as_str())
-                    || self.transcript_epoch.get() != epoch
-                {
-                    return;
-                }
-                self.rebuilt_from_snapshot.set(false);
-                for event in events {
-                    self.apply(event);
-                }
-            }
-            Err(err) => {
-                log::warn!("business replay: {err}");
-                if self.messages.with(Vec::is_empty) {
-                    if let Ok(snap) = client::snapshot(&url, &session_id).await {
-                        if self.selected_session.get().as_deref() == Some(session_id.as_str())
-                            && self.transcript_epoch.get() == epoch
-                            && self.messages.with(Vec::is_empty)
-                        {
-                            self.install_snapshot(snap.messages, snap.approvals, snap.high_water);
-                        }
-                    }
+                    break;
                 }
             }
         }
@@ -745,7 +877,84 @@ impl Store {
     fn reconnect(self) {
         self.ws_generation.update(|generation| *generation += 1);
         self.ws_out.replace(None);
-        self.socket_label.set("Events: connecting".to_owned());
+        if self.socket_held.get() {
+            self.socket_label.set("Events: disconnected".to_owned());
+        } else {
+            self.socket_label.set("Events: connecting".to_owned());
+        }
+    }
+
+    fn begin_live_buffer(self) {
+        self.live_gate.with(|gate| {
+            gate.lock().expect("live gate").buffering = true;
+        });
+    }
+
+    fn buffering_live(self) -> bool {
+        self.live_gate
+            .with(|gate| gate.lock().expect("live gate").buffering)
+    }
+
+    /// Apply socket events that were not inside the snapshot just installed.
+    /// The flag flips off in the same critical section as the last empty take,
+    /// so an event cannot sit in the buffer after catch-up has finished.
+    fn finish_live_buffer(self) {
+        loop {
+            let batch = self.live_gate.with(|gate| {
+                let mut gate = gate.lock().expect("live gate");
+                let batch = std::mem::take(&mut gate.pending);
+                if batch.is_empty() {
+                    gate.buffering = false;
+                }
+                batch
+            });
+            if batch.is_empty() {
+                break;
+            }
+            let open = self.selected_session.get();
+            for event in batch {
+                if let Some(session_id) = event_session(&event) {
+                    if open.as_deref() != Some(session_id) {
+                        continue;
+                    }
+                }
+                let high = self.business_high_water.get();
+                if crate::model::covered_by_high_water(&event, high) {
+                    continue;
+                }
+                self.apply(event);
+            }
+        }
+    }
+
+    fn ingest_live(self, event: crate::model::ServerEvent) {
+        let mut event = Some(event);
+        let queued = self.live_gate.with(|gate| {
+            let mut gate = gate.lock().expect("live gate");
+            if gate.buffering {
+                if let Some(event) = event.take() {
+                    gate.pending.push(event);
+                }
+                true
+            } else {
+                false
+            }
+        });
+        if !queued {
+            if let Some(event) = event {
+                self.apply(event);
+            }
+        }
+    }
+
+    fn note_subscribed(self, event: &crate::model::ServerEvent) {
+        if let crate::model::ServerEvent::Ignored(kind) = event {
+            if let Some(session_id) = kind.strip_prefix("subscribed ") {
+                if !session_id.is_empty() {
+                    self.live_subscribed.set(session_id.to_owned());
+                }
+            }
+        }
     }
 
     fn subscribe(self, session_id: &str) {
@@ -760,6 +969,10 @@ impl Store {
         let store = self;
         go(async move {
             loop {
+                while store.socket_held.get() {
+                    store.socket_label.set("Events: disconnected".to_owned());
+                    timer(Duration::from_millis(100)).await;
+                }
                 let generation = store.ws_generation.get();
                 let base = store.server_url.get();
                 let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -772,32 +985,50 @@ impl Store {
                 client::drive_socket(base, cmd_rx, ev_tx);
                 loop {
                     let event = ev_rx.recv().await;
-                    if store.ws_generation.get() != generation {
+                    if store.ws_generation.get() != generation || store.socket_held.get() {
                         break;
                     }
                     match event {
                         Some(WsEvent::Open) => {
                             store.socket_label.set("Events: connected".to_owned());
                             if let Some(session_id) = store.selected_session.get() {
+                                // The ack has to be for this socket, not the one that just died.
+                                store.live_subscribed.set(String::new());
+                                store.begin_live_buffer();
                                 store.subscribe(&session_id);
+                                let again = store;
+                                let session_id = session_id.clone();
+                                go(async move {
+                                    again.load_transcript(session_id).await;
+                                });
                             }
                         }
-                        Some(WsEvent::Server(event)) => store.apply(event),
+                        Some(WsEvent::Server(event)) => {
+                            store.note_subscribed(&event);
+                            store.ingest_live(event);
+                        }
                         Some(WsEvent::Closed(reason)) => {
+                            store.live_subscribed.set(String::new());
                             store
                                 .socket_label
                                 .set(format!("Events: disconnected: {reason}"));
                             break;
                         }
                         None => {
+                            store.live_subscribed.set(String::new());
                             store.socket_label.set("Events: disconnected".to_owned());
                             break;
                         }
                     }
                 }
                 store.ws_out.replace(None);
+                store.live_subscribed.set(String::new());
+                if store.socket_held.get() {
+                    store.socket_label.set("Events: disconnected".to_owned());
+                    continue;
+                }
                 for _ in 0..20 {
-                    if store.ws_generation.get() != generation {
+                    if store.ws_generation.get() != generation || store.socket_held.get() {
                         break;
                     }
                     timer(Duration::from_millis(100)).await;
@@ -938,6 +1169,11 @@ impl Store {
     }
 
     fn reload_session(self, session_id: String) {
+        // Catch-up is already reading the log. A nested reload would apply the
+        // same suffix again, or observe it before the caller has finished.
+        if self.buffering_live() {
+            return;
+        }
         let store = self;
         go(async move {
             store.load_transcript(session_id).await;
@@ -1104,5 +1340,26 @@ impl Store {
                 list.insert(0, session);
             }
         });
+    }
+}
+
+fn event_session(event: &crate::model::ServerEvent) -> Option<&str> {
+    use crate::model::ServerEvent;
+    let session_id = match event {
+        ServerEvent::Delta { session_id, .. }
+        | ServerEvent::Completed { session_id, .. }
+        | ServerEvent::Failed { session_id, .. }
+        | ServerEvent::Canceled { session_id, .. }
+        | ServerEvent::Updated { session_id, .. } => session_id.as_str(),
+        ServerEvent::Created { message, .. } => message.session_id.as_str(),
+        ServerEvent::Approval(approval) => approval.session_id.as_str(),
+        ServerEvent::Task(task) => task.session_id.as_str(),
+        ServerEvent::Session(session) => session.id.as_str(),
+        ServerEvent::Ignored(_) => return None,
+    };
+    if session_id.is_empty() {
+        None
+    } else {
+        Some(session_id)
     }
 }

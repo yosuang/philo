@@ -475,8 +475,35 @@ pub fn parse_event(text: &str) -> Result<ServerEvent, String> {
         }
         "task.updated" => Ok(ServerEvent::Task(parse_nested(&value, "task")?)),
         "session.updated" => Ok(ServerEvent::Session(parse_nested(&value, "session")?)),
+        "subscribed" => {
+            let session_id = optional(&value, &["sessionId", "session_id"]);
+            Ok(ServerEvent::Ignored(format!("subscribed {session_id}")))
+        }
         other => Ok(ServerEvent::Ignored(other.to_owned())),
     }
+}
+
+/// The Philo business cursor carried on a live event.
+/// `message.seq` and a Makez public cursor are not this value.
+pub fn event_business_cursor(event: &ServerEvent) -> Option<i64> {
+    let cursor = match event {
+        ServerEvent::Delta { cursor, .. }
+        | ServerEvent::Completed { cursor, .. }
+        | ServerEvent::Failed { cursor, .. }
+        | ServerEvent::Canceled { cursor, .. }
+        | ServerEvent::Created { cursor, .. }
+        | ServerEvent::Updated { cursor, .. } => *cursor,
+        _ => 0,
+    };
+    (cursor > 0).then_some(cursor)
+}
+
+/// A socket event buffered across the snapshot read is already in that
+/// snapshot when its business cursor is at or before the high water.
+/// A later cursor is not covered and must still be applied. An event with
+/// no business cursor is not treated as covered.
+pub fn covered_by_high_water(event: &ServerEvent, high_water: i64) -> bool {
+    event_business_cursor(event).is_some_and(|cursor| event_inside_snapshot(cursor, high_water))
 }
 
 /// Orders a transcript by `seq` only. `created_at` and id are not the order.
@@ -748,6 +775,31 @@ mod tests {
         assert!(event_inside_snapshot(4, 4));
         assert!(!event_inside_snapshot(5, 4));
         assert!(!event_inside_snapshot(0, 4));
+    }
+
+    #[test]
+    fn buffered_event_after_the_snapshot_is_kept() {
+        let inside = parse_event(
+            r#"{"type":"message.delta","id":"e2","cursor":2,"messageId":"m","sessionId":"s","text":"red"}"#,
+        )
+        .unwrap();
+        let after = parse_event(
+            r#"{"type":"message.delta","id":"e5","cursor":5,"messageId":"m","sessionId":"s","text":"blue"}"#,
+        )
+        .unwrap();
+        let no_cursor = parse_event(
+            r#"{"type":"message.delta","id":"e0","messageId":"m","sessionId":"s","text":"z"}"#,
+        )
+        .unwrap();
+        let created = parse_event(
+            r#"{"type":"message.created","id":"e1","cursor":1,"messageId":"m","sessionId":"s","message":{"id":"m","sessionId":"s","seq":9,"role":"assistant","content":"red","status":"streaming"}}"#,
+        )
+        .unwrap();
+        assert!(covered_by_high_water(&inside, 4));
+        assert!(!covered_by_high_water(&after, 4));
+        assert!(!covered_by_high_water(&no_cursor, 4));
+        assert_eq!(event_business_cursor(&created), Some(1));
+        assert_ne!(event_business_cursor(&created), Some(9));
     }
 
     #[test]

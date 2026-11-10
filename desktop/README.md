@@ -68,7 +68,13 @@ That test needs `network: "live"`, `PHILO_ACTOR_TOKEN`, and the server on port 8
 nsh test expired-cursor.test.tsx --target linux
 ```
 
-The window receives the HTTP 400 itself, replaces the transcript with that snapshot, and does not append the same text again. `Adapter: unavailable` stays up.
+The window receives the HTTP 400 itself, replaces the transcript with that snapshot, and does not append the same text again. `Adapter: unavailable` stays up. That file starts from an empty transcript and `after=0`. It does not reconnect.
+
+`reconnect-cursor.test.tsx` starts from messages that are already on screen and a non-zero business cursor. Set `PHILO_FIXTURE_SUFFIX=1` so the window can store one later `fixture-business-source` delta. It disconnects the event socket, stores that delta while the socket is down, then reconnects. The client reads with the cursor it still holds, shows that suffix once, and does not append it again. The fixture stays labeled. It is not Makez.
+
+```bash
+nsh test reconnect-cursor.test.tsx --target linux
+```
 
 ## Contract notes
 

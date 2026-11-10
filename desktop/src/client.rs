@@ -172,6 +172,32 @@ fn parse_snapshot(value: &Value) -> Result<MaterializedSnapshot, String> {
     })
 }
 
+/// Posts one labeled fixture delta. The caller does not apply the returned
+/// event; the business log is what a later reconnect reads. This is not Makez.
+pub async fn post_fixture_delta(
+    base: &str,
+    session_id: &str,
+    message_id: &str,
+    text: &str,
+    event_key: &str,
+) -> Result<(), String> {
+    let _ = send_json(
+        "POST",
+        &endpoint(base, "/v1/fixture-business-source")?,
+        json!({
+            "source": "fixture-business-source",
+            "conversationId": session_id,
+            "eventKey": event_key,
+            "type": "message.delta",
+            "messageId": message_id,
+            "text": text,
+            "status": "",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn send_message(
     base: &str,
     session_id: &str,
