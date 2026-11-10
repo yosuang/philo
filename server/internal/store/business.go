@@ -34,7 +34,6 @@ const FixtureSource = "fixture-business-source"
 
 // FixtureInput is one labeled fixture event. EventKey dedups that fixture
 // input. It is not a Makez source offset and not a turn id.
-// ActorID is the server-configured bearer actor. A client body does not supply it.
 type FixtureInput struct {
 	Source         string
 	OwnerID        string
@@ -44,7 +43,6 @@ type FixtureInput struct {
 	MessageID      string
 	Text           string
 	Status         string
-	ActorID        string
 }
 
 func (e BusinessEvent) MarshalMap() (map[string]any, error) {
@@ -369,8 +367,6 @@ func applyFixtureLocked(ctx context.Context, tx pgx.Tx, in FixtureInput) (Busine
 		return appendBusinessEvent(ctx, tx, in.ConversationID, "message.completed", msg.ID, map[string]any{
 			"status": "complete",
 		})
-	case "fixture.running-task":
-		return insertFixtureRunningTask(ctx, tx, in)
 	case "message.updated":
 		if in.Status == "" {
 			return BusinessEvent{}, errors.New("status is required")
@@ -391,57 +387,6 @@ func applyFixtureLocked(ctx context.Context, tx pgx.Tx, in FixtureInput) (Busine
 	default:
 		return BusinessEvent{}, errors.New("unsupported fixture event")
 	}
-}
-
-// insertFixtureRunningTask stores one running task under the fixture label.
-// The anchor message is an error row, not a model reply. The task is not a
-// Makez run. This does not complete the task, and it does not decide whether
-// a later edit of a card cancels an in-flight task.
-func insertFixtureRunningTask(ctx context.Context, tx pgx.Tx, in FixtureInput) (BusinessEvent, error) {
-	if in.ActorID == "" {
-		return BusinessEvent{}, errors.New("fixture task requires the bearer actor")
-	}
-	ts := now()
-	msg, err := scanMessage(tx.QueryRow(ctx, `
-		INSERT INTO messages (
-			id, session_id, role, content, status, error_code, error_message, adapter, created_at, updated_at
-		) VALUES ($1, $2, 'assistant', '', 'error', 'fixture_task', $3, $4, $5, $5)
-		RETURNING `+messageCols,
-		uuid.NewString(), in.ConversationID, "labeled fixture task; not a model reply", FixtureSource, ts,
-	))
-	if err != nil {
-		return BusinessEvent{}, err
-	}
-	snapshot, err := json.Marshal(map[string]string{
-		"kind":    "fixture-running-task",
-		"summary": FixtureSource,
-	})
-	if err != nil {
-		return BusinessEvent{}, err
-	}
-	approvalID := uuid.NewString()
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO approvals (
-			id, session_id, message_id, kind, summary, status,
-			requester_actor_id, action_snapshot, created_at, updated_at
-		) VALUES ($1, $2, $3, 'fixture-running-task', $4, 'approved', $5, $6, $7, $7)`,
-		approvalID, in.ConversationID, msg.ID, FixtureSource, in.ActorID, snapshot, ts,
-	); err != nil {
-		return BusinessEvent{}, err
-	}
-	task, err := scanTask(tx.QueryRow(ctx, `
-		INSERT INTO tasks (id, session_id, approval_id, status, source, result, created_at, updated_at)
-		VALUES ($1, $2, $3, 'running', $4, '', $5, $5)
-		RETURNING `+taskCols,
-		uuid.NewString(), in.ConversationID, approvalID, FixtureSource, ts,
-	))
-	if err != nil {
-		return BusinessEvent{}, err
-	}
-	return appendBusinessEvent(ctx, tx, in.ConversationID, "fixture.running-task", msg.ID, map[string]any{
-		"source": FixtureSource,
-		"task":   task,
-	})
 }
 
 func listMessages(ctx context.Context, q queryer, sessionID string) ([]Message, error) {

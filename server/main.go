@@ -66,9 +66,12 @@ func main() {
 	}()
 
 	execution := "unavailable"
-	if cfg.DevFixture() {
+	switch {
+	case cfg.ExecutionFixture == config.ExecutionFixtureWorker:
+		execution = "fixture-worker"
+	case cfg.DevFixture():
 		execution = "fixture-dev"
-	} else if cfg.MakezTestBinding() {
+	case cfg.MakezTestBinding():
 		execution = "test-binding"
 	}
 	log.Printf("philo session server listening on %s execution=%s", cfg.HTTPAddr, execution)

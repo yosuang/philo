@@ -14,8 +14,11 @@ const (
 	defaultAddr            = ":8080"
 	defaultProviderBaseURL = "https://api.openai.com/v1"
 	defaultChunkDelay      = 40 * time.Millisecond
-	// ExecutionFixtureDev is the only value that runs the isolated dev adapter.
+	// ExecutionFixtureDev is the isolated dev adapter. It also finishes its local task.
 	ExecutionFixtureDev = "dev"
+	// ExecutionFixtureWorker runs that same draft path and leaves the approved task running.
+	// It is not Makez and it does not write the task row itself.
+	ExecutionFixtureWorker = "worker"
 	// TestMakezBinding is the only label that may call Makez.
 	// It is not a production owner-to-workspace identity.
 	TestMakezBinding = "test-binding"
@@ -74,18 +77,29 @@ func FromEnv() (Config, error) {
 	return cfg, nil
 }
 
-// DevFixture reports whether this process opted into the isolated dev adapter.
+// DevFixture reports whether this process opted into the isolated draft adapter.
+// dev finishes its local task. worker leaves that task running.
 func (c Config) DevFixture() bool {
+	return c.ExecutionFixture == ExecutionFixtureDev || c.ExecutionFixture == ExecutionFixtureWorker
+}
+
+// FinishesFixtureTask reports whether approve should store a local result.
+// The worker fixture does not. Production does not either.
+func (c Config) FinishesFixtureTask() bool {
 	return c.ExecutionFixture == ExecutionFixtureDev
 }
 
 // HealthAdapter is the adapter field on GET /v1/health.
-// The production value is unavailable. dev is only the explicit fixture.
+// The production value is unavailable. dev and worker are explicit fixtures.
 func (c Config) HealthAdapter() string {
-	if c.DevFixture() {
+	switch c.ExecutionFixture {
+	case ExecutionFixtureDev:
 		return "dev"
+	case ExecutionFixtureWorker:
+		return ExecutionFixtureWorker
+	default:
+		return "unavailable"
 	}
-	return "unavailable"
 }
 
 // LiveMakez rejects a partial client and any binding other than the test label.

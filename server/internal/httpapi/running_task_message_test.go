@@ -4,166 +4,118 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/yosuang/philo/server/internal/config"
-	"github.com/yosuang/philo/server/internal/store"
 )
 
-// TestUserMessageStoredWhileFixtureTaskRuns posts through the session API
-// while a labeled fixture task is running. The task is not a Makez run and
-// not a model reply. An unset fixture stays unavailable.
+// TestUserMessageStoredWhileFixtureTaskRuns approves a draft through the
+// decision route while PHILO_EXECUTION_FIXTURE=worker, then posts another
+// message. The task stays running. The card keeps its snapshot and requester.
+// The fixture is not Makez. An unset fixture stays unavailable.
 func TestUserMessageStoredWhileFixtureTaskRuns(t *testing.T) {
-	t.Run("running fixture task", func(t *testing.T) {
-		srv, pool := startProduction(t, config.Config{BusinessFixture: true})
-		assertUnavailableHealth(t, srv)
-		conversationID := openDefault(t, srv, createAgent(t, srv, "Ada"))
+	t.Run("worker fixture", func(t *testing.T) {
+		srv, pool := startConfigured(t, config.Config{
+			ExecutionFixture: config.ExecutionFixtureWorker,
+			DevChunkDelay:    time.Millisecond,
+		}, false)
+		health := asMap(t, mustGET(t, srv, "/v1/health"))
+		if health["adapter"] != "worker" || health["makez"] != "disconnected" || health["ok"] != true {
+			t.Fatalf("health = %#v", health)
+		}
+		willa := openDefault(t, srv, createAgent(t, srv, "Willa"))
+		hugo := openDefault(t, srv, createAgent(t, srv, "Hugo"))
+		beforeHugo := cardEffects(t, pool, hugo)
 
-		status, body := postFixture(t, srv, map[string]any{
-			"source":         store.FixtureSource,
-			"conversationId": conversationID,
-			"eventKey":       "running-task-1",
-			"type":           "fixture.running-task",
-		})
+		status, body := postSubmit(t, srv, testToken, willa, "draft-weekly", "/draft send the weekly note")
 		if status != http.StatusOK {
-			t.Fatalf("fixture task %d %s", status, body)
+			t.Fatalf("draft %d %s", status, body)
 		}
-		planted := asMap(t, body)
-		if planted["type"] != "fixture.running-task" || planted["source"] != store.FixtureSource {
-			t.Fatalf("fixture event = %#v", planted)
+		card := waitPendingCard(t, srv, willa)
+		cardID := card["id"].(string)
+		if card["requesterActorId"] != testActor {
+			t.Fatalf("requester = %#v", card["requesterActorId"])
 		}
-		plantedTask, _ := planted["task"].(map[string]any)
-		taskID, _ := plantedTask["id"].(string)
-		if taskID == "" || plantedTask["status"] != "running" || plantedTask["source"] != store.FixtureSource || plantedTask["result"] != "" {
-			t.Fatalf("planted task = %#v", plantedTask)
+		if kind, summary := snapSummary(t, card); kind != "draft_action" || summary != "send the weekly note" {
+			t.Fatalf("snapshot = %s %s", kind, summary)
 		}
-		againStatus, againBody := postFixture(t, srv, map[string]any{
-			"source":         store.FixtureSource,
-			"conversationId": conversationID,
-			"eventKey":       "running-task-1",
-			"type":           "fixture.running-task",
-		})
-		if againStatus != http.StatusOK || asMap(t, againBody)["id"] != planted["id"] {
-			t.Fatalf("repeat fixture %d %s", againStatus, againBody)
-		}
+		snapshotBefore := storedSnapshot(t, pool, cardID)
 
-		before := taskList(t, srv, conversationID)
-		if len(before) != 1 || before[0]["id"] != taskID || before[0]["status"] != "running" || before[0]["source"] != store.FixtureSource {
-			t.Fatalf("tasks before send = %#v", before)
-		}
-		anchor := messageList(t, srv, conversationID)
-		if streamingCount(anchor) != 0 {
-			t.Fatal("fixture task left a streaming reply")
-		}
-		assertNoModelReply(t, anchor)
-		if len(anchor) != 1 || anchor[0]["role"] != "assistant" || anchor[0]["status"] != "error" || anchor[0]["content"] != "" {
-			t.Fatalf("fixture anchor = %#v", anchor)
-		}
-		meta, _ := anchor[0]["metadata"].(map[string]any)
-		if meta["adapter"] != store.FixtureSource {
-			t.Fatalf("fixture anchor adapter = %#v", anchor[0]["metadata"])
-		}
-
-		const firstKey = "while-task-1"
-		const firstText = "still here"
-		status, body = postSubmit(t, srv, testToken, conversationID, firstKey, firstText)
-		if status == http.StatusConflict && errCode(t, body) == "reply_in_progress" {
-			t.Fatalf("rejected because a task is running: %s", body)
-		}
+		status, body = do(t, srv, http.MethodPost, "/v1/approvals/"+cardID+"/decision", map[string]any{"decision": "approve"})
 		if status != http.StatusOK {
-			t.Fatalf("first send %d %s", status, body)
+			t.Fatalf("approve %d %s", status, body)
 		}
-		first := asMap(t, body)
-		if first["execution"] != "unavailable" || first["replayed"] != false {
-			t.Fatalf("first submit = %#v", first)
+		approved := asMap(t, body)
+		if approved["id"] != cardID || approved["status"] != "approved" || approved["requesterActorId"] != testActor {
+			t.Fatalf("approved = %#v", approved)
 		}
-		if _, ok := first["assistantMessage"]; ok {
-			t.Fatalf("running task started a reply: %s", body)
+		if kind, summary := snapSummary(t, approved); kind != "draft_action" || summary != "send the weekly note" {
+			t.Fatalf("approve changed the snapshot: %s %s", kind, summary)
 		}
-		user, _ := first["userMessage"].(map[string]any)
-		if user["role"] != "user" || user["content"] != firstText || user["status"] != "complete" {
+		taskID := waitRunningTask(t, srv, willa, cardID)
+		time.Sleep(200 * time.Millisecond)
+		if got := taskList(t, srv, willa); len(got) != 1 || got[0]["id"] != taskID || got[0]["status"] != "running" || got[0]["source"] != "philo-server" || got[0]["result"] != "" {
+			t.Fatalf("task finished or changed: %#v", got)
+		}
+
+		const follow = "Willa sends while the task runs"
+		status, body = postSubmit(t, srv, testToken, willa, "while-running", follow)
+		if status != http.StatusOK {
+			t.Fatalf("send %d %s", status, body)
+		}
+		sent := asMap(t, body)
+		if code, ok := sent["error"].(map[string]any); ok && code["code"] == "reply_in_progress" {
+			t.Fatalf("rejected because the task is running: %s", body)
+		}
+		user, _ := sent["userMessage"].(map[string]any)
+		if user["role"] != "user" || user["content"] != follow || user["status"] != "complete" {
 			t.Fatalf("user message = %#v", user)
 		}
-		turnID, _ := first["turnId"].(string)
-		if turnID == "" || turnID == firstKey {
-			t.Fatalf("turn id = %q", turnID)
+		if !hasUser(messageList(t, srv, willa), follow) {
+			t.Fatal("user message was not stored")
 		}
 
-		const secondText = "and again"
-		status, body = postSubmit(t, srv, testToken, conversationID, "while-task-2", secondText)
-		if status != http.StatusOK {
-			t.Fatalf("second send %d %s", status, body)
+		cards := approvalList(t, srv, willa)
+		if len(cards) != 1 || cards[0]["id"] != cardID || cards[0]["status"] != "approved" || cards[0]["requesterActorId"] != testActor {
+			t.Fatalf("card after send = %#v", cards)
 		}
-		second := asMap(t, body)
-		if second["execution"] != "unavailable" {
-			t.Fatalf("second submit = %#v", second)
+		if kind, summary := snapSummary(t, cards[0]); kind != "draft_action" || summary != "send the weekly note" {
+			t.Fatalf("snapshot after send = %s %s", kind, summary)
 		}
-		if _, ok := second["assistantMessage"]; ok {
-			t.Fatalf("second send started a reply: %s", body)
+		if storedSnapshot(t, pool, cardID) != snapshotBefore {
+			t.Fatalf("stored snapshot changed: %s", storedSnapshot(t, pool, cardID))
 		}
-		secondUser, _ := second["userMessage"].(map[string]any)
-		if secondUser["content"] != secondText || secondUser["status"] != "complete" {
-			t.Fatalf("second user message = %#v", secondUser)
+		tasks := taskList(t, srv, willa)
+		if len(tasks) != 1 || tasks[0]["id"] != taskID || tasks[0]["approvalId"] != cardID || tasks[0]["status"] != "running" || tasks[0]["source"] != "philo-server" || tasks[0]["result"] != "" {
+			t.Fatalf("task after send = %#v", tasks)
 		}
-
-		status, body = postSubmit(t, srv, testToken, conversationID, firstKey, firstText)
-		if status != http.StatusOK {
-			t.Fatalf("replay %d %s", status, body)
+		if cardEffects(t, pool, hugo) != beforeHugo {
+			t.Fatalf("other bot changed: before %+v after %+v", beforeHugo, cardEffects(t, pool, hugo))
 		}
-		replay := asMap(t, body)
-		if replay["turnId"] != turnID || replay["replayed"] != true || replay["execution"] != "unavailable" {
-			t.Fatalf("replay = %#v", replay)
-		}
-
-		after := taskList(t, srv, conversationID)
-		if len(after) != 1 || after[0]["id"] != taskID || after[0]["status"] != "running" || after[0]["source"] != store.FixtureSource || after[0]["result"] != "" {
-			t.Fatalf("task changed = %#v", after)
-		}
-		assertTaskStillRunning(t, pool, conversationID, taskID)
-		messages := messageList(t, srv, conversationID)
-		assertNoModelReply(t, messages)
-		if userCount(messages, firstText) != 1 || userCount(messages, secondText) != 1 {
-			t.Fatalf("stored messages = %#v", messages)
-		}
-		var linked, checkpoints, wakes, outbox, unavailableOutbox int
+		var linked int
 		if err := pool.QueryRow(context.Background(), `
-			SELECT
-				(SELECT count(*) FROM turns
-					WHERE conversation_id = $1
-					AND (makez_task_id IS NOT NULL OR makez_run_id IS NOT NULL OR makez_workspace_id IS NOT NULL)),
-				(SELECT count(*) FROM source_checkpoints),
-				(SELECT count(*) FROM wake_intents WHERE conversation_id = $1),
-				(SELECT count(*) FROM outbox WHERE conversation_id = $1),
-				(SELECT count(*) FROM outbox WHERE conversation_id = $1 AND payload->>'execution' = 'unavailable')`,
-			conversationID).Scan(&linked, &checkpoints, &wakes, &outbox, &unavailableOutbox); err != nil {
+			SELECT count(*) FROM turns
+			WHERE conversation_id = $1
+			AND (makez_task_id IS NOT NULL OR makez_run_id IS NOT NULL OR makez_workspace_id IS NOT NULL)`,
+			willa).Scan(&linked); err != nil {
 			t.Fatal(err)
 		}
-		if linked != 0 || checkpoints != 0 {
-			t.Fatalf("fixture task linked a Makez run: linked=%d checkpoints=%d", linked, checkpoints)
+		if linked != 0 {
+			t.Fatal("worker fixture linked a Makez run")
 		}
-		if wakes != 2 || outbox != 2 || unavailableOutbox != 2 {
-			t.Fatalf("submit rows wakes=%d outbox=%d unavailable=%d", wakes, outbox, unavailableOutbox)
-		}
-		assertUnavailableHealth(t, srv)
 	})
 
 	t.Run("unset fixture", func(t *testing.T) {
 		srv, pool := startProduction(t, config.Config{})
-		assertUnavailableHealth(t, srv)
-		conversationID := openDefault(t, srv, createAgent(t, srv, "Ada"))
-		status, body := postFixture(t, srv, map[string]any{
-			"source":         store.FixtureSource,
-			"conversationId": conversationID,
-			"eventKey":       "running-task-unset",
-			"type":           "fixture.running-task",
-		})
-		if status != http.StatusNotFound {
-			t.Fatalf("unset fixture route %d %s", status, body)
+		health := asMap(t, mustGET(t, srv, "/v1/health"))
+		if health["adapter"] != "unavailable" || health["makez"] != "disconnected" {
+			t.Fatalf("health = %#v", health)
 		}
-		status, body = postSubmit(t, srv, testToken, conversationID, "unset-task", "/draft send the weekly note")
+		conversationID := openDefault(t, srv, createAgent(t, srv, "Una"))
+		status, body := postSubmit(t, srv, testToken, conversationID, "unset-draft", "/draft send the weekly note")
 		if status != http.StatusOK {
 			t.Fatalf("unset submit %d %s", status, body)
 		}
@@ -175,34 +127,51 @@ func TestUserMessageStoredWhileFixtureTaskRuns(t *testing.T) {
 			t.Fatalf("unset fixture started a reply: %s", body)
 		}
 		user, _ := got["userMessage"].(map[string]any)
-		if user["content"] != "/draft send the weekly note" || user["role"] != "user" || user["status"] != "complete" {
+		if user["content"] != "/draft send the weekly note" || user["status"] != "complete" {
 			t.Fatalf("unset user message = %#v", user)
 		}
-		if len(taskList(t, srv, conversationID)) != 0 {
-			t.Fatal("unset fixture stored a task")
+		if len(taskList(t, srv, conversationID)) != 0 || len(approvalList(t, srv, conversationID)) != 0 {
+			t.Fatal("unset fixture stored a card or a task")
 		}
 		var approvals int
 		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM approvals WHERE session_id = $1`, conversationID).Scan(&approvals); err != nil {
 			t.Fatal(err)
 		}
 		if approvals != 0 {
-			t.Fatalf("unset fixture stored an approval: %d", approvals)
+			t.Fatalf("approvals = %d", approvals)
 		}
-		messages := messageList(t, srv, conversationID)
-		assertNoModelReply(t, messages)
-		if userCount(messages, "/draft send the weekly note") != 1 {
-			t.Fatalf("unset message was not stored: %#v", messages)
-		}
-		assertUnavailableHealth(t, srv)
 	})
 }
 
-func assertUnavailableHealth(t *testing.T, srv *httptest.Server) {
+func waitPendingCard(t *testing.T, srv *httptest.Server, sessionID string) map[string]any {
 	t.Helper()
-	health := asMap(t, mustGET(t, srv, "/v1/health"))
-	if health["adapter"] != "unavailable" || health["makez"] != "disconnected" || health["ok"] != true {
-		t.Fatalf("health = %#v", health)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cards := approvalList(t, srv, sessionID)
+		if len(cards) == 1 && cards[0]["status"] == "pending" {
+			return cards[0]
+		}
+		time.Sleep(15 * time.Millisecond)
 	}
+	t.Fatal("pending card was not stored")
+	return nil
+}
+
+func waitRunningTask(t *testing.T, srv *httptest.Server, sessionID, approvalID string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		tasks := taskList(t, srv, sessionID)
+		if len(tasks) == 1 && tasks[0]["approvalId"] == approvalID && tasks[0]["status"] == "running" && tasks[0]["source"] == "philo-server" {
+			id, _ := tasks[0]["id"].(string)
+			if id != "" {
+				return id
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatal("running task was not stored")
+	return ""
 }
 
 func taskList(t *testing.T, srv *httptest.Server, sessionID string) []map[string]any {
@@ -219,64 +188,20 @@ func taskList(t *testing.T, srv *httptest.Server, sessionID string) []map[string
 	return out
 }
 
-func assertTaskStillRunning(t *testing.T, pool *pgxpool.Pool, sessionID, taskID string) {
+func storedSnapshot(t *testing.T, pool *pgxpool.Pool, approvalID string) string {
 	t.Helper()
-	var status, source, result, approval string
-	var tasks int
-	err := pool.QueryRow(context.Background(), `
-		SELECT
-			(SELECT status FROM tasks WHERE id = $1),
-			(SELECT source FROM tasks WHERE id = $1),
-			(SELECT result FROM tasks WHERE id = $1),
-			(SELECT approval_id FROM tasks WHERE id = $1),
-			(SELECT count(*) FROM tasks WHERE session_id = $2)`,
-		taskID, sessionID).Scan(&status, &source, &result, &approval, &tasks)
-	if err != nil {
+	var snapshot string
+	if err := pool.QueryRow(context.Background(), `SELECT action_snapshot::text FROM approvals WHERE id = $1`, approvalID).Scan(&snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if status != "running" || source != store.FixtureSource || result != "" || approval == "" || tasks != 1 {
-		t.Fatalf("stored task status=%s source=%s result=%q approval=%s tasks=%d", status, source, result, approval, tasks)
-	}
-	var cardStatus, kind, requester string
-	if err := pool.QueryRow(context.Background(), `
-		SELECT status, kind, requester_actor_id
-		FROM approvals WHERE id = $1`, approval).Scan(&cardStatus, &kind, &requester); err != nil {
-		t.Fatal(err)
-	}
-	if cardStatus != "approved" || kind != "fixture-running-task" || requester != testActor {
-		t.Fatalf("fixture card status=%s kind=%s requester=%s", cardStatus, kind, requester)
-	}
+	return snapshot
 }
 
-func assertNoModelReply(t *testing.T, messages []map[string]any) {
-	t.Helper()
-	for _, msg := range messages {
-		content, _ := msg["content"].(string)
-		if msg["role"] == "assistant" && msg["status"] == "complete" {
-			t.Fatalf("assistant success stored: %#v", msg)
-		}
-		if strings.HasPrefix(content, "[philo dev adapter]") {
-			t.Fatalf("model reply stored: %#v", msg)
-		}
-	}
-}
-
-func streamingCount(messages []map[string]any) int {
-	n := 0
-	for _, msg := range messages {
-		if msg["status"] == "streaming" {
-			n++
-		}
-	}
-	return n
-}
-
-func userCount(messages []map[string]any, content string) int {
-	n := 0
+func hasUser(messages []map[string]any, content string) bool {
 	for _, msg := range messages {
 		if msg["role"] == "user" && msg["content"] == content && msg["status"] == "complete" {
-			n++
+			return true
 		}
 	}
-	return n
+	return false
 }

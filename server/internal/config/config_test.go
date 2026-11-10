@@ -13,6 +13,8 @@ func TestHealthAdapter(t *testing.T) {
 		want string
 	}{
 		{name: "explicit fixture", cfg: Config{ExecutionFixture: ExecutionFixtureDev}, want: "dev"},
+		{name: "worker fixture", cfg: Config{ExecutionFixture: ExecutionFixtureWorker}, want: "worker"},
+		{name: "other fixture value", cfg: Config{ExecutionFixture: "other"}, want: "unavailable"},
 		{name: "adapter dev without fixture", cfg: Config{Adapter: "dev"}, want: "unavailable"},
 		{name: "provider with key", cfg: Config{Adapter: "provider", ProviderAPIKey: "k"}, want: "unavailable"},
 		{name: "provider without key", cfg: Config{Adapter: "provider"}, want: "unavailable"},
@@ -24,6 +26,21 @@ func TestHealthAdapter(t *testing.T) {
 				t.Fatalf("HealthAdapter() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestWorkerFixtureDoesNotFinishTheTask(t *testing.T) {
+	worker := Config{ExecutionFixture: ExecutionFixtureWorker}
+	if !worker.DevFixture() || worker.FinishesFixtureTask() || worker.HealthAdapter() != "worker" {
+		t.Fatalf("worker fixture = %+v health %s", worker, worker.HealthAdapter())
+	}
+	dev := Config{ExecutionFixture: ExecutionFixtureDev}
+	if !dev.DevFixture() || !dev.FinishesFixtureTask() || dev.HealthAdapter() != "dev" {
+		t.Fatalf("dev fixture = %+v", dev)
+	}
+	unset := Config{}
+	if unset.DevFixture() || unset.FinishesFixtureTask() {
+		t.Fatal("unset fixture opted in")
 	}
 }
 

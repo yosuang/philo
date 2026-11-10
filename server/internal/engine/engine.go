@@ -26,20 +26,23 @@ type Engine struct {
 	ad    adapter.Adapter
 	hub   *hub.Hub
 
-	mu      sync.Mutex
-	runs    map[string]context.CancelFunc
-	fixture bool
+	mu          sync.Mutex
+	runs        map[string]context.CancelFunc
+	fixture     bool
+	finishTasks bool
 }
 
 // New builds an engine. ad is the isolated fixture adapter when fixture is set.
-// Production does not call it and does not complete tasks from this process.
-func New(st *store.Store, ad adapter.Adapter, h *hub.Hub, fixture bool) *Engine {
+// finishTasks is only the dev fixture. The worker fixture leaves the task running.
+// Production does not call the adapter and does not complete tasks from this process.
+func New(st *store.Store, ad adapter.Adapter, h *hub.Hub, fixture, finishTasks bool) *Engine {
 	return &Engine{
-		store:   st,
-		ad:      ad,
-		hub:     h,
-		runs:    map[string]context.CancelFunc{},
-		fixture: fixture,
+		store:       st,
+		ad:          ad,
+		hub:         h,
+		runs:        map[string]context.CancelFunc{},
+		fixture:     fixture,
+		finishTasks: finishTasks,
 	}
 }
 
@@ -101,7 +104,8 @@ func (e *Engine) Cancel(ctx context.Context, sessionID string) (store.Message, e
 
 // Decide records approve or reject. Approve stores a local philo-server task.
 // The dev fixture may later store a result. That result does not change the
-// card. Production does not complete the task. Reject creates no task.
+// card. The worker fixture leaves the task running. Production does not
+// complete the task. Reject creates no task. This does not cancel an in-flight task.
 func (e *Engine) Decide(ctx context.Context, approvalID, decision string) (store.Approval, error) {
 	res, err := e.store.Decide(ctx, approvalID, decision)
 	if err != nil {
@@ -110,7 +114,7 @@ func (e *Engine) Decide(ctx context.Context, approvalID, decision string) (store
 	e.publishApproval("approval.updated", res.Approval)
 	if res.Task != nil {
 		e.publishTask(*res.Task)
-		if e.fixture {
+		if e.finishTasks {
 			go e.completeTask(res.Task.ID, res.Approval.Summary)
 		}
 	}

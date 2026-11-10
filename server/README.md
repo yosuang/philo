@@ -41,7 +41,7 @@ go test ./...
 | `PHILO_DATABASE_URL` | required | Postgres DSN |
 | `PHILO_HTTP_ADDR` | `:8080` | Listen address |
 | `PHILO_MODEL_ADAPTER` | empty | Ignored as an execution path. `dev` here does not enable the fixture |
-| `PHILO_EXECUTION_FIXTURE` | empty | `dev` opts into the isolated fixture. Any other value leaves execution unavailable |
+| `PHILO_EXECUTION_FIXTURE` | empty | `dev` opts into the isolated fixture and finishes its local task. `worker` uses that same draft path and leaves the task running. Any other value leaves execution unavailable |
 | `PHILO_BUSINESS_FIXTURE` | empty | `fixture-business-source` mounts the labeled fixture event route. It is not Makez |
 | `PHILO_AUTH_CREDENTIALS` | empty | `token\|actor\|owner` entries. Empty means business routes reject callers |
 | `PHILO_PROVIDER_API_KEY` | empty | Required when adapter is `provider` |
@@ -49,15 +49,15 @@ go test ./...
 | `PHILO_MAKEZ_URL` | empty | GET this URL for the Makez health check |
 | `PHILO_DEV_CHUNK_DELAY` | `40ms` | Pause between dev stream chunks |
 
-An unknown adapter value refuses to start. `PHILO_MODEL_ADAPTER=provider` does not start a provider call and does not fall back to dev. Health reports `unavailable` unless the dev fixture is on.
+An unknown adapter value refuses to start. `PHILO_MODEL_ADAPTER=provider` does not start a provider call and does not fall back to dev. Health reports `unavailable` unless `PHILO_EXECUTION_FIXTURE` is `dev` or `worker`.
 
 ## Adapter behavior
 
 `PHILO_EXECUTION_FIXTURE=dev` streams a fixed local reply. Assistant messages carry `metadata.adapter` of `dev`. The text starts with `[philo dev adapter]` and says it is not a live model. A user message that starts with `/draft ` (slash, draft, space) and has a non-empty summary creates one pending approval of kind `draft_action` after the reply finishes. The summary is the rest of the first line. That card stores the summary as its action snapshot and the bearer actor as its requester. An empty summary creates no approval. Canceling before the reply finishes creates no approval. That fixture also completes its local task after an explicit approve. The result does not change the card. It is not production and not acceptance.
 
-Without that fixture, a submit stores the user message, a turn, a wake intent, and an outbox row. Execution is `unavailable`. No assistant stream is started.
+`PHILO_EXECUTION_FIXTURE=worker` is the labeled unfinished worker. It uses the same `/draft` path, so the pending card, its snapshot, and its requester come from that reply. Approve still inserts the `philo-server` task through the decision route. This process does not store a result on that task. It does not call Makez. Health reports `worker`.
 
-`PHILO_BUSINESS_FIXTURE=fixture-business-source` also accepts `type` `fixture.running-task` on `POST /v1/fixture-business-source`. That stores one task at `running` whose `source` is `fixture-business-source`, plus an approved card whose snapshot names that fixture. The anchor message is an error row, not an assistant success. The route does not call Makez and does not complete the task. A later user message is still stored, and the task keeps status `running`. Unset, that route is not mounted and a submit stays `execution` `unavailable`.
+Without either fixture, a submit stores the user message, a turn, a wake intent, and an outbox row. Execution is `unavailable`. No assistant stream is started. A draft creates no card and no task.
 
 ## Approval and Makez
 
