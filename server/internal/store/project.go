@@ -54,6 +54,9 @@ type ProjectResult struct {
 	ProcessingCursor  string
 	Published         bool
 	LocalReceiptAcked bool
+	// Events are business rows this read committed for newly stored plain logs.
+	// Empty unless the read asked to surface them. They are not a run completion.
+	Events []BusinessEvent
 }
 
 type observationRow struct {
@@ -88,10 +91,10 @@ func (s *Store) ProjectCapturedFailure(ctx context.Context, in CaptureInput, fau
 	if err != nil {
 		return ProjectResult{}, err
 	}
-	return s.applyProjection(ctx, in.Binding, parsed, fault)
+	return s.applyProjection(ctx, in.Binding, parsed, fault, false)
 }
 
-func (s *Store) applyProjection(ctx context.Context, binding TestBinding, parsed parsedCapture, fault FaultPoint) (ProjectResult, error) {
+func (s *Store) applyProjection(ctx context.Context, binding TestBinding, parsed parsedCapture, fault FaultPoint, surfaceLogs bool) (ProjectResult, error) {
 	if parsed.task != nil && parsed.task.ConversationID != binding.CapturedConversationID {
 		return ProjectResult{}, ErrBindingMismatch
 	}
@@ -133,7 +136,8 @@ func (s *Store) applyProjection(ctx context.Context, binding TestBinding, parsed
 		if err != nil {
 			return ProjectResult{}, err
 		}
-		if err := writeLogs(ctx, tx, pending); err != nil {
+		inserted, err := writeLogs(ctx, tx, pending)
+		if err != nil {
 			return ProjectResult{}, err
 		}
 		if parsed.task != nil && parsed.task.RunID != "" && len(pending) > 0 {
@@ -141,10 +145,25 @@ func (s *Store) applyProjection(ctx context.Context, binding TestBinding, parsed
 				return ProjectResult{}, err
 			}
 		}
+		var events []BusinessEvent
+		if surfaceLogs {
+			for _, log := range inserted {
+				// A failure line stays on the failure path. A plain log is a
+				// transcript row, not a finished run.
+				if log.Text == "" || log.FailureText != "" {
+					continue
+				}
+				ev, err := insertResumedLog(ctx, tx, binding, log.Text)
+				if err != nil {
+					return ProjectResult{}, err
+				}
+				events = append(events, ev)
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ProjectResult{}, err
 		}
-		return ProjectResult{Replayed: len(parsed.logs) > 0 && len(pending) == 0}, nil
+		return ProjectResult{Replayed: len(parsed.logs) > 0 && len(pending) == 0, Events: events}, nil
 	}
 
 	if err := atFault(fault, FaultProjection); err != nil {
@@ -164,7 +183,7 @@ func (s *Store) applyProjection(ctx context.Context, binding TestBinding, parsed
 	if err := atFault(fault, FaultDedup); err != nil {
 		return ProjectResult{}, err
 	}
-	if err := writeLogs(ctx, tx, parsed.logs); err != nil {
+	if _, err := writeLogs(ctx, tx, parsed.logs); err != nil {
 		return ProjectResult{}, err
 	}
 	if err := insertObservation(ctx, tx, *parsed.task, messageID); err != nil {
@@ -436,7 +455,8 @@ func linkTurn(ctx context.Context, tx pgx.Tx, binding TestBinding, task taskView
 	return nil
 }
 
-func writeLogs(ctx context.Context, tx pgx.Tx, logs []publicLog) error {
+func writeLogs(ctx context.Context, tx pgx.Tx, logs []publicLog) ([]publicLog, error) {
+	inserted := make([]publicLog, 0, len(logs))
 	for _, log := range logs {
 		var stored string
 		err := tx.QueryRow(ctx, `
@@ -447,16 +467,38 @@ func writeLogs(ctx context.Context, tx pgx.Tx, logs []publicLog) error {
 			continue
 		}
 		if !errors.Is(mapErr(err), ErrNotFound) {
-			return err
+			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO source_log_dedup (run_id, public_seq, payload_sha256, failure_text)
 			VALUES ($1, $2, $3, $4)`,
 			log.RunID, log.Seq, log.Hash, log.FailureText); err != nil {
-			return err
+			return nil, err
 		}
+		inserted = append(inserted, log)
 	}
-	return nil
+	return inserted, nil
+}
+
+// insertResumedLog stores one plain source log as a transcript row and the
+// business event that carries it. The row is not the turn's assistant reply:
+// it has no turn id, and this does not emit message.completed. A second read
+// of the same public seq does not call this.
+func insertResumedLog(ctx context.Context, tx pgx.Tx, binding TestBinding, text string) (BusinessEvent, error) {
+	ts := now()
+	msg, err := scanMessage(tx.QueryRow(ctx, `
+		INSERT INTO messages (
+			id, session_id, role, content, status, created_at, updated_at
+		) VALUES ($1, $2, 'assistant', $3, 'complete', $4, $4)
+		RETURNING `+messageCols,
+		uuid.NewString(), binding.ConversationID, text, ts,
+	))
+	if err != nil {
+		return BusinessEvent{}, err
+	}
+	return appendBusinessEvent(ctx, tx, binding.ConversationID, "message.created", msg.ID, map[string]any{
+		"message": msg,
+	})
 }
 
 func insertObservation(ctx context.Context, tx pgx.Tx, task taskView, messageID string) error {

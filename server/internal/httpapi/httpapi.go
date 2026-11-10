@@ -171,15 +171,15 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 		}
 	}
 	st := store.New(pool)
+	h := hub.New()
 	var resume func(context.Context) (int, error)
 	if live != nil && !cfg.DevFixture() {
 		workspace := cfg.MakezWorkspaceID
 		client := live.WithTimeout(resumeAttemptTimeout)
 		resume = func(ctx context.Context) (int, error) {
-			return resumeCommitted(ctx, st, client, workspace)
+			return resumeCommitted(ctx, st, client, workspace, h)
 		}
 	}
-	h := hub.New()
 	var hold *subscribeHold
 	if cfg.BusinessFixture {
 		hold = newSubscribeHold()
@@ -208,7 +208,7 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 // The owner and the bot are the stored rows. No new owner or binding is created.
 // A turn that has no task is left alone, so startup does not submit one.
 // A bot owned by someone else is not dialed. A source error does not stop the others.
-func resumeCommitted(ctx context.Context, st *store.Store, client *makez.Client, workspace string) (int, error) {
+func resumeCommitted(ctx context.Context, st *store.Store, client *makez.Client, workspace string, h *hub.Hub) (int, error) {
 	turns, err := st.LinkedTurns(ctx, workspace)
 	if err != nil {
 		return 0, err
@@ -230,8 +230,24 @@ func resumeCommitted(ctx context.Context, st *store.Store, client *makez.Client,
 			continue
 		}
 		log.Printf("startup resume workspace=%s task=%s after=%d", turn.Link.WorkspaceID, turn.Link.TaskID, after)
-		if _, err := makez.ResumeLinked(ctx, st, client, turn.Binding); err != nil {
+		result, err := makez.ResumeLinked(ctx, st, client, turn.Binding)
+		if err != nil {
 			log.Printf("startup resume task=%s: %s", turn.Link.TaskID, err)
+			continue
+		}
+		// The row is already committed. Publish is how a subscribed client
+		// sees a log that arrived after this process was listening. A client
+		// that was down reads the same row from its cursor.
+		for _, ev := range result.Project.Events {
+			item, err := ev.MarshalMap()
+			if err != nil {
+				log.Printf("startup resume publish task=%s: %s", turn.Link.TaskID, err)
+				continue
+			}
+			if h != nil {
+				h.Publish(turn.Binding.ConversationID, item)
+			}
+			log.Printf("startup resume published session=%s cursor=%d", turn.Binding.ConversationID, ev.Cursor)
 		}
 	}
 	return len(turns), nil

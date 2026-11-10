@@ -57,7 +57,7 @@ func ConsumeNoKey(ctx context.Context, st *store.Store, client *Client, binding 
 		result.Submitted = true
 	}
 	result.TaskID = link.TaskID
-	return readLinked(ctx, st, client, binding, link, result)
+	return readLinked(ctx, st, client, binding, link, result, false)
 }
 
 // ResumeLinked reads the public log from the stored seq for a task the turn
@@ -76,10 +76,10 @@ func ResumeLinked(ctx context.Context, st *store.Store, client *Client, binding 
 	if !found || link.TaskID == "" || link.RunID == "" {
 		return ConsumeResult{}, fmt.Errorf("startup resume has no linked task")
 	}
-	return readLinked(ctx, st, client, binding, link, ConsumeResult{TaskID: link.TaskID, RunID: link.RunID})
+	return readLinked(ctx, st, client, binding, link, ConsumeResult{TaskID: link.TaskID, RunID: link.RunID}, true)
 }
 
-func readLinked(ctx context.Context, st *store.Store, client *Client, binding store.LiveBinding, link store.ServiceLink, result ConsumeResult) (ConsumeResult, error) {
+func readLinked(ctx context.Context, st *store.Store, client *Client, binding store.LiveBinding, link store.ServiceLink, result ConsumeResult, surfaceLogs bool) (ConsumeResult, error) {
 	after, err := st.AppliedPublicSeq(ctx, link)
 	if err != nil {
 		return result, err
@@ -110,6 +110,7 @@ func readLinked(ctx context.Context, st *store.Store, client *Client, binding st
 	projected, err := st.ProjectServiceRead(ctx, binding, store.ServiceRead{
 		SSE:              events,
 		AuthoritativeGET: body,
+		SurfaceLogs:      surfaceLogs,
 	}, store.FaultNone)
 	if err != nil {
 		return result, err

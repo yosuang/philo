@@ -105,8 +105,11 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal, afterStop
 
 	pool := connectDSN(t, dsn)
 	before := durableView(t, pool, conv, src)
-	if before.applied != 2 || before.processing != fixtureProcessingCursor || before.logs != 2 || before.high != 1 {
-		t.Fatalf("committed view = %+v", before)
+	if before.applied != 2 || before.processing != fixtureProcessingCursor || before.logs != 2 || before.high != 1 || before.assistants != 0 {
+		t.Fatalf("committed view = %+v kinds=%v", before, before.kinds)
+	}
+	if len(before.kinds) != 1 || before.kinds[0] != "message.created" {
+		t.Fatalf("business events before the kill = %#v", before.kinds)
 	}
 	if before.turnID != turn || before.userID != user["id"] || before.taskID != src.TaskID || !before.outboxUnsent {
 		t.Fatalf("committed identity = %+v", before)
@@ -192,8 +195,14 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal, afterStop
 	if after.outboxXmin != before.outboxXmin || !after.outboxUnsent {
 		t.Fatalf("outbox changed\nbefore %+v\nafter  %+v", before, after)
 	}
-	if after.applied != 3 || after.logs != 3 || after.assistants != 0 || after.high != before.high || after.taskID != before.taskID {
-		t.Fatalf("suffix view = %+v", after)
+	if after.applied != 3 || after.logs != 3 || after.assistants != 1 || after.high != before.high+1 || after.taskID != before.taskID {
+		t.Fatalf("suffix view = %+v kinds=%v", after, after.kinds)
+	}
+	if after.high == after.applied || strconv.FormatInt(after.high, 10) == after.processing {
+		t.Fatalf("business high-water collapsed into the source checkpoint: %+v", after)
+	}
+	if len(after.kinds) != 2 || after.kinds[0] != "message.created" || after.kinds[1] != "message.created" {
+		t.Fatalf("business events = %#v", after.kinds)
 	}
 	cursors := src.eventCursors()
 	emptyReads := 0
@@ -224,12 +233,15 @@ func resumeFixtureSource(t *testing.T, bin string, sig syscall.Signal, afterStop
 	}
 	assertNoAssistantSuccess(t, second.url, pool, conv)
 	snap := apiSnapshot(t, second.url, conv)
-	if snap["sessionId"] != conv || number(t, snap["highWater"]) != before.high {
+	if snap["sessionId"] != conv || number(t, snap["highWater"]) != before.high+1 {
 		t.Fatalf("snapshot = %#v", snap)
 	}
 	messages := snap["messages"].([]any)
-	if len(messages) != 1 || messages[0].(map[string]any)["id"] != user["id"] || messages[0].(map[string]any)["content"] != osKillContent {
+	if len(messages) != 2 || messages[0].(map[string]any)["id"] != user["id"] || messages[0].(map[string]any)["content"] != osKillContent {
 		t.Fatalf("messages = %#v", messages)
+	}
+	if messages[1].(map[string]any)["role"] != "assistant" || messages[1].(map[string]any)["content"] != fixtureSourceLogThree || messages[1].(map[string]any)["status"] != "complete" {
+		t.Fatalf("resumed log = %#v", messages[1])
 	}
 	if n := messagePostsTo(second.url); n != 0 {
 		t.Fatalf("replay ran because the harness posted %d messages to the new process", n)
@@ -592,6 +604,7 @@ type durableState struct {
 	checkpointXmin string
 	outboxXmin     string
 	outboxUnsent   bool
+	kinds          []string
 }
 
 func durableView(t *testing.T, pool *pgxpool.Pool, conv string, src *fixtureSource) durableState {
@@ -607,7 +620,7 @@ func durableView(t *testing.T, pool *pgxpool.Pool, conv string, src *fixtureSour
 			(SELECT count(*) FROM tasks WHERE session_id = s.id AND status = 'completed'),
 			(SELECT count(*) FROM terminal_observations),
 			u.id, u.content, t.id, t.makez_workspace_id, t.makez_run_id,
-			(SELECT id FROM business_events WHERE conversation_id = s.id AND event_type = 'message.created'),
+			(SELECT id FROM business_events WHERE conversation_id = s.id AND event_type = 'message.created' ORDER BY cursor ASC LIMIT 1),
 			o.id, o.xmin::text, (o.published_at IS NULL)
 		FROM sessions s
 		JOIN turns t ON t.conversation_id = s.id
@@ -669,7 +682,7 @@ func durableView(t *testing.T, pool *pgxpool.Pool, conv string, src *fixtureSour
 	if got.hashOne != fixtureLogHash(fixtureSourceLogOne) || got.hashTwo != fixtureLogHash(fixtureSourceLogTwo) {
 		t.Fatalf("logs seqs=%v hashes=%s %s", seqs, got.hashOne, got.hashTwo)
 	}
-	if got.userContent != osKillContent || got.assistants != 0 || got.completed != 0 || got.terminals != 0 {
+	if got.userContent != osKillContent || got.completed != 0 || got.terminals != 0 {
 		t.Fatalf("view = %+v", got)
 	}
 	var kinds []string
@@ -689,9 +702,7 @@ func durableView(t *testing.T, pool *pgxpool.Pool, conv string, src *fixtureSour
 	if err := kindRows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(kinds) != 1 || kinds[0] != "message.created" {
-		t.Fatalf("business events = %#v", kinds)
-	}
+	got.kinds = kinds
 	return got
 }
 
@@ -728,16 +739,26 @@ func businessView(t *testing.T, pool *pgxpool.Pool, conv string) businessState {
 
 func assertNoAssistantSuccess(t *testing.T, base string, pool *pgxpool.Pool, conv string) {
 	t.Helper()
+	logs := 0
 	for _, item := range apiMessages(t, base, conv) {
 		if item["role"] == "assistant" {
-			t.Fatalf("assistant = %#v", item)
+			// The resumed plain log is a transcript row. It is not a model
+			// reply and not a completed run.
+			if item["content"] != fixtureSourceLogThree || item["status"] != "complete" || item["error"] != nil {
+				t.Fatalf("assistant = %#v", item)
+			}
+			logs++
+			continue
 		}
 		if item["role"] == "user" && (item["content"] != osKillContent || item["status"] != "complete") {
 			t.Fatalf("user = %#v", item)
 		}
 	}
-	if scalar(t, pool, `SELECT count(*) FROM messages WHERE session_id = $1 AND role = 'assistant'`, conv) != 0 {
-		t.Fatal("assistant row")
+	if logs != 1 {
+		t.Fatalf("resumed log rows = %d", logs)
+	}
+	if scalar(t, pool, `SELECT count(*) FROM messages WHERE session_id = $1 AND role = 'assistant' AND turn_id IS NOT NULL`, conv) != 0 {
+		t.Fatal("resumed log was stored as the turn reply")
 	}
 	if scalar(t, pool, `SELECT count(*) FROM tasks WHERE status = 'completed'`) != 0 {
 		t.Fatal("a task was marked completed")
