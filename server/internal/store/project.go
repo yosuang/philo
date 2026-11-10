@@ -232,9 +232,8 @@ func atFault(got, point FaultPoint) error {
 }
 
 func failureText(ctx context.Context, tx pgx.Tx, parsed parsedCapture) (string, error) {
-	if parsed.failureText != "" {
-		return parsed.failureText, nil
-	}
+	// The first stored public log wins. A later body at the same seq is not
+	// the message, even when that body is also a Pi failure line.
 	var stored string
 	err := tx.QueryRow(ctx, `
 		SELECT failure_text FROM source_log_dedup
@@ -246,6 +245,9 @@ func failureText(ctx context.Context, tx pgx.Tx, parsed parsedCapture) (string, 
 	}
 	if err != nil && !errors.Is(mapErr(err), ErrNotFound) {
 		return "", err
+	}
+	if parsed.failureText != "" {
+		return parsed.failureText, nil
 	}
 	return "AGENT_FAILED", nil
 }

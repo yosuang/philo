@@ -178,6 +178,39 @@ func TestStatusAndNonTerminalDoNotSucceed(t *testing.T) {
 	}
 }
 
+func TestConflictingPiFailureDoesNotReplaceTheStoredError(t *testing.T) {
+	srv, pool := startProduction(t, config.Config{})
+	conv, turn := seedUnavailableTurn(t, srv)
+	cap := store.CapturedNoKeyFailure()
+	st := store.New(pool)
+	if _, err := st.ProjectCapturedFailure(context.Background(), store.CaptureInput{
+		Binding:     testBinding(conv, turn),
+		DurableLogs: cap.PublicLog,
+	}, store.FaultNone); err != nil {
+		t.Fatal(err)
+	}
+	// Same public seq, and this body is itself a Pi failure. It must not
+	// become the assistant error. The stored log text stays the message.
+	replacement := `{"kind":"pi","record":{"id":"m1","type":"response","command":"prompt","success":false,"error":"REPLACED"}}`
+	if _, err := st.ProjectCapturedFailure(context.Background(), store.CaptureInput{
+		Binding:          testBinding(conv, turn),
+		DurableLogs:      appendSeq(t, cap.PublicLog, 1, replacement),
+		AuthoritativeGET: cap.TaskGET,
+	}, store.FaultNone); err != nil {
+		t.Fatal(err)
+	}
+	assertOneFailure(t, srv, pool, conv, turn)
+	var text string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT failure_text FROM source_log_dedup WHERE run_id = $1 AND public_seq = 1`, storeRun(),
+	).Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(text, "No API key found for the selected model.") || strings.Contains(text, "REPLACED") {
+		t.Fatalf("stored text = %q", text)
+	}
+}
+
 func TestLogThenTerminalKeepsTheCapturedError(t *testing.T) {
 	srv, pool := startProduction(t, config.Config{})
 	conv, turn := seedUnavailableTurn(t, srv)
