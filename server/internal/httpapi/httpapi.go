@@ -37,16 +37,80 @@ const (
 	maxContent      = 100000
 )
 
+const (
+	// resumeAttemptTimeout bounds one events read, including a body that never ends.
+	resumeAttemptTimeout = 2 * time.Second
+	// resumeInterval is the wait between attempts inside the fast budget. The loop does not spin.
+	resumeInterval = 200 * time.Millisecond
+	// resumeBudget is the fast phase. When it ends the process logs startup resume stopped.
+	// It is not the end of reading a source that is still linked.
+	resumeBudget = 12 * time.Second
+	// resumeSlowInterval is the wait after that stop. It is long enough that the loop is not busy.
+	resumeSlowInterval = 2 * time.Second
+)
+
 // App is the session server handler.
 type App struct {
 	Handler http.Handler
 	engine  *engine.Engine
+	resume  func(context.Context) (int, error)
 }
 
 // Stop cancels in-flight generations.
 func (a *App) Stop() {
 	if a != nil && a.engine != nil {
 		a.engine.Stop()
+	}
+}
+
+// ResumeCommitted reads fixture sources already linked on stored turns.
+// It does not submit a task. An unset binding does not dial out.
+// The count is how many owned turns were eligible. A source error is logged
+// and does not discard the rest of the list.
+func (a *App) ResumeCommitted(ctx context.Context) (int, error) {
+	if a == nil || a.resume == nil {
+		return 0, nil
+	}
+	return a.resume(ctx)
+}
+
+// WatchCommitted reads linked fixture sources beside listen.
+// The first 12 seconds use a short interval. That phase logs startup resume
+// stopped and does not abandon a turn that is still linked. Later reads wait
+// resumeSlowInterval, and each read still stops at resumeAttemptTimeout.
+// No owned turn means stop. An unset binding never enters this loop.
+func (a *App) WatchCommitted(ctx context.Context) {
+	if a == nil || a.resume == nil {
+		return
+	}
+	deadline := time.Now().Add(resumeBudget)
+	slow := false
+	for {
+		attempt, cancel := context.WithTimeout(ctx, resumeAttemptTimeout)
+		n, err := a.resume(attempt)
+		cancel()
+		if err != nil {
+			log.Printf("startup resume: %s", err)
+		}
+		if n == 0 || ctx.Err() != nil {
+			log.Printf("startup resume stopped linked=%d", n)
+			return
+		}
+		interval := resumeInterval
+		if !time.Now().Before(deadline) {
+			if !slow {
+				slow = true
+				log.Printf("startup resume stopped linked=%d", n)
+			}
+			interval = resumeSlowInterval
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 
@@ -107,6 +171,14 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 		}
 	}
 	st := store.New(pool)
+	var resume func(context.Context) (int, error)
+	if live != nil && !cfg.DevFixture() {
+		workspace := cfg.MakezWorkspaceID
+		client := live.WithTimeout(resumeAttemptTimeout)
+		resume = func(ctx context.Context) (int, error) {
+			return resumeCommitted(ctx, st, client, workspace)
+		}
+	}
 	h := hub.New()
 	var hold *subscribeHold
 	if cfg.BusinessFixture {
@@ -129,7 +201,40 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 	}
 	mux := http.NewServeMux()
 	s.routes(mux)
-	return &App{Handler: mux, engine: eng}, nil
+	return &App{Handler: mux, engine: eng, resume: resume}, nil
+}
+
+// resumeCommitted continues each owned turn that already stores a task in workspace.
+// The owner and the bot are the stored rows. No new owner or binding is created.
+// A turn that has no task is left alone, so startup does not submit one.
+// A bot owned by someone else is not dialed. A source error does not stop the others.
+func resumeCommitted(ctx context.Context, st *store.Store, client *makez.Client, workspace string) (int, error) {
+	turns, err := st.LinkedTurns(ctx, workspace)
+	if err != nil {
+		return 0, err
+	}
+	log.Printf("startup resume linked=%d", len(turns))
+	for _, turn := range turns {
+		owned, err := st.AgentOwnedBy(ctx, turn.Binding.BotID, turn.Binding.OwnerID)
+		if err != nil {
+			log.Printf("startup resume owner check task=%s: %s", turn.Link.TaskID, err)
+			continue
+		}
+		if !owned {
+			log.Printf("startup resume skipped foreign bot task=%s", turn.Link.TaskID)
+			continue
+		}
+		after, err := st.AppliedPublicSeq(ctx, turn.Link)
+		if err != nil {
+			log.Printf("startup resume checkpoint task=%s: %s", turn.Link.TaskID, err)
+			continue
+		}
+		log.Printf("startup resume workspace=%s task=%s after=%d", turn.Link.WorkspaceID, turn.Link.TaskID, after)
+		if _, err := makez.ResumeLinked(ctx, st, client, turn.Binding); err != nil {
+			log.Printf("startup resume task=%s: %s", turn.Link.TaskID, err)
+		}
+	}
+	return len(turns), nil
 }
 
 func newAdapter(cfg config.Config) (adapter.Adapter, error) {

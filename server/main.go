@@ -46,6 +46,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Resume runs beside listen. A hung or failed source uses the attempt
+	// timeout and the budget. It does not decide whether the process listens.
+	go app.WatchCommitted(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

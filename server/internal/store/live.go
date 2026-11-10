@@ -128,6 +128,68 @@ func (s *Store) ServiceTask(ctx context.Context, binding LiveBinding) (ServiceLi
 	return link, true, nil
 }
 
+// LinkedTurn is one turn that already stores a task in the given workspace.
+// The owner and bot are the rows already stored. This list does not allocate either.
+type LinkedTurn struct {
+	Binding LiveBinding
+	Link    ServiceLink
+}
+
+// LinkedTurns returns turns whose stored task workspace is workspaceID.
+// A turn with no task id is omitted. The caller must not submit one for it.
+func (s *Store) LinkedTurns(ctx context.Context, workspaceID string) ([]LinkedTurn, error) {
+	if workspaceID == "" {
+		return nil, fmt.Errorf("workspace is required")
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT t.owner_id, t.conversation_id, t.id, a.id,
+		       t.makez_workspace_id, t.makez_task_id, t.makez_run_id
+		FROM turns t
+		JOIN sessions s ON s.id = t.conversation_id
+		JOIN agents a ON a.id = s.agent_id AND a.owner_id = t.owner_id
+		WHERE t.makez_workspace_id = $1
+		  AND t.owner_id <> ''
+		  AND t.makez_task_id IS NOT NULL
+		  AND t.makez_run_id IS NOT NULL
+		ORDER BY t.created_at, t.id`, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LinkedTurn
+	for rows.Next() {
+		var owner, conversation, turn, bot, workspace, task, run string
+		if err := rows.Scan(&owner, &conversation, &turn, &bot, &workspace, &task, &run); err != nil {
+			return nil, err
+		}
+		out = append(out, LinkedTurn{
+			Binding: LiveBinding{
+				Label:          TestBindingLabel,
+				OwnerID:        owner,
+				ConversationID: conversation,
+				TurnID:         turn,
+				BotID:          bot,
+				WorkspaceID:    workspace,
+			},
+			Link: ServiceLink{WorkspaceID: workspace, TaskID: task, RunID: run},
+		})
+	}
+	return out, rows.Err()
+}
+
+// AgentOwnedBy reports whether the bot row belongs to ownerID.
+// A missing bot or a different owner is false. This does not create an owner.
+func (s *Store) AgentOwnedBy(ctx context.Context, botID, ownerID string) (bool, error) {
+	if botID == "" || ownerID == "" {
+		return false, nil
+	}
+	var owned bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND owner_id = $2)`,
+		botID, ownerID).Scan(&owned)
+	return owned, err
+}
+
 // AppliedPublicSeq is the Makez public log seq stored for this run.
 // It is not message.seq and not the business high-water. A missing row is 0.
 func (s *Store) AppliedPublicSeq(ctx context.Context, link ServiceLink) (int64, error) {

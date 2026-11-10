@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 var errIncomplete = errors.New("incomplete makez client")
@@ -42,6 +43,17 @@ func NewClient(baseURL, token, workspace string) (*Client, error) {
 		WorkspaceID: workspace,
 		HTTP:        &http.Client{},
 	}, nil
+}
+
+// WithTimeout returns a client whose calls stop when d elapses.
+// The submit client is unchanged. Resume uses this bound.
+func (c *Client) WithTimeout(d time.Duration) *Client {
+	if c == nil {
+		return nil
+	}
+	next := *c
+	next.HTTP = &http.Client{Timeout: d}
+	return &next
 }
 
 // Submitted is the task id, and the run id when the response has one.
