@@ -1119,6 +1119,7 @@ func (s *server) fixtureBusiness(w http.ResponseWriter, r *http.Request) {
 		MessageID:      body.MessageID,
 		Text:           body.Text,
 		Status:         body.Status,
+		ActorID:        p.ActorID,
 	})
 	if err != nil {
 		s.storeErr(w, err, "session not found")

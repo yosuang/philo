@@ -57,6 +57,8 @@ An unknown adapter value refuses to start. `PHILO_MODEL_ADAPTER=provider` does n
 
 Without that fixture, a submit stores the user message, a turn, a wake intent, and an outbox row. Execution is `unavailable`. No assistant stream is started.
 
+`PHILO_BUSINESS_FIXTURE=fixture-business-source` also accepts `type` `fixture.running-task` on `POST /v1/fixture-business-source`. That stores one task at `running` whose `source` is `fixture-business-source`, plus an approved card whose snapshot names that fixture. The anchor message is an error row, not an assistant success. The route does not call Makez and does not complete the task. A later user message is still stored, and the task keeps status `running`. Unset, that route is not mounted and a submit stays `execution` `unavailable`.
+
 ## Approval and Makez
 
 `POST /v1/approvals/{id}/decision` with `{"decision":"approve"}` stores the approval as approved and inserts a task `{status:"running", source:"philo-server"}`. Production does not mark that task completed. `reject` stores the approval as rejected and creates no task. The bearer owner must own the conversation. A body field named `owner` or `requester` is not a credential and does not replace the snapshot. `POST /v1/approvals/{id}/edit` with a new summary invalidates that card and stores a new pending card. The old card cannot approve the edited action. Makez is not called. Philo does not declare a run complete.
