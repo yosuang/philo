@@ -53,13 +53,13 @@ An unknown adapter value refuses to start. `PHILO_MODEL_ADAPTER=provider` does n
 
 ## Adapter behavior
 
-`PHILO_EXECUTION_FIXTURE=dev` streams a fixed local reply. Assistant messages carry `metadata.adapter` of `dev`. The text starts with `[philo dev adapter]` and says it is not a live model. A user message that starts with `/draft ` (slash, draft, space) and has a non-empty summary creates one pending approval of kind `draft_action` after the reply finishes. The summary is the rest of the first line. An empty summary creates no approval. Canceling before the reply finishes creates no approval. That fixture also completes its local task after an explicit approve. It is not production and not acceptance.
+`PHILO_EXECUTION_FIXTURE=dev` streams a fixed local reply. Assistant messages carry `metadata.adapter` of `dev`. The text starts with `[philo dev adapter]` and says it is not a live model. A user message that starts with `/draft ` (slash, draft, space) and has a non-empty summary creates one pending approval of kind `draft_action` after the reply finishes. The summary is the rest of the first line. That card stores the summary as its action snapshot and the bearer actor as its requester. An empty summary creates no approval. Canceling before the reply finishes creates no approval. That fixture also completes its local task after an explicit approve. The result does not change the card. It is not production and not acceptance.
 
 Without that fixture, a submit stores the user message, a turn, a wake intent, and an outbox row. Execution is `unavailable`. No assistant stream is started.
 
 ## Approval and Makez
 
-`POST /v1/approvals/{id}/decision` with `{"decision":"approve"}` stores the approval as approved and inserts a task `{status:"running", source:"philo-server"}`. Production does not mark that task completed. `reject` stores the approval as rejected and creates no task. Makez is not called. Philo does not declare a run complete.
+`POST /v1/approvals/{id}/decision` with `{"decision":"approve"}` stores the approval as approved and inserts a task `{status:"running", source:"philo-server"}`. Production does not mark that task completed. `reject` stores the approval as rejected and creates no task. The bearer owner must own the conversation. A body field named `owner` or `requester` is not a credential and does not replace the snapshot. `POST /v1/approvals/{id}/edit` with a new summary invalidates that card and stores a new pending card. The old card cannot approve the edited action. Makez is not called. Philo does not declare a run complete.
 
 `GET /v1/connectors` lists Makez. It is connected only when `PHILO_MAKEZ_URL` is set and that GET returns a 2xx status. Otherwise it is disconnected, with the reason on the connector object. A failed check is never reported as connected.
 
@@ -85,4 +85,4 @@ Assistant messages include `metadata.adapter`. Failures include `error.code` and
 
 ## Not in this server
 
-Attachments, notifications, skills, memory, routines, connector OAuth, and Makez execution are not implemented. There are no sample agents, sample chats, or fake tool traces. Idempotency retention, the owner-to-Makez-workspace binding, and source-offset recovery are not decided here. This server does not ingest Makez or recover an attempt.
+Attachments, notifications, skills, memory, routines, connector OAuth, and Makez execution are not implemented. There are no sample agents, sample chats, or fake tool traces. Idempotency retention, the owner-to-Makez-workspace binding, and source-offset recovery are not decided here. The approval card does not choose a production identity, a lease, or the field that binds a snapshot to a Run. This server does not ingest Makez or recover an attempt.

@@ -99,8 +99,9 @@ func (e *Engine) Cancel(ctx context.Context, sessionID string) (store.Message, e
 	}
 }
 
-// Decide records approve or reject. Approve starts a philo-server task that
-// then stores its own result. Reject creates no task.
+// Decide records approve or reject. Approve stores a local philo-server task.
+// The dev fixture may later store a result. That result does not change the
+// card. Production does not complete the task. Reject creates no task.
 func (e *Engine) Decide(ctx context.Context, approvalID, decision string) (store.Approval, error) {
 	res, err := e.store.Decide(ctx, approvalID, decision)
 	if err != nil {
@@ -353,7 +354,7 @@ func (e *Engine) completeTask(taskID, summary string) {
 	result := "philo-server stored result for draft action: " + summary
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	task, err := e.store.CompleteTask(ctx, taskID, result)
+	task, err := e.store.RecordWorkerResult(ctx, taskID, store.WorkerClaim{Text: result})
 	if err != nil {
 		log.Printf("complete task %s: %v", taskID, err)
 		return

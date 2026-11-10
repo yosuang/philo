@@ -314,15 +314,26 @@ func (s *Store) FinishStreaming(ctx context.Context, messageID, kind, summary st
 			return Message{}, nil, false, err
 		}
 		if !exists {
-			row, err := insertApproval(ctx, tx, msg.SessionID, messageID, kind, summary, ts)
+			actor, err := requesterForMessage(ctx, tx, msg)
 			if err != nil {
 				return Message{}, nil, false, err
 			}
-			approval = &row
-			if _, err := appendBusinessEvent(ctx, tx, msg.SessionID, "approval.requested", msg.ID, map[string]any{
-				"approval": row,
-			}); err != nil {
-				return Message{}, nil, false, err
+			// No bearer actor is stored for this turn. Do not invent one.
+			if actor != "" {
+				snapshot, err := actionSnapshot(kind, summary)
+				if err != nil {
+					return Message{}, nil, false, err
+				}
+				row, err := insertApproval(ctx, tx, msg.SessionID, messageID, kind, summary, actor, snapshot, ts)
+				if err != nil {
+					return Message{}, nil, false, err
+				}
+				approval = &row
+				if _, err := appendBusinessEvent(ctx, tx, msg.SessionID, "approval.requested", msg.ID, map[string]any{
+					"approval": row,
+				}); err != nil {
+					return Message{}, nil, false, err
+				}
 			}
 		}
 	}
