@@ -4,12 +4,17 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/yosuang/philo/server/internal/config"
+	"github.com/yosuang/philo/server/internal/engine"
+	"github.com/yosuang/philo/server/internal/store"
 )
 
 // TestUserMessageStoredWhileFixtureTaskRuns approves a draft through the
@@ -56,9 +61,13 @@ func TestUserMessageStoredWhileFixtureTaskRuns(t *testing.T) {
 			t.Fatalf("approve changed the snapshot: %s %s", kind, summary)
 		}
 		taskID := waitRunningTask(t, srv, willa, cardID)
-		time.Sleep(200 * time.Millisecond)
-		if got := taskList(t, srv, willa); len(got) != 1 || got[0]["id"] != taskID || got[0]["status"] != "running" || got[0]["source"] != "philo-server" || got[0]["result"] != "" {
-			t.Fatalf("task finished or changed: %#v", got)
+		workerPID := waitFixtureWorker(t)
+		if sessions := fixtureWorkerSessions(t, pool, taskID); sessions != 1 {
+			t.Fatalf("fixture worker sessions = %d", sessions)
+		}
+		startedAt := taskUpdatedAt(t, pool, taskID)
+		if !startedAt.After(taskCreatedAt(t, pool, taskID)) {
+			t.Fatal("fixture worker did not touch the running task")
 		}
 
 		const follow = "Willa sends while the task runs"
@@ -92,6 +101,9 @@ func TestUserMessageStoredWhileFixtureTaskRuns(t *testing.T) {
 		if len(tasks) != 1 || tasks[0]["id"] != taskID || tasks[0]["approvalId"] != cardID || tasks[0]["status"] != "running" || tasks[0]["source"] != "philo-server" || tasks[0]["result"] != "" {
 			t.Fatalf("task after send = %#v", tasks)
 		}
+		if !fixtureWorkerAlive(workerPID) {
+			t.Fatalf("fixture worker %d exited before the task finished", workerPID)
+		}
 		if cardEffects(t, pool, hugo) != beforeHugo {
 			t.Fatalf("other bot changed: before %+v after %+v", beforeHugo, cardEffects(t, pool, hugo))
 		}
@@ -105,6 +117,32 @@ func TestUserMessageStoredWhileFixtureTaskRuns(t *testing.T) {
 		}
 		if linked != 0 {
 			t.Fatal("worker fixture linked a Makez run")
+		}
+		finished := waitTaskStatus(t, srv, willa, taskID, "completed")
+		if finished["result"] != engine.FixtureWorkerResult {
+			t.Fatalf("fixture end = %#v", finished["result"])
+		}
+		if finished["source"] != "philo-server" || finished["approvalId"] != cardID {
+			t.Fatalf("finished task = %#v", finished)
+		}
+		if fixtureWorkerAlive(workerPID) {
+			t.Fatalf("fixture worker %d still alive after the task finished", workerPID)
+		}
+		cards = approvalList(t, srv, willa)
+		if len(cards) != 1 || cards[0]["id"] != cardID || cards[0]["status"] != "approved" || cards[0]["requesterActorId"] != testActor {
+			t.Fatalf("card after fixture end = %#v", cards)
+		}
+		if kind, summary := snapSummary(t, cards[0]); kind != "draft_action" || summary != "send the weekly note" {
+			t.Fatalf("snapshot after fixture end = %s %s", kind, summary)
+		}
+		if storedSnapshot(t, pool, cardID) != snapshotBefore {
+			t.Fatal("fixture end changed the snapshot")
+		}
+		if sessions := fixtureWorkerSessions(t, pool, taskID); sessions != 1 {
+			t.Fatalf("fixture worker session disappeared: %d", sessions)
+		}
+		if cardEffects(t, pool, hugo) != beforeHugo {
+			t.Fatalf("other bot changed after fixture end: %+v", cardEffects(t, pool, hugo))
 		}
 	})
 
@@ -195,6 +233,97 @@ func storedSnapshot(t *testing.T, pool *pgxpool.Pool, approvalID string) string 
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func waitTaskStatus(t *testing.T, srv *httptest.Server, sessionID, taskID, want string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, task := range taskList(t, srv, sessionID) {
+			if task["id"] == taskID && task["status"] == want {
+				return task
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("task %s did not become %s", taskID, want)
+	return nil
+}
+
+func fixtureWorkerSessions(t *testing.T, pool *pgxpool.Pool, taskID string) int {
+	t.Helper()
+	var n int
+	err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM logical_native_sessions
+		WHERE scope = 'worker' AND worker_run_ref = $1 AND harness_pin = $2`,
+		taskID, store.FixtureWorkerPin).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func taskCreatedAt(t *testing.T, pool *pgxpool.Pool, taskID string) time.Time {
+	t.Helper()
+	var created time.Time
+	if err := pool.QueryRow(context.Background(), `SELECT created_at FROM tasks WHERE id = $1`, taskID).Scan(&created); err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+func taskUpdatedAt(t *testing.T, pool *pgxpool.Pool, taskID string) time.Time {
+	t.Helper()
+	var updated time.Time
+	if err := pool.QueryRow(context.Background(), `SELECT updated_at FROM tasks WHERE id = $1`, taskID).Scan(&updated); err != nil {
+		t.Fatal(err)
+	}
+	return updated
+}
+
+func waitFixtureWorker(t *testing.T) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if pid := fixtureWorkerPID(); pid != 0 && fixtureWorkerAlive(pid) {
+			return pid
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("fixture worker process did not start")
+	return 0
+}
+
+func fixtureWorkerPID() int {
+	self := os.Getpid()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		status, err := os.ReadFile("/proc/" + entry.Name() + "/status")
+		if err != nil || !strings.Contains(string(status), "PPid:\t"+strconv.Itoa(self)+"\n") {
+			continue
+		}
+		cmd, err := os.ReadFile("/proc/" + entry.Name() + "/cmdline")
+		if err != nil || !strings.Contains(string(cmd), "philo-fixture-worker") {
+			continue
+		}
+		return pid
+	}
+	return 0
+}
+
+func fixtureWorkerAlive(pid int) bool {
+	if pid == 0 {
+		return false
+	}
+	_, err := os.Stat("/proc/" + strconv.Itoa(pid))
+	return err == nil
 }
 
 func hasUser(messages []map[string]any, content string) bool {

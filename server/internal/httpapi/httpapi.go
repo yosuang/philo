@@ -185,7 +185,7 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 		hold = newSubscribeHold()
 		h.SetAcker(hold)
 	}
-	eng := engine.New(st, ad, h, cfg.DevFixture(), cfg.FinishesFixtureTask())
+	eng := engine.New(st, ad, h, cfg.DevFixture(), cfg.FinishesFixtureTask(), cfg.WorkerFixture())
 	s := &server{
 		store:         st,
 		eng:           eng,

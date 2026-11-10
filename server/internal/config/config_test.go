@@ -31,15 +31,15 @@ func TestHealthAdapter(t *testing.T) {
 
 func TestWorkerFixtureDoesNotFinishTheTask(t *testing.T) {
 	worker := Config{ExecutionFixture: ExecutionFixtureWorker}
-	if !worker.DevFixture() || worker.FinishesFixtureTask() || worker.HealthAdapter() != "worker" {
+	if !worker.DevFixture() || !worker.WorkerFixture() || worker.FinishesFixtureTask() || worker.HealthAdapter() != "worker" {
 		t.Fatalf("worker fixture = %+v health %s", worker, worker.HealthAdapter())
 	}
 	dev := Config{ExecutionFixture: ExecutionFixtureDev}
-	if !dev.DevFixture() || !dev.FinishesFixtureTask() || dev.HealthAdapter() != "dev" {
+	if !dev.DevFixture() || !dev.FinishesFixtureTask() || dev.WorkerFixture() || dev.HealthAdapter() != "dev" {
 		t.Fatalf("dev fixture = %+v", dev)
 	}
 	unset := Config{}
-	if unset.DevFixture() || unset.FinishesFixtureTask() {
+	if unset.DevFixture() || unset.FinishesFixtureTask() || unset.WorkerFixture() {
 		t.Fatal("unset fixture opted in")
 	}
 }

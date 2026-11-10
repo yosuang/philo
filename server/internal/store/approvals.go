@@ -348,3 +348,12 @@ func (s *Store) RecordWorkerResult(ctx context.Context, taskID string, claim Wor
 func (s *Store) CompleteTask(ctx context.Context, id, result string) (Task, error) {
 	return s.RecordWorkerResult(ctx, id, WorkerClaim{Text: result})
 }
+
+// TouchRunningTask records that a fixture worker is in progress.
+// Status stays running. The approval is not changed.
+func (s *Store) TouchRunningTask(ctx context.Context, id string) (Task, error) {
+	return scanTask(s.pool.QueryRow(ctx, `
+		UPDATE tasks SET updated_at = $2
+		WHERE id = $1 AND status = 'running'
+		RETURNING `+taskCols, id, now()))
+}

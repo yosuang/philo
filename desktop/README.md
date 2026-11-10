@@ -108,7 +108,7 @@ nsh test approval-reconnect.test.tsx --target linux
 
 `approval-unset.test.tsx` leaves `PHILO_EXECUTION_FIXTURE` unset. A draft stays `Execution is unavailable.` and the chat has no approval card.
 
-`worker-message.test.tsx` uses `PHILO_EXECUTION_FIXTURE=worker`. That label is not Makez. The desktop sends `/draft`, then Approve. The server stores the pending card from that reply and the running `philo-server` task from the decision route. The task stays unfinished. The desktop then sends another message through the composer. The same snapshot, requester, and task id stay on that bot. The other bot does not show them. Leave `PHILO_TEST_EDIT_SUMMARY` unset. There is no editor.
+`worker-message.test.tsx` uses `PHILO_EXECUTION_FIXTURE=worker`. That label is not Makez. The desktop sends `/draft`, then Approve. The server stores the pending card from that reply and the running `philo-server` task from the decision route. The task stays `running` while a `philo-fixture-worker` process is alive. The desktop then sends another message through the composer. The same snapshot, requester, and task id stay on that bot. The other bot does not show them. When that process exits, the task shows the fixture result, which is not a model reply. Leave `PHILO_TEST_EDIT_SUMMARY` unset. There is no editor.
 
 ```bash
 nsh test approval-unset.test.tsx --target linux

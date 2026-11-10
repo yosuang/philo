@@ -16,8 +16,9 @@ const (
 	defaultChunkDelay      = 40 * time.Millisecond
 	// ExecutionFixtureDev is the isolated dev adapter. It also finishes its local task.
 	ExecutionFixtureDev = "dev"
-	// ExecutionFixtureWorker runs that same draft path and leaves the approved task running.
-	// It is not Makez and it does not write the task row itself.
+	// ExecutionFixtureWorker runs that same draft path, starts a fixture-worker
+	// process, and finishes the philo-server task only when that process exits.
+	// It is not Makez and it is not a model reply.
 	ExecutionFixtureWorker = "worker"
 	// TestMakezBinding is the only label that may call Makez.
 	// It is not a production owner-to-workspace identity.
@@ -78,15 +79,21 @@ func FromEnv() (Config, error) {
 }
 
 // DevFixture reports whether this process opted into the isolated draft adapter.
-// dev finishes its local task. worker leaves that task running.
+// dev finishes its local task after a short delay. worker starts a fixture process.
 func (c Config) DevFixture() bool {
 	return c.ExecutionFixture == ExecutionFixtureDev || c.ExecutionFixture == ExecutionFixtureWorker
 }
 
-// FinishesFixtureTask reports whether approve should store a local result.
-// The worker fixture does not. Production does not either.
+// FinishesFixtureTask reports whether approve stores the dev fixture result
+// after a short delay. The worker fixture does not use that delay.
 func (c Config) FinishesFixtureTask() bool {
 	return c.ExecutionFixture == ExecutionFixtureDev
+}
+
+// WorkerFixture reports whether approve starts the labeled fixture-worker process.
+// Production does not. This is not a Makez run.
+func (c Config) WorkerFixture() bool {
+	return c.ExecutionFixture == ExecutionFixtureWorker
 }
 
 // HealthAdapter is the adapter field on GET /v1/health.
