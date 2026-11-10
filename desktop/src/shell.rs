@@ -639,6 +639,16 @@ fn banners(store: Store) -> impl IntoElement {
                 )
             },
         ))
+        .child(when(
+            move || store.rebuilt_from_snapshot.get(),
+            || {
+                view().px_4().pb_2().child(
+                    text("Business cursor expired. This chat was rebuilt from the snapshot.")
+                        .text_size(px(13.0))
+                        .text_color(move || theme().foreground),
+                )
+            },
+        ))
         .child(error_line(store, true))
         .child(error_line(store, false))
 }

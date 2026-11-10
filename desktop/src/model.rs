@@ -541,6 +541,18 @@ fn optional_filtered(value: &Value, keys: &[&str]) -> Option<String> {
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_owned))
 }
 
+/// An expired cursor's snapshot already contains every event at or before
+/// its high water. Applying one of those events again appends a second copy.
+pub fn event_inside_snapshot(cursor: i64, high_water: i64) -> bool {
+    cursor > 0 && cursor <= high_water
+}
+
+/// The replacement snapshot becomes the transcript. It does not append onto it.
+pub fn replace_transcript(messages: &mut Vec<Message>, snapshot: Vec<Message>) {
+    *messages = snapshot;
+    sort_messages(messages);
+}
+
 fn encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
@@ -713,6 +725,29 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn expired_snapshot_replaces_and_does_not_cover_a_later_event() {
+        let mut messages = vec![Message {
+            id: "m".into(),
+            role: "assistant".into(),
+            content: "red".into(),
+            ..Message::default()
+        }];
+        replace_transcript(&mut messages, vec![Message {
+            id: "m".into(),
+            role: "assistant".into(),
+            content: "redgreen".into(),
+            status: "complete".into(),
+            ..Message::default()
+        }]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "redgreen");
+        assert!(event_inside_snapshot(2, 4));
+        assert!(event_inside_snapshot(4, 4));
+        assert!(!event_inside_snapshot(5, 4));
+        assert!(!event_inside_snapshot(0, 4));
     }
 
     #[test]

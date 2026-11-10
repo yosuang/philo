@@ -742,6 +742,7 @@ func (s *server) businessEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	events, snap, err := s.store.BusinessEventsAfter(r.Context(), p.OwnerID, id, after)
 	if errors.Is(err, store.ErrCursorExpired) {
+		log.Printf("business cursor expired session=%s after=%d high=%d", id, after, snap.HighWater)
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]string{
 				"code":    "invalid_request",
