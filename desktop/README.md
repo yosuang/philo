@@ -37,7 +37,7 @@ Settings shows the server URL. The default is `http://127.0.0.1:8080`. Saving it
 
 ## What the window does
 
-With the fixture unset, the banner says `Adapter: unavailable`. Create a bot (name, instructions, model id) and send a message. The user message stays in the transcript and the window says `Execution is unavailable.` There is no assistant reply. Switching bots restores each transcript. Reload reads that bot's messages again. Cancel posts `POST /v1/sessions/{id}/cancel` on the resumed server session. Retry appears only after an assistant message is `error` or `canceled`.
+With the fixture unset, the banner says `Adapter: unavailable`. Create a bot (name, instructions, model id) and send a message. The user message stays in the transcript and the window says `Execution is unavailable.` There is no assistant reply. Switching bots restores each transcript. Reload reads that bot's messages again. If the business cursor the client still holds is expired, the client applies the snapshot and high water from that HTTP 400 and does not append a second copy. The window says the chat was rebuilt from the snapshot. Cancel posts `POST /v1/sessions/{id}/cancel` on the resumed server session. Retry appears only after an assistant message is `error` or `canceled`.
 
 `PHILO_EXECUTION_FIXTURE=dev` is the isolated fixture. That process shows the development-adapter banner and streams a fixed local reply. It is not a production success. A message that starts with `/draft ` asks that fixture for one pending approval. Approve and Reject post `POST /v1/approvals/{id}/decision`. On the fixture, approve is what lets the server complete a `philo-server` task. Reject does not. Production does not create that approval.
 
@@ -61,6 +61,14 @@ nsh test session-loop.test.tsx --target linux
 ```
 
 That test needs `network: "live"`, `PHILO_ACTOR_TOKEN`, and the server on port 8080. It checks that a send stays `Execution is unavailable.` and does not show a dev-adapter reply. `nsh test` with no file also runs it, so start the server first or pass `App.test.tsx` only.
+
+`expired-cursor.test.tsx` is the expired business cursor. Leave `PHILO_EXECUTION_FIXTURE` unset. Set `PHILO_BUSINESS_FIXTURE=fixture-business-source`, which is the labeled fixture and not a model reply. Seed one fixture transcript, then delete the early business events so a cursor of `0` is expired. The desktop process needs `PHILO_ACTOR_TOKEN`.
+
+```bash
+nsh test expired-cursor.test.tsx --target linux
+```
+
+The window receives the HTTP 400 itself, replaces the transcript with that snapshot, and does not append the same text again. `Adapter: unavailable` stays up.
 
 ## Contract notes
 

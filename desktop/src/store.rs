@@ -12,8 +12,9 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::client::{self, BusinessReplay, WsCmd, WsEvent};
 use crate::model::{
-    Agent, Approval, Connector, DEFAULT_SERVER, Health, Message, Session, Task, normalize_base,
-    sort_messages, stored_status_for_event, transcript_summary,
+    Agent, Approval, Connector, DEFAULT_SERVER, Health, Message, Session, Task,
+    event_inside_snapshot, normalize_base, replace_transcript, sort_messages,
+    stored_status_for_event, transcript_summary,
 };
 
 const SERVER_KEY: &str = "serverUrl";
@@ -100,6 +101,8 @@ pub struct Store {
     pub appearance: Signal<AppearanceChoice>,
     pub sending: Signal<bool>,
     pub socket_label: Signal<String>,
+    /// Set when this chat was replaced from an expired-cursor snapshot.
+    pub rebuilt_from_snapshot: Signal<bool>,
     /// The third column. Closed matches the two-column chat layout.
     pub details_open: Signal<bool>,
     /// Library tab of the details column. Activity is the other tab.
@@ -149,6 +152,7 @@ impl Store {
             appearance: signal(AppearanceChoice::System),
             sending: signal(false),
             socket_label: signal("Events: connecting".to_owned()),
+            rebuilt_from_snapshot: signal(false),
             details_open: signal(false),
             library_tab: signal(false),
             ws_generation: signal(0),
@@ -279,6 +283,9 @@ impl Store {
             self.messages.set(Vec::new());
             self.approvals.set(Vec::new());
             self.tasks.set(Vec::new());
+            self.rebuilt_from_snapshot.set(false);
+            self.business_high_water.set(0);
+            self.applied_event_ids.with(|seen| seen.clear());
         }
         let generation = self.open_generation.get();
         let store = self;
@@ -353,6 +360,9 @@ impl Store {
                         store.messages.set(Vec::new());
                         store.approvals.set(Vec::new());
                         store.tasks.set(Vec::new());
+                        store.rebuilt_from_snapshot.set(false);
+                        store.business_high_water.set(0);
+                        store.applied_event_ids.with(|seen| seen.clear());
                     }
                     match client::list_agents(&url).await {
                         Ok(agents) => store.agents.set(agents),
@@ -655,31 +665,73 @@ impl Store {
     async fn load_transcript(self, session_id: String) {
         let url = self.server_url.get();
         let epoch = self.transcript_epoch.get();
-        let snapshot = client::snapshot(&url, &session_id).await;
         let tasks = client::list_tasks(&url, &session_id).await;
         if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
             return;
         }
-        let mut high_water = self.business_high_water.get();
-        match snapshot {
-            Ok(snap) if self.transcript_epoch.get() == epoch => {
-                high_water = snap.high_water;
-                self.install_snapshot(snap.messages, snap.approvals, snap.high_water);
-            }
-            Ok(_) => {}
-            Err(err) => self.action_error.set(Some(err)),
+        // Ask with the cursor this client still holds. A snapshot high water is
+        // not expired, so using it first never receives the replacement 400.
+        let held = if self.messages.with(Vec::is_empty) {
+            self.business_high_water.set(0);
+            self.applied_event_ids.with(|seen| seen.clear());
+            0
+        } else {
+            self.business_high_water.get()
+        };
+        if self.transcript_epoch.get() != epoch
+            || self.selected_session.get().as_deref() != Some(session_id.as_str())
+        {
+            return;
         }
-        if self.selected_session.get().as_deref() == Some(session_id.as_str()) {
-            match client::business_events(&url, &session_id, high_water).await {
-                Ok(BusinessReplay::Events(events)) => {
-                    for event in events {
-                        self.apply(event);
+        match client::business_events(&url, &session_id, held).await {
+            Ok(BusinessReplay::Expired(snap)) => {
+                if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
+                let high = snap.high_water;
+                log::info!(
+                    "business cursor {held} expired; replacing transcript with snapshot high_water={high} messages={}",
+                    snap.messages.len()
+                );
+                self.install_snapshot(snap.messages, snap.approvals, high);
+                self.rebuilt_from_snapshot.set(true);
+                // The snapshot already includes every event at or before `high`.
+                // Only a later suffix is applied, so the snapshot text is not appended twice.
+                if let Ok(BusinessReplay::Events(events)) =
+                    client::business_events(&url, &session_id, high).await
+                {
+                    if self.selected_session.get().as_deref() == Some(session_id.as_str())
+                        && self.transcript_epoch.get() == epoch
+                    {
+                        for event in events {
+                            self.apply(event);
+                        }
                     }
                 }
-                Ok(BusinessReplay::Expired(snap)) => {
-                    self.install_snapshot(snap.messages, snap.approvals, snap.high_water);
+            }
+            Ok(BusinessReplay::Events(events)) => {
+                if self.selected_session.get().as_deref() != Some(session_id.as_str())
+                    || self.transcript_epoch.get() != epoch
+                {
+                    return;
                 }
-                Err(err) => log::warn!("business replay: {err}"),
+                self.rebuilt_from_snapshot.set(false);
+                for event in events {
+                    self.apply(event);
+                }
+            }
+            Err(err) => {
+                log::warn!("business replay: {err}");
+                if self.messages.with(Vec::is_empty) {
+                    if let Ok(snap) = client::snapshot(&url, &session_id).await {
+                        if self.selected_session.get().as_deref() == Some(session_id.as_str())
+                            && self.transcript_epoch.get() == epoch
+                            && self.messages.with(Vec::is_empty)
+                        {
+                            self.install_snapshot(snap.messages, snap.approvals, snap.high_water);
+                        }
+                    }
+                }
             }
         }
         if let Ok(tasks) = tasks {
@@ -906,12 +958,13 @@ impl Store {
 
     fn install_snapshot(
         self,
-        mut messages: Vec<Message>,
+        messages: Vec<Message>,
         approvals: Vec<Approval>,
         high_water: i64,
     ) {
-        sort_messages(&mut messages);
-        self.messages.set(messages);
+        let mut installed = Vec::new();
+        replace_transcript(&mut installed, messages);
+        self.messages.set(installed);
         self.approvals.set(approvals);
         self.business_high_water.set(high_water);
         self.applied_event_ids.with(|seen| seen.clear());
@@ -940,7 +993,7 @@ impl Store {
             } => (event_id, *cursor),
             _ => return false,
         };
-        if cursor > 0 && cursor <= self.business_high_water.get() {
+        if event_inside_snapshot(cursor, self.business_high_water.get()) {
             return true;
         }
         if event_id.is_empty() {

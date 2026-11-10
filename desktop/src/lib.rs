@@ -24,6 +24,7 @@ fn native(registry: &mut Registry) {
 /// Philo's root window.
 #[component]
 pub fn App() -> impl IntoElement {
+    let _ = env_logger::try_init();
     let store = Store::boot();
     set_title("Philo");
     set_frame(WindowFrame {

@@ -136,6 +136,7 @@ pub async fn business_events(
     let (status, text) = request("GET", &url, None).await?;
     let value = parse_json(&text)?;
     if status == 400 {
+        log::info!("business-events after={after} status=400");
         if let Some(snap) = value.get("snapshot") {
             return Ok(BusinessReplay::Expired(parse_snapshot(snap)?));
         }
