@@ -9,16 +9,19 @@ import (
 	"github.com/google/uuid"
 )
 
-const messageCols = `id, session_id, role, content, status, error_code, error_message, adapter, reply_to_id, created_at, updated_at`
+const messageCols = `id, session_id, role, content, status, error_code, error_message, adapter, reply_to_id, created_at, updated_at, seq, turn_id`
 
 func scanMessage(row scannable) (Message, error) {
 	var m Message
-	var code, emsg, adpt, reply *string
+	var code, emsg, adpt, reply, turn *string
 	if err := row.Scan(
 		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Status,
-		&code, &emsg, &adpt, &reply, &m.CreatedAt, &m.UpdatedAt,
+		&code, &emsg, &adpt, &reply, &m.CreatedAt, &m.UpdatedAt, &m.Seq, &turn,
 	); err != nil {
 		return Message{}, mapErr(err)
+	}
+	if turn != nil {
+		m.TurnID = *turn
 	}
 	m.CreatedAt = m.CreatedAt.UTC()
 	m.UpdatedAt = m.UpdatedAt.UTC()
@@ -216,36 +219,58 @@ func (s *Store) AppendContent(ctx context.Context, messageID, text string) (bool
 }
 
 // MarkCanceled persists a cancel if the reply is still streaming.
+// The status change does not insert a message or allocate a seq.
 func (s *Store) MarkCanceled(ctx context.Context, messageID string) (Message, bool, error) {
-	msg, err := scanMessage(s.pool.QueryRow(ctx, `
-		UPDATE messages
-		SET status = 'canceled', updated_at = $2
-		WHERE id = $1 AND status = 'streaming'
-		RETURNING `+messageCols,
-		messageID, now(),
-	))
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return Message{}, false, nil
-		}
-		return Message{}, false, err
-	}
-	return msg, true, nil
+	return s.markTerminal(ctx, messageID, "canceled", "message.canceled", "", "")
 }
 
 // MarkError persists a generation failure if the reply is still streaming.
+// The status change does not insert a message or allocate a seq.
 func (s *Store) MarkError(ctx context.Context, messageID, code, message string) (Message, bool, error) {
-	msg, err := scanMessage(s.pool.QueryRow(ctx, `
-		UPDATE messages
-		SET status = 'error', error_code = $2, error_message = $3, updated_at = $4
-		WHERE id = $1 AND status = 'streaming'
-		RETURNING `+messageCols,
-		messageID, code, message, now(),
-	))
+	return s.markTerminal(ctx, messageID, "error", "message.error", code, message)
+}
+
+func (s *Store) markTerminal(ctx context.Context, messageID, status, eventType, code, message string) (Message, bool, error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
+		return Message{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var msg Message
+	var scanErr error
+	if status == "error" {
+		msg, scanErr = scanMessage(tx.QueryRow(ctx, `
+			UPDATE messages
+			SET status = 'error', error_code = $2, error_message = $3, updated_at = $4
+			WHERE id = $1 AND status = 'streaming'
+			RETURNING `+messageCols,
+			messageID, code, message, now(),
+		))
+	} else {
+		msg, scanErr = scanMessage(tx.QueryRow(ctx, `
+			UPDATE messages
+			SET status = 'canceled', updated_at = $2
+			WHERE id = $1 AND status = 'streaming'
+			RETURNING `+messageCols,
+			messageID, now(),
+		))
+	}
+	if scanErr != nil {
+		if errors.Is(scanErr, ErrNotFound) {
 			return Message{}, false, nil
 		}
+		return Message{}, false, scanErr
+	}
+	fields := map[string]any{"status": msg.Status}
+	if status == "error" {
+		fields["code"] = code
+		fields["message"] = message
+	}
+	if _, err := appendBusinessEvent(ctx, tx, msg.SessionID, eventType, msg.ID, fields); err != nil {
+		return Message{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return Message{}, false, err
 	}
 	return msg, true, nil
@@ -294,7 +319,17 @@ func (s *Store) FinishStreaming(ctx context.Context, messageID, kind, summary st
 				return Message{}, nil, false, err
 			}
 			approval = &row
+			if _, err := appendBusinessEvent(ctx, tx, msg.SessionID, "approval.requested", msg.ID, map[string]any{
+				"approval": row,
+			}); err != nil {
+				return Message{}, nil, false, err
+			}
 		}
+	}
+	if _, err := appendBusinessEvent(ctx, tx, msg.SessionID, "message.completed", msg.ID, map[string]any{
+		"status": "complete",
+	}); err != nil {
+		return Message{}, nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, nil, false, err

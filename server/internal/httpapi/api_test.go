@@ -11,12 +11,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/yosuang/philo/server/internal/adapter/dev"
+	"github.com/yosuang/philo/server/internal/auth"
 	"github.com/yosuang/philo/server/internal/config"
 	"github.com/yosuang/philo/server/internal/migrate"
 )
+
+const (
+	testToken = "philo-test-actor"
+	testActor = "actor-test"
+	testOwner = "owner-test"
+)
+
+func testCredentials() []auth.Credential {
+	return []auth.Credential{{Token: testToken, ActorID: testActor, OwnerID: testOwner}}
+}
 
 func TestUnknownAdapterIsRefused(t *testing.T) {
 	_, err := New(nil, config.Config{Adapter: "mystery"})
@@ -122,7 +135,12 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := migrate.Up(context.Background(), pool); err != nil {
 		t.Fatal(err)
 	}
-	app, err := New(pool, config.Config{Adapter: "dev", DevChunkDelay: time.Millisecond})
+	app, err := New(pool, config.Config{
+		Adapter:          "dev",
+		DevChunkDelay:    time.Millisecond,
+		ExecutionFixture: config.ExecutionFixtureDev,
+		Credentials:      testCredentials(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,34 +421,30 @@ func TestCanceledDraftCreatesNoApproval(t *testing.T) {
 
 func TestProviderMissingKeyDoesNotUseDev(t *testing.T) {
 	srv := start(t, config.Config{Adapter: "provider"})
-	status, body := do(t, srv, http.MethodGet, "/v1/health", nil)
-	if asMap(t, body)["adapter"] != "unconfigured" {
-		t.Fatalf("health = %s", body)
+	if asMap(t, mustGET(t, srv, "/v1/health"))["adapter"] == "dev" {
+		t.Fatal("provider health became dev")
 	}
 	sessionID := createSession(t, srv, createAgent(t, srv, "Ada"))
-	ws := subscribe(t, srv, sessionID)
-	status, body = do(t, srv, http.MethodPost, "/v1/sessions/"+sessionID+"/messages", map[string]any{"content": "/draft ship it"})
+	status, body := do(t, srv, http.MethodPost, "/v1/sessions/"+sessionID+"/messages", map[string]any{"content": "/draft ship it"})
 	if status != http.StatusOK {
 		t.Fatalf("post %d %s", status, body)
 	}
-	assistant := asMap(t, body)["assistantMessage"].(map[string]any)
-	if assistant["metadata"].(map[string]any)["adapter"] != "provider" {
-		t.Fatalf("metadata = %#v", assistant["metadata"])
+	posted := asMap(t, body)
+	if posted["execution"] != "unavailable" {
+		t.Fatalf("execution = %#v", posted["execution"])
 	}
-	ev, _ := ws.until(t, "message.error", 5*time.Second)
-	if ev["code"] != "provider_not_configured" {
-		t.Fatalf("event = %#v", ev)
+	if _, ok := posted["assistantMessage"]; ok {
+		t.Fatal("provider path created an assistant message")
 	}
-	if !strings.Contains(ev["message"].(string), "does not fall back") {
-		t.Fatalf("message = %#v", ev["message"])
+	status, body = do(t, srv, http.MethodGet, "/v1/sessions/"+sessionID+"/messages", nil)
+	if status != http.StatusOK {
+		t.Fatalf("messages %d %s", status, body)
 	}
-	got := pollStatus(t, srv, sessionID, assistant["id"].(string), "error")
-	apiErr := got["error"].(map[string]any)
-	if apiErr["code"] != "provider_not_configured" {
-		t.Fatalf("error = %#v", apiErr)
-	}
-	if strings.Contains(got["content"].(string), "not a live model") || strings.Contains(got["content"].(string), "dev adapter") {
-		t.Fatalf("fell back to dev: %q", got["content"])
+	for _, item := range asMap(t, body)["messages"].([]any) {
+		content, _ := item.(map[string]any)["content"].(string)
+		if strings.Contains(content, "not a live model") || strings.Contains(content, "dev adapter") {
+			t.Fatalf("fell back to dev: %q", content)
+		}
 	}
 	status, body = do(t, srv, http.MethodGet, "/v1/approvals?sessionId="+sessionID, nil)
 	if len(asMap(t, body)["approvals"].([]any)) != 0 {
@@ -456,23 +470,30 @@ func TestProviderStreamsRemoteText(t *testing.T) {
 		ProviderAPIKey:  "test-key",
 		ProviderBaseURL: upstream.URL,
 	})
-	if asMap(t, mustGET(t, srv, "/v1/health"))["adapter"] != "provider" {
-		t.Fatal("health adapter")
+	health := asMap(t, mustGET(t, srv, "/v1/health"))
+	if health["adapter"] == "dev" || health["adapter"] == "provider" {
+		t.Fatalf("health adapter = %#v", health["adapter"])
 	}
 	sessionID := createSession(t, srv, createAgent(t, srv, "Ada"))
-	ws := subscribe(t, srv, sessionID)
 	status, body := do(t, srv, http.MethodPost, "/v1/sessions/"+sessionID+"/messages", map[string]any{"content": "/draft ship it"})
 	if status != http.StatusOK {
 		t.Fatalf("post %d %s", status, body)
 	}
-	assistantID := asMap(t, body)["assistantMessage"].(map[string]any)["id"].(string)
-	ws.until(t, "message.completed", 5*time.Second)
-	got := pollStatus(t, srv, sessionID, assistantID, "complete")
-	if got["content"] != "alphabeta" || got["metadata"].(map[string]any)["adapter"] != "provider" {
-		t.Fatalf("message = %#v", got)
+	posted := asMap(t, body)
+	if posted["execution"] != "unavailable" {
+		t.Fatalf("execution = %#v", posted["execution"])
 	}
-	if !sawKey {
-		t.Fatal("provider was not called with the key")
+	if assistant, ok := posted["assistantMessage"]; ok {
+		t.Fatalf("provider path returned an assistant: %#v", assistant)
+	}
+	if sawKey {
+		t.Fatal("provider was called")
+	}
+	for _, item := range asMap(t, mustGET(t, srv, "/v1/sessions/"+sessionID+"/messages"))["messages"].([]any) {
+		content, _ := item.(map[string]any)["content"].(string)
+		if content == "alphabeta" || strings.Contains(content, "dev adapter") || strings.Contains(content, "not a live model") {
+			t.Fatalf("unexpected generated content %q", content)
+		}
 	}
 	if len(asMap(t, mustGET(t, srv, "/v1/approvals?sessionId="+sessionID))["approvals"].([]any)) != 0 {
 		t.Fatal("provider adapter created an approval")
@@ -512,11 +533,28 @@ func TestMakezHealthOnTheAPI(t *testing.T) {
 
 func start(t *testing.T, cfg config.Config) *httptest.Server {
 	t.Helper()
-	if cfg.Adapter == "" {
-		cfg.Adapter = "dev"
+	srv, _ := startConfigured(t, cfg, true)
+	return srv
+}
+
+func startProduction(t *testing.T, cfg config.Config) (*httptest.Server, *pgxpool.Pool) {
+	t.Helper()
+	if cfg.ExecutionFixture != "" {
+		t.Fatal("production starter must not enable the dev fixture")
 	}
-	if cfg.Adapter == "dev" && cfg.DevChunkDelay == 0 {
+	return startConfigured(t, cfg, false)
+}
+
+func startConfigured(t *testing.T, cfg config.Config, optIntoDevFixture bool) (*httptest.Server, *pgxpool.Pool) {
+	t.Helper()
+	if optIntoDevFixture && cfg.Adapter == "" && cfg.ExecutionFixture == "" {
+		cfg.ExecutionFixture = config.ExecutionFixtureDev
+	}
+	if cfg.ExecutionFixture == config.ExecutionFixtureDev && cfg.DevChunkDelay == 0 {
 		cfg.DevChunkDelay = 25 * time.Millisecond
+	}
+	if len(cfg.Credentials) == 0 {
+		cfg.Credentials = testCredentials()
 	}
 	pool := newDB(t)
 	app, err := New(pool, cfg)
@@ -528,7 +566,7 @@ func start(t *testing.T, cfg config.Config) *httptest.Server {
 		app.Stop()
 		srv.Close()
 	})
-	return srv
+	return srv, pool
 }
 
 func createAgent(t *testing.T, srv *httptest.Server, name string) string {
@@ -569,6 +607,10 @@ func do(t *testing.T, srv *httptest.Server, method, path string, body any) (int,
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	if method == http.MethodPost && strings.HasSuffix(path, "/messages") && req.Header.Get("Idempotency-Key") == "" {
+		req.Header.Set("Idempotency-Key", uuid.NewString())
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -689,7 +731,9 @@ type socket struct {
 func subscribe(t *testing.T, srv *httptest.Server, sessionID string) *socket {
 	t.Helper()
 	rawURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/v1/events"
-	conn, _, err := websocket.DefaultDialer.Dial(rawURL, nil)
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+testToken)
+	conn, _, err := websocket.DefaultDialer.Dial(rawURL, header)
 	if err != nil {
 		t.Fatal(err)
 	}

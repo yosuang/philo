@@ -121,6 +121,11 @@ func (s *Store) Decide(ctx context.Context, id, decision string) (Decision, erro
 		}
 		task = &row
 	}
+	if _, err := appendBusinessEvent(ctx, tx, approval.SessionID, "approval.updated", approval.MessageID, map[string]any{
+		"approval": approval,
+	}); err != nil {
+		return Decision{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Decision{}, err
 	}

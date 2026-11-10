@@ -20,23 +20,24 @@ func scanSession(row scannable) (Session, error) {
 	return sess, nil
 }
 
-// CreateSession inserts a session for an existing agent.
-func (s *Store) CreateSession(ctx context.Context, agentID, title string) (Session, error) {
-	if _, err := s.GetAgent(ctx, agentID); err != nil {
+// CreateSession inserts a non-default session for an agent the owner can access.
+// Historical rows stay off the default open path.
+func (s *Store) CreateSession(ctx context.Context, ownerID, agentID, title string) (Session, error) {
+	if _, err := s.RequireAgent(ctx, ownerID, agentID); err != nil {
 		return Session{}, err
 	}
 	ts := now()
 	return scanSession(s.pool.QueryRow(ctx, `
-		INSERT INTO sessions (id, agent_id, title, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $4)
+		INSERT INTO sessions (id, agent_id, title, is_default, created_at, updated_at)
+		VALUES ($1, $2, $3, FALSE, $4, $4)
 		RETURNING `+sessionCols,
 		uuid.NewString(), agentID, strings.TrimSpace(title), ts,
 	))
 }
 
 // ListSessions returns one agent's sessions, most recently updated first.
-func (s *Store) ListSessions(ctx context.Context, agentID string) ([]Session, error) {
-	if _, err := s.GetAgent(ctx, agentID); err != nil {
+func (s *Store) ListSessions(ctx context.Context, ownerID, agentID string) ([]Session, error) {
+	if _, err := s.RequireAgent(ctx, ownerID, agentID); err != nil {
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `

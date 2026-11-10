@@ -21,7 +21,10 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
-	cfg := config.FromEnv()
+	cfg, err := config.FromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
 	if cfg.DatabaseURL == "" {
 		log.Fatal("PHILO_DATABASE_URL is required")
 	}
@@ -59,7 +62,11 @@ func main() {
 		}
 	}()
 
-	log.Printf("philo session server listening on %s adapter=%s", cfg.HTTPAddr, cfg.Adapter)
+	execution := "unavailable"
+	if cfg.DevFixture() {
+		execution = "fixture-dev"
+	}
+	log.Printf("philo session server listening on %s execution=%s", cfg.HTTPAddr, execution)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

@@ -22,6 +22,12 @@ var (
 	ErrNotRetryable = errors.New("not retryable")
 	// ErrNotPending means the approval was already decided.
 	ErrNotPending = errors.New("not pending")
+	// ErrForbidden means the authenticated owner does not own the record.
+	ErrForbidden = errors.New("forbidden")
+	// ErrIdempotencyConflict means the scope is already bound to a different payload.
+	ErrIdempotencyConflict = errors.New("idempotency conflict")
+	// ErrCursorExpired means the business cursor is older than the retained log.
+	ErrCursorExpired = errors.New("business cursor expired")
 )
 
 // APIError is the persisted generation error.
@@ -35,12 +41,14 @@ type Metadata struct {
 	Adapter string `json:"adapter"`
 }
 
-// Agent is a configured assistant.
+// Agent is a configured assistant. OwnerID is the server tenant, not a
+// client-supplied credential and not a Makez workspace id.
 type Agent struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
 	Instructions string    `json:"instructions"`
 	ModelID      string    `json:"modelId"`
+	OwnerID      string    `json:"-"`
 	CreatedAt    time.Time `json:"createdAt"`
 	UpdatedAt    time.Time `json:"updatedAt"`
 }
@@ -54,16 +62,19 @@ type Session struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// Message is one transcript row.
+// Message is one transcript row. Seq orders messages in one conversation.
+// A status change does not allocate another seq.
 type Message struct {
 	ID        string    `json:"id"`
 	SessionID string    `json:"sessionId"`
+	Seq       int64     `json:"seq"`
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
 	Status    string    `json:"status"`
 	Error     *APIError `json:"error,omitempty"`
 	Metadata  *Metadata `json:"metadata,omitempty"`
 	ReplyToID string    `json:"-"`
+	TurnID    string    `json:"-"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }

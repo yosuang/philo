@@ -99,6 +99,9 @@ pub struct Message {
     pub id: String,
     #[serde(default)]
     pub session_id: String,
+    /// Conversation order. Not a timestamp and not the business cursor.
+    #[serde(default)]
+    pub seq: i64,
     #[serde(default)]
     pub role: String,
     #[serde(default)]
@@ -236,27 +239,50 @@ pub struct ErrorEnvelope {
 pub struct PostedMessages {
     pub user_message: Option<Message>,
     pub assistant_message: Option<Message>,
+    pub turn_id: String,
+    pub execution: String,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServerEvent {
     Delta {
+        event_id: String,
+        cursor: i64,
         message_id: String,
         session_id: String,
         text: String,
     },
     Completed {
+        event_id: String,
+        cursor: i64,
         message_id: String,
         session_id: String,
     },
     Failed {
+        event_id: String,
+        cursor: i64,
         message_id: String,
         session_id: String,
         message: String,
     },
     Canceled {
+        event_id: String,
+        cursor: i64,
         message_id: String,
         session_id: String,
+    },
+    Created {
+        event_id: String,
+        cursor: i64,
+        message: Message,
+    },
+    Updated {
+        event_id: String,
+        cursor: i64,
+        message_id: String,
+        session_id: String,
+        status: String,
     },
     Approval(Approval),
     Task(Task),
@@ -379,6 +405,22 @@ pub fn parse_posted(value: &Value) -> PostedMessages {
         assistant_message: value
             .get("assistantMessage")
             .and_then(|item| serde_json::from_value(item.clone()).ok()),
+        turn_id: optional(value, &["turnId", "turn_id"]),
+        execution: optional(value, &["execution"]),
+        replayed: value
+            .get("replayed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+/// `message.completed` is the event name. The stored status literal is `complete`.
+pub fn stored_status_for_event(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        "message.completed" => Some("complete"),
+        "message.error" => Some("error"),
+        "message.canceled" => Some("canceled"),
+        _ => None,
     }
 }
 
@@ -391,22 +433,42 @@ pub fn parse_event(text: &str) -> Result<ServerEvent, String> {
         .to_owned();
     match kind.as_str() {
         "message.delta" => Ok(ServerEvent::Delta {
+            event_id: event_id(&value),
+            cursor: event_cursor(&value),
             message_id: required(&value, &["messageId", "message_id"])?,
             session_id: required(&value, &["sessionId", "session_id"])?,
             text: optional(&value, &["text", "delta"]),
         }),
         "message.completed" => Ok(ServerEvent::Completed {
+            event_id: event_id(&value),
+            cursor: event_cursor(&value),
             message_id: required(&value, &["messageId", "message_id"])?,
             session_id: required(&value, &["sessionId", "session_id"])?,
         }),
         "message.error" => Ok(ServerEvent::Failed {
+            event_id: event_id(&value),
+            cursor: event_cursor(&value),
             message_id: required(&value, &["messageId", "message_id"])?,
             session_id: required(&value, &["sessionId", "session_id"])?,
             message: optional(&value, &["message", "error"]),
         }),
         "message.canceled" => Ok(ServerEvent::Canceled {
+            event_id: event_id(&value),
+            cursor: event_cursor(&value),
             message_id: required(&value, &["messageId", "message_id"])?,
             session_id: required(&value, &["sessionId", "session_id"])?,
+        }),
+        "message.created" => Ok(ServerEvent::Created {
+            event_id: event_id(&value),
+            cursor: event_cursor(&value),
+            message: parse_nested(&value, "message")?,
+        }),
+        "message.updated" => Ok(ServerEvent::Updated {
+            event_id: event_id(&value),
+            cursor: event_cursor(&value),
+            message_id: required(&value, &["messageId", "message_id"])?,
+            session_id: required(&value, &["sessionId", "session_id"])?,
+            status: optional(&value, &["status"]),
         }),
         "approval.requested" | "approval.updated" => {
             Ok(ServerEvent::Approval(parse_nested(&value, "approval")?))
@@ -417,17 +479,9 @@ pub fn parse_event(text: &str) -> Result<ServerEvent, String> {
     }
 }
 
+/// Orders a transcript by `seq` only. `created_at` and id are not the order.
 pub fn sort_messages(messages: &mut [Message]) {
-    if messages
-        .iter()
-        .all(|message| !message.created_at.is_empty())
-    {
-        messages.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then(left.id.cmp(&right.id))
-        });
-    }
+    messages.sort_by(|left, right| left.seq.cmp(&right.seq));
 }
 
 /// One line from the newest message, short enough for a bot row.
@@ -458,18 +512,12 @@ pub fn transcript_summary(messages: &[Message]) -> String {
         .unwrap_or_else(|| "No messages yet".to_owned())
 }
 
-pub fn sort_sessions_newest_first(sessions: &mut [Session]) {
-    if sessions
-        .iter()
-        .all(|session| !session.created_at.is_empty())
-    {
-        sessions.sort_by(|left, right| {
-            right
-                .created_at
-                .cmp(&left.created_at)
-                .then(left.id.cmp(&right.id))
-        });
-    }
+fn event_id(value: &Value) -> String {
+    optional(value, &["id", "eventId"])
+}
+
+fn event_cursor(value: &Value) -> i64 {
+    value.get("cursor").and_then(Value::as_i64).unwrap_or(0)
 }
 
 fn parse_nested<T: DeserializeOwned>(value: &Value, key: &str) -> Result<T, String> {
@@ -560,6 +608,8 @@ mod tests {
         assert_eq!(
             delta,
             ServerEvent::Delta {
+                event_id: String::new(),
+                cursor: 0,
                 message_id: "m".into(),
                 session_id: "s".into(),
                 text: "Hi".into(),
@@ -619,5 +669,163 @@ mod tests {
         let mut failed = assistant.clone();
         failed.status = "error".into();
         assert!(failed.can_retry());
+    }
+
+    #[test]
+    fn equal_created_at_orders_by_seq() {
+        let mut messages = vec![
+            Message {
+                id: "aaaa".into(),
+                seq: 2,
+                created_at: "2026-11-10T00:00:00Z".into(),
+                content: "second".into(),
+                ..Message::default()
+            },
+            Message {
+                id: "zzzz".into(),
+                seq: 1,
+                created_at: "2026-11-10T00:00:00Z".into(),
+                content: "first".into(),
+                ..Message::default()
+            },
+        ];
+        sort_messages(&mut messages);
+        assert_eq!(messages[0].id, "zzzz");
+        assert_eq!(messages[1].id, "aaaa");
+    }
+
+    #[test]
+    fn completed_event_maps_to_stored_complete() {
+        assert_eq!(
+            stored_status_for_event("message.completed"),
+            Some("complete")
+        );
+        let event = parse_event(
+            r#"{"type":"message.completed","id":"e1","cursor":4,"messageId":"m","sessionId":"s"}"#,
+        )
+        .unwrap();
+        match event {
+            ServerEvent::Completed {
+                event_id, cursor, ..
+            } => {
+                assert_eq!(event_id, "e1");
+                assert_eq!(cursor, 4);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reapplying_a_created_event_does_not_append() {
+        let raw = r#"{"type":"message.created","id":"e1","cursor":1,"messageId":"m","sessionId":"s","message":{"id":"m","sessionId":"s","seq":1,"role":"user","content":"Hello","status":"complete"}}"#;
+        let event = parse_event(raw).unwrap();
+        let mut messages = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        assert!(apply_business(&mut messages, &mut seen, &event));
+        assert!(!apply_business(&mut messages, &mut seen, &event));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].status, "complete");
+    }
+}
+
+#[cfg(test)]
+pub fn apply_business(
+    messages: &mut Vec<Message>,
+    seen: &mut std::collections::HashSet<String>,
+    event: &ServerEvent,
+) -> bool {
+    let (event_id, cursor, fresh) = match event {
+        ServerEvent::Created {
+            event_id,
+            cursor,
+            message,
+        } => {
+            if !claim(seen, event_id, *cursor) {
+                return false;
+            }
+            upsert(messages, message.clone());
+            (event_id.clone(), *cursor, true)
+        }
+        ServerEvent::Delta {
+            event_id,
+            cursor,
+            message_id,
+            session_id,
+            text,
+        } => {
+            if !claim(seen, event_id, *cursor) {
+                return false;
+            }
+            if let Some(message) = messages.iter_mut().find(|item| item.id == *message_id) {
+                message.content.push_str(text);
+            } else if !event_id.is_empty() {
+                messages.push(Message {
+                    id: message_id.clone(),
+                    session_id: session_id.clone(),
+                    role: "assistant".into(),
+                    content: text.clone(),
+                    status: "streaming".into(),
+                    ..Message::default()
+                });
+            } else {
+                messages.push(Message {
+                    id: message_id.clone(),
+                    session_id: session_id.clone(),
+                    role: "assistant".into(),
+                    content: text.clone(),
+                    status: "streaming".into(),
+                    ..Message::default()
+                });
+            }
+            (event_id.clone(), *cursor, true)
+        }
+        ServerEvent::Completed {
+            event_id,
+            cursor,
+            message_id,
+            ..
+        }
+        | ServerEvent::Updated {
+            event_id,
+            cursor,
+            message_id,
+            ..
+        } => {
+            if !claim(seen, event_id, *cursor) {
+                return false;
+            }
+            let status = match event {
+                ServerEvent::Completed { .. } => "complete",
+                ServerEvent::Updated { status, .. } => status.as_str(),
+                _ => "",
+            };
+            if let Some(message) = messages.iter_mut().find(|item| item.id == *message_id) {
+                if !status.is_empty() {
+                    message.status = status.to_owned();
+                }
+            }
+            (event_id.clone(), *cursor, true)
+        }
+        _ => return false,
+    };
+    let _ = (event_id, cursor, fresh);
+    sort_messages(messages);
+    true
+}
+
+#[cfg(test)]
+fn claim(seen: &mut std::collections::HashSet<String>, event_id: &str, _cursor: i64) -> bool {
+    if event_id.is_empty() {
+        return true;
+    }
+    seen.insert(event_id.to_owned())
+}
+
+#[cfg(test)]
+fn upsert(messages: &mut Vec<Message>, message: Message) {
+    if let Some(slot) = messages.iter_mut().find(|item| item.id == message.id) {
+        *slot = message;
+    } else {
+        messages.push(message);
     }
 }

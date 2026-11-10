@@ -25,6 +25,21 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	if dsn := strings.TrimSpace(os.Getenv("PHILO_TEST_DATABASE_URL")); dsn != "" {
+		adminDSN = dsn
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		var err error
+		adminPool, err = store.Connect(ctx, adminDSN)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "admin pool: %v\n", err)
+			os.Exit(1)
+		}
+		code := m.Run()
+		adminPool.Close()
+		os.Exit(code)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 

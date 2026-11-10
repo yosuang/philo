@@ -1,6 +1,6 @@
 //! Workspace state. Signals stay private to this module; pages call the methods.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,10 +10,10 @@ use nsh_core::storage::Storage;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use crate::client::{self, WsCmd, WsEvent};
+use crate::client::{self, BusinessReplay, WsCmd, WsEvent};
 use crate::model::{
     Agent, Approval, Connector, DEFAULT_SERVER, Health, Message, Session, Task, normalize_base,
-    sort_sessions_newest_first, transcript_summary,
+    sort_messages, stored_status_for_event, transcript_summary,
 };
 
 const SERVER_KEY: &str = "serverUrl";
@@ -108,9 +108,13 @@ pub struct Store {
     transcript_epoch: Signal<u64>,
     /// Bumps when the open bot changes so an older resume cannot overwrite it.
     open_generation: Signal<u64>,
-    /// One resume at a time, so the first visit creates a single server session.
+    /// One open at a time, so two local callers share the server default conversation.
     resume_lock: Stored<Arc<Mutex<()>>>,
     ws_out: Stored<Option<UnboundedSender<WsCmd>>>,
+    business_high_water: Signal<i64>,
+    applied_event_ids: Stored<HashSet<String>>,
+    submit_serial: Signal<u64>,
+    pending_submit: Stored<Option<(String, String, String)>>,
 }
 
 /// `spawn` cancels a task when its handle is dropped. Long-running work is
@@ -152,6 +156,10 @@ impl Store {
             open_generation: signal(0),
             resume_lock: stored(Arc::new(Mutex::new(()))),
             ws_out: stored(None),
+            business_high_water: signal(0),
+            applied_event_ids: stored(HashSet::new()),
+            submit_serial: signal(0),
+            pending_submit: stored(None),
         };
         if let Some(saved) = Storage::get_item(SERVER_KEY)
             && let Ok(url) = normalize_base(&saved)
@@ -416,18 +424,28 @@ impl Store {
                 store.sending.set(false);
                 return;
             }
-            let result = client::send_message(&store.server_url.get(), &session_id, &content).await;
+            let key = store.submit_key(&session_id, &content);
+            let result =
+                client::send_message(&store.server_url.get(), &session_id, &content, &key).await;
             store.sending.set(false);
             match result {
                 Ok(posted) => {
+                    store.clear_submit(&session_id, &content);
                     if store.selected_session.get().as_deref() != Some(session_id.as_str()) {
                         return;
                     }
+                    let unavailable =
+                        posted.assistant_message.is_none() && posted.execution == "unavailable";
                     if let Some(message) = posted.user_message {
                         store.upsert_message(message);
                     }
                     if let Some(message) = posted.assistant_message {
                         store.upsert_message(message);
+                    }
+                    if unavailable {
+                        store
+                            .action_error
+                            .set(Some("Execution is unavailable.".to_owned()));
                     }
                     store.remember_preview();
                     store.load_transcript(session_id).await;
@@ -565,7 +583,8 @@ impl Store {
             && self.open_generation.get() == generation
     }
 
-    /// Resume this bot's newest server session. Create one only when it has none.
+    /// Open the bot's server-side default conversation. The desktop does not
+    /// choose a session, and it does not keep a session list for navigation.
     async fn resume_bot(self, agent_id: String, generation: u64) {
         let lock = self.resume_lock.with(|lock| Arc::clone(lock));
         let _guard = lock.lock().await;
@@ -573,11 +592,8 @@ impl Store {
             return;
         }
         let url = self.server_url.get();
-        let mut sessions = match client::list_sessions(&url, &agent_id).await {
-            Ok(mut sessions) => {
-                sort_sessions_newest_first(&mut sessions);
-                sessions
-            }
+        let session = match client::open_conversation(&url, &agent_id).await {
+            Ok(session) => session,
             Err(err) => {
                 if self.still_opening(&agent_id, generation) {
                     self.action_error.set(Some(err));
@@ -588,32 +604,6 @@ impl Store {
         if !self.still_opening(&agent_id, generation) {
             return;
         }
-        let session = if let Some(latest) = sessions.first().cloned() {
-            latest
-        } else {
-            let title = self.selected_agent_name();
-            let title = if title.trim().is_empty() {
-                "Chat".to_owned()
-            } else {
-                title
-            };
-            match client::create_session(&url, &agent_id, &title).await {
-                Ok(session) => session,
-                Err(err) => {
-                    if self.still_opening(&agent_id, generation) {
-                        self.action_error.set(Some(err));
-                    }
-                    return;
-                }
-            }
-        };
-        if !self.still_opening(&agent_id, generation) {
-            return;
-        }
-        if !sessions.iter().any(|item| item.id == session.id) {
-            sessions.insert(0, session.clone());
-        }
-        self.sessions.set(sessions);
         let session_id = session.id.clone();
         self.selected_session.set(Some(session_id.clone()));
         self.subscribe(&session_id);
@@ -630,17 +620,13 @@ impl Store {
                 continue;
             }
             let url = self.server_url.get();
-            let summary = match client::list_sessions(&url, &agent.id).await {
-                Ok(mut sessions) => {
-                    sort_sessions_newest_first(&mut sessions);
-                    if let Some(session) = sessions.first() {
-                        match client::list_messages(&url, &session.id).await {
-                            Ok(messages) => transcript_summary(&messages),
-                            Err(_) => continue,
-                        }
-                    } else {
-                        "No messages yet".to_owned()
-                    }
+            let summary = match client::get_conversation(&url, &agent.id).await {
+                Ok(session) => match client::list_messages(&url, &session.id).await {
+                    Ok(messages) => transcript_summary(&messages),
+                    Err(_) => continue,
+                },
+                Err(err) if err.contains("not_found") || err.contains("404") => {
+                    "No messages yet".to_owned()
                 }
                 Err(_) => continue,
             };
@@ -669,27 +655,39 @@ impl Store {
     async fn load_transcript(self, session_id: String) {
         let url = self.server_url.get();
         let epoch = self.transcript_epoch.get();
-        let messages = client::list_messages(&url, &session_id).await;
-        let approvals = client::list_approvals(&url, &session_id).await;
+        let snapshot = client::snapshot(&url, &session_id).await;
         let tasks = client::list_tasks(&url, &session_id).await;
         if self.selected_session.get().as_deref() != Some(session_id.as_str()) {
             return;
         }
-        let loaded = messages.is_ok();
-        match messages {
-            Ok(messages) if self.transcript_epoch.get() == epoch => self.messages.set(messages),
+        let mut high_water = self.business_high_water.get();
+        match snapshot {
+            Ok(snap) if self.transcript_epoch.get() == epoch => {
+                high_water = snap.high_water;
+                self.install_snapshot(snap.messages, snap.approvals, snap.high_water);
+            }
             Ok(_) => {}
             Err(err) => self.action_error.set(Some(err)),
         }
-        if let Ok(approvals) = approvals {
-            self.approvals.set(approvals);
+        if self.selected_session.get().as_deref() == Some(session_id.as_str()) {
+            match client::business_events(&url, &session_id, high_water).await {
+                Ok(BusinessReplay::Events(events)) => {
+                    for event in events {
+                        self.apply(event);
+                    }
+                }
+                Ok(BusinessReplay::Expired(snap)) => {
+                    self.install_snapshot(snap.messages, snap.approvals, snap.high_water);
+                }
+                Err(err) => log::warn!("business replay: {err}"),
+            }
         }
         if let Ok(tasks) = tasks {
-            self.tasks.set(tasks);
+            if self.selected_session.get().as_deref() == Some(session_id.as_str()) {
+                self.tasks.set(tasks);
+            }
         }
-        if loaded {
-            self.remember_preview();
-        }
+        self.remember_preview();
     }
 
     fn reconnect(self) {
@@ -758,34 +756,80 @@ impl Store {
 
     fn apply(self, event: crate::model::ServerEvent) {
         use crate::model::ServerEvent;
+        if self.already_applied(&event) {
+            return;
+        }
         match event {
             ServerEvent::Delta {
+                event_id,
+                cursor,
                 message_id,
                 session_id,
                 text,
-            } => self.apply_delta(session_id, message_id, text),
+            } => {
+                self.apply_delta(session_id, message_id, text);
+                self.remember_event(&event_id, cursor);
+            }
             ServerEvent::Completed {
+                event_id,
+                cursor,
                 message_id,
                 session_id,
             } => {
-                self.set_status(&session_id, &message_id, "completed", None);
+                self.set_status(
+                    &session_id,
+                    &message_id,
+                    stored_status_for_event("message.completed").unwrap_or("complete"),
+                    None,
+                );
+                self.remember_event(&event_id, cursor);
                 self.reload_session(session_id);
             }
             ServerEvent::Failed {
+                event_id,
+                cursor,
                 message_id,
                 session_id,
                 message,
             } => {
                 self.set_status(&session_id, &message_id, "error", Some(message.clone()));
                 self.action_error.set(Some(message));
+                self.remember_event(&event_id, cursor);
                 self.reload_session(session_id);
             }
             ServerEvent::Canceled {
+                event_id,
+                cursor,
                 message_id,
                 session_id,
             } => {
                 self.set_status(&session_id, &message_id, "canceled", None);
+                self.remember_event(&event_id, cursor);
                 self.reload_session(session_id);
+            }
+            ServerEvent::Created {
+                event_id,
+                cursor,
+                message,
+            } => {
+                if self.selected_session.get().as_deref() == Some(message.session_id.as_str())
+                    || message.session_id.is_empty()
+                {
+                    self.upsert_message(message);
+                }
+                self.remember_event(&event_id, cursor);
+            }
+            ServerEvent::Updated {
+                event_id,
+                cursor,
+                message_id,
+                session_id,
+                status,
+            } => {
+                if !status.is_empty() {
+                    self.set_status(&session_id, &message_id, &status, None);
+                }
+                self.remember_event(&event_id, cursor);
             }
             ServerEvent::Approval(approval) => self.upsert_approval(approval),
             ServerEvent::Task(task) => self.upsert_task(task),
@@ -806,7 +850,7 @@ impl Store {
         self.messages.update(|list| {
             if let Some(message) = list.iter_mut().find(|message| message.id == message_id) {
                 message.content.push_str(&text);
-                if message.status.is_empty() || message.status == "completed" {
+                if message.status.is_empty() {
                     message.status = "streaming".to_owned();
                 }
             } else {
@@ -819,6 +863,7 @@ impl Store {
                     ..Message::default()
                 });
             }
+            sort_messages(list);
         });
         self.remember_preview();
     }
@@ -854,8 +899,99 @@ impl Store {
             } else {
                 list.push(message);
             }
+            sort_messages(list);
         });
         self.remember_preview();
+    }
+
+    fn install_snapshot(
+        self,
+        mut messages: Vec<Message>,
+        approvals: Vec<Approval>,
+        high_water: i64,
+    ) {
+        sort_messages(&mut messages);
+        self.messages.set(messages);
+        self.approvals.set(approvals);
+        self.business_high_water.set(high_water);
+        self.applied_event_ids.with(|seen| seen.clear());
+    }
+
+    fn already_applied(self, event: &crate::model::ServerEvent) -> bool {
+        use crate::model::ServerEvent;
+        let (event_id, cursor) = match event {
+            ServerEvent::Delta {
+                event_id, cursor, ..
+            }
+            | ServerEvent::Completed {
+                event_id, cursor, ..
+            }
+            | ServerEvent::Failed {
+                event_id, cursor, ..
+            }
+            | ServerEvent::Canceled {
+                event_id, cursor, ..
+            }
+            | ServerEvent::Created {
+                event_id, cursor, ..
+            }
+            | ServerEvent::Updated {
+                event_id, cursor, ..
+            } => (event_id, *cursor),
+            _ => return false,
+        };
+        if cursor > 0 && cursor <= self.business_high_water.get() {
+            return true;
+        }
+        if event_id.is_empty() {
+            return false;
+        }
+        self.applied_event_ids.with(|seen| seen.contains(event_id))
+    }
+
+    fn remember_event(self, event_id: &str, cursor: i64) {
+        if !event_id.is_empty() {
+            self.applied_event_ids.with(|seen| {
+                seen.insert(event_id.to_owned());
+            });
+        }
+        if cursor > self.business_high_water.get() {
+            self.business_high_water.set(cursor);
+        }
+    }
+
+    fn submit_key(self, session_id: &str, content: &str) -> String {
+        let mut reuse = None;
+        self.pending_submit.with(|pending| {
+            if let Some((session, body, key)) = pending {
+                if session == session_id && body == content {
+                    reuse = Some(key.clone());
+                }
+            }
+        });
+        if let Some(key) = reuse {
+            return key;
+        }
+        self.submit_serial.update(|n| *n += 1);
+        let key = format!("desktop-{}", self.submit_serial.get());
+        self.pending_submit.replace(Some((
+            session_id.to_owned(),
+            content.to_owned(),
+            key.clone(),
+        )));
+        key
+    }
+
+    fn clear_submit(self, session_id: &str, content: &str) {
+        self.pending_submit.with(|pending| {
+            let clear = matches!(
+                pending.as_ref(),
+                Some((session, body, _)) if session == session_id && body == content
+            );
+            if clear {
+                *pending = None;
+            }
+        });
     }
 
     fn upsert_agent(self, agent: Agent) {

@@ -26,17 +26,20 @@ type Engine struct {
 	ad    adapter.Adapter
 	hub   *hub.Hub
 
-	mu   sync.Mutex
-	runs map[string]context.CancelFunc
+	mu      sync.Mutex
+	runs    map[string]context.CancelFunc
+	fixture bool
 }
 
-// New builds an engine. ad is the only model adapter this process will call.
-func New(st *store.Store, ad adapter.Adapter, h *hub.Hub) *Engine {
+// New builds an engine. ad is the isolated fixture adapter when fixture is set.
+// Production does not call it and does not complete tasks from this process.
+func New(st *store.Store, ad adapter.Adapter, h *hub.Hub, fixture bool) *Engine {
 	return &Engine{
-		store: st,
-		ad:    ad,
-		hub:   h,
-		runs:  map[string]context.CancelFunc{},
+		store:   st,
+		ad:      ad,
+		hub:     h,
+		runs:    map[string]context.CancelFunc{},
+		fixture: fixture,
 	}
 }
 
@@ -106,7 +109,9 @@ func (e *Engine) Decide(ctx context.Context, approvalID, decision string) (store
 	e.publishApproval("approval.updated", res.Approval)
 	if res.Task != nil {
 		e.publishTask(*res.Task)
-		go e.completeTask(res.Task.ID, res.Approval.Summary)
+		if e.fixture {
+			go e.completeTask(res.Task.ID, res.Approval.Summary)
+		}
 	}
 	return res.Approval, nil
 }
@@ -119,6 +124,15 @@ func (e *Engine) Stop() {
 		cancel()
 		delete(e.runs, id)
 	}
+}
+
+// StartFixture starts the isolated dev adapter for one assistant row.
+// Production calls do not use it.
+func (e *Engine) StartFixture(messageID string) {
+	if e == nil || !e.fixture || e.ad == nil {
+		return
+	}
+	e.start(messageID)
 }
 
 func (e *Engine) start(messageID string) {
@@ -163,7 +177,7 @@ func (e *Engine) generate(ctx context.Context, messageID string) {
 		log.Printf("generate load %s: %v", messageID, err)
 		return
 	}
-	if msg.Status != "streaming" {
+	if msg.Status != "streaming" || e.ad == nil {
 		return
 	}
 	if msg.ReplyToID == "" {

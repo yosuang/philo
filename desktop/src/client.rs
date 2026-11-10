@@ -6,6 +6,8 @@ use futures_util::{SinkExt, StreamExt};
 use nsh_core::prelude::*;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 use crate::model::{
@@ -13,6 +15,17 @@ use crate::model::{
     endpoint, endpoint_query, events_url, explain_http, parse_agent, parse_approval, parse_event,
     parse_health, parse_json, parse_list, parse_posted, parse_session,
 };
+
+pub struct MaterializedSnapshot {
+    pub high_water: i64,
+    pub messages: Vec<Message>,
+    pub approvals: Vec<Approval>,
+}
+
+pub enum BusinessReplay {
+    Events(Vec<ServerEvent>),
+    Expired(MaterializedSnapshot),
+}
 
 pub enum WsCmd {
     Subscribe(String),
@@ -72,21 +85,6 @@ pub async fn update_agent(
     parse_agent(&value)
 }
 
-pub async fn list_sessions(base: &str, agent_id: &str) -> Result<Vec<Session>, String> {
-    let value = get_json(&endpoint_query(base, "/v1/sessions", "agentId", agent_id)?).await?;
-    parse_list(&value, "sessions")
-}
-
-pub async fn create_session(base: &str, agent_id: &str, title: &str) -> Result<Session, String> {
-    let value = send_json(
-        "POST",
-        &endpoint(base, "/v1/sessions")?,
-        json!({ "agentId": agent_id, "title": title }),
-    )
-    .await?;
-    parse_session(&value)
-}
-
 pub async fn list_messages(base: &str, session_id: &str) -> Result<Vec<Message>, String> {
     let value = get_json(&endpoint(
         base,
@@ -98,15 +96,92 @@ pub async fn list_messages(base: &str, session_id: &str) -> Result<Vec<Message>,
     Ok(messages)
 }
 
+pub async fn open_conversation(base: &str, agent_id: &str) -> Result<Session, String> {
+    let value = send_json(
+        "POST",
+        &endpoint(base, &format!("/v1/agents/{agent_id}/conversation"))?,
+        json!({}),
+    )
+    .await?;
+    parse_session(&value)
+}
+
+pub async fn get_conversation(base: &str, agent_id: &str) -> Result<Session, String> {
+    let value = get_json(&endpoint(
+        base,
+        &format!("/v1/agents/{agent_id}/conversation"),
+    )?)
+    .await?;
+    parse_session(&value)
+}
+
+pub async fn snapshot(base: &str, session_id: &str) -> Result<MaterializedSnapshot, String> {
+    let value = get_json(&endpoint(
+        base,
+        &format!("/v1/sessions/{session_id}/snapshot"),
+    )?)
+    .await?;
+    parse_snapshot(&value)
+}
+
+pub async fn business_events(
+    base: &str,
+    session_id: &str,
+    after: i64,
+) -> Result<BusinessReplay, String> {
+    let url = endpoint(
+        base,
+        &format!("/v1/sessions/{session_id}/business-events?after={after}"),
+    )?;
+    let (status, text) = request("GET", &url, None).await?;
+    let value = parse_json(&text)?;
+    if status == 400 {
+        if let Some(snap) = value.get("snapshot") {
+            return Ok(BusinessReplay::Expired(parse_snapshot(snap)?));
+        }
+        return Err(explain_http(status, &text));
+    }
+    if status < 200 || status >= 300 {
+        return Err(explain_http(status, &text));
+    }
+    let events = value
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut parsed = Vec::new();
+    for event in events {
+        parsed.push(parse_event(&event.to_string())?);
+    }
+    Ok(BusinessReplay::Events(parsed))
+}
+
+fn parse_snapshot(value: &Value) -> Result<MaterializedSnapshot, String> {
+    let mut messages: Vec<Message> = parse_list(value, "messages")?;
+    crate::model::sort_messages(&mut messages);
+    let approvals: Vec<Approval> = parse_list(value, "approvals").unwrap_or_default();
+    let high_water = value
+        .get("highWater")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "snapshot is missing highWater".to_owned())?;
+    Ok(MaterializedSnapshot {
+        high_water,
+        messages,
+        approvals,
+    })
+}
+
 pub async fn send_message(
     base: &str,
     session_id: &str,
     content: &str,
+    idempotency_key: &str,
 ) -> Result<PostedMessages, String> {
-    let value = send_json(
+    let value = send_json_headers(
         "POST",
         &endpoint(base, &format!("/v1/sessions/{session_id}/messages"))?,
-        json!({ "content": content }),
+        json!({ "content": content, "options": {} }),
+        &[("Idempotency-Key", idempotency_key)],
     )
     .await?;
     Ok(parse_posted(&value))
@@ -130,17 +205,6 @@ pub async fn retry(base: &str, message_id: &str) -> Result<(), String> {
     )
     .await?;
     Ok(())
-}
-
-pub async fn list_approvals(base: &str, session_id: &str) -> Result<Vec<Approval>, String> {
-    let value = get_json(&endpoint_query(
-        base,
-        "/v1/approvals",
-        "sessionId",
-        session_id,
-    )?)
-    .await?;
-    parse_list(&value, "approvals")
 }
 
 pub async fn decide(base: &str, id: &str, decision: &str) -> Result<Approval, String> {
@@ -179,7 +243,22 @@ pub fn drive_socket(
         };
         log::info!("connecting {url}");
         let mut pending = None;
-        let connect = tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(&url));
+        let request = match url.into_client_request() {
+            Ok(mut request) => {
+                if let Some(token) = actor_token() {
+                    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+                        request.headers_mut().insert("Authorization", value);
+                    }
+                }
+                request
+            }
+            Err(err) => {
+                let _ = events.send(WsEvent::Closed(err.to_string()));
+                return;
+            }
+        };
+        let connect =
+            tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(request));
         tokio::pin!(connect);
         let socket = loop {
             tokio::select! {
@@ -301,26 +380,63 @@ fn deliver(text: &str, events: &UnboundedSender<WsEvent>) -> Option<String> {
     }
 }
 
+fn actor_token() -> Option<String> {
+    std::env::var("PHILO_ACTOR_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+fn authorize(request: HttpRequest) -> HttpRequest {
+    match actor_token() {
+        Some(token) => request.header("Authorization", format!("Bearer {token}")),
+        None => request,
+    }
+}
+
 async fn get_json(url: &str) -> Result<Value, String> {
-    let response = fetch(HttpRequest::get(url).header("Accept", "application/json")).await?;
-    finish(response)
+    let (status, text) = request("GET", url, None).await?;
+    if !(200..300).contains(&status) {
+        return Err(explain_http(status, &text));
+    }
+    parse_json(&text)
 }
 
 async fn send_json(method: &str, url: &str, body: Value) -> Result<Value, String> {
-    let response = fetch(
-        HttpRequest::new(method, url)
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .body(body.to_string()),
-    )
-    .await?;
-    finish(response)
+    send_json_headers(method, url, body, &[]).await
 }
 
-fn finish(response: HttpResponse) -> Result<Value, String> {
-    let text = response.text();
-    if !response.ok() {
-        return Err(explain_http(response.status(), &text));
+async fn send_json_headers(
+    method: &str,
+    url: &str,
+    body: Value,
+    headers: &[(&str, &str)],
+) -> Result<Value, String> {
+    let (status, text) = request(method, url, Some((body, headers))).await?;
+    if !(200..300).contains(&status) {
+        return Err(explain_http(status, &text));
     }
     parse_json(&text)
+}
+
+async fn request(
+    method: &str,
+    url: &str,
+    body: Option<(Value, &[(&str, &str)])>,
+) -> Result<(u16, String), String> {
+    let mut http = authorize(
+        HttpRequest::new(method, url)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json"),
+    );
+    if let Some((_, headers)) = &body {
+        for (name, value) in *headers {
+            http = http.header(*name, *value);
+        }
+    }
+    if let Some((payload, _)) = body {
+        http = http.body(payload.to_string());
+    }
+    let response = fetch(http).await?;
+    Ok((response.status(), response.text()))
 }
