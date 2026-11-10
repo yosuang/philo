@@ -39,7 +39,7 @@ Settings shows the server URL. The default is `http://127.0.0.1:8080`. Saving it
 
 With the fixture unset, the banner says `Adapter: unavailable`. Create a bot (name, instructions, model id) and send a message. The user message stays in the transcript and the window says `Execution is unavailable.` There is no assistant reply. Switching bots restores each transcript. Reload reads that bot's messages again. If the business cursor the client still holds is expired, the client applies the snapshot and high water from that HTTP 400 and does not append a second copy. The window says the chat was rebuilt from the snapshot. Cancel posts `POST /v1/sessions/{id}/cancel` on the resumed server session. Retry appears only after an assistant message is `error` or `canceled`.
 
-`PHILO_EXECUTION_FIXTURE=dev` is the isolated fixture. That process shows the development-adapter banner and streams a fixed local reply. It is not a production success. A message that starts with `/draft ` asks that fixture for one pending approval. Approve and Reject post `POST /v1/approvals/{id}/decision`. On the fixture, approve is what lets the server complete a `philo-server` task. Reject does not. Production does not create that approval.
+`PHILO_EXECUTION_FIXTURE=dev` is the isolated fixture. That process shows the development-adapter banner and streams a fixed local reply. It is not a production success and it is not Makez. A message that starts with `/draft ` asks that fixture for one pending approval. The chat shows that card from the server: the action snapshot and the stored status. Approve and Reject are shown only while the card is pending and still has a snapshot. They post `POST /v1/approvals/{id}/decision`. There is no editor for the action. `PHILO_TEST_EDIT_SUMMARY`, when set, is one replacement summary. The client posts it to `POST /v1/approvals/{id}/edit`, posts a decision for the old id, and replaces the cards with `GET /v1/approvals`. Production leaves that variable unset, and then the client does not edit. An edit marks the old card `invalid`. That card cannot be approved. The new card shows the new snapshot. On the fixture, approve is what lets the server complete a `philo-server` task for the snapshot it stored. Reject does not. With the fixture unset, a draft stays `Execution is unavailable.` and creates no card.
 
 Connectors shows Makez as not connected, with the server's reason, unless `PHILO_MAKEZ_URL` is set and healthy. Attachments, notifications, skills, memory, routines, tool-call transcripts, and connector sign-in are real pages that say they are not available yet.
 
@@ -92,6 +92,18 @@ nsh test subscribe-gap.test.tsx --target linux
 
 ```bash
 nsh test reconnect-cursor.test.tsx --target linux
+```
+
+`approval-card.test.tsx` sends `/draft` through the chat to a server with `PHILO_EXECUTION_FIXTURE=dev`. Set `PHILO_TEST_EDIT_SUMMARY` to the replacement summary. The card that appears is the one the API and the store saved, including its action snapshot. The client posts that summary to the production edit route and reads the cards back. The old card stays `invalid` and a decision on it is `approval_not_pending`. The new card shows the new snapshot. Approving uses the Approve control. The window has no editor. The fixture is not Makez.
+
+```bash
+nsh test approval-card.test.tsx --target linux
+```
+
+`approval-unset.test.tsx` leaves `PHILO_EXECUTION_FIXTURE` unset. A draft stays `Execution is unavailable.` and the chat has no approval card.
+
+```bash
+nsh test approval-unset.test.tsx --target linux
 ```
 
 `client-restart.test.tsx` opens one bot chat, then kills the Philo process with SIGKILL after the labeled fixture source is committed and starts another process on the same database. The open client catches up by itself. It does not send the message again and it does not press Reconnect. A log armed while the process is down and a log armed after the new process is listening each show once in that bot's chat. The other bot's business cursor stays where it was. The source is `test-fixture-source`, the fixture the server resume already reads. It is not live Makez. Leave `PHILO_EXECUTION_FIXTURE` and `PHILO_MAKEZ_URL` unset. The desktop process needs `PHILO_ACTOR_TOKEN` and `PHILO_RESTART_URL` pointing at `restart-harness.mjs`. Production does not set that URL, so those controls are not in the shipping window. A second test in the same file starts Philo with the fixture unset and checks that a send stays `Execution is unavailable.`

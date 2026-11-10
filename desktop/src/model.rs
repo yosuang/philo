@@ -138,6 +138,16 @@ impl Message {
     }
 }
 
+/// The action a card binds. The server stores this document with the card.
+/// It is not a Makez run and not a client-supplied grant.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Deserialize)]
+pub struct ActionSnapshot {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub summary: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Approval {
@@ -146,18 +156,62 @@ pub struct Approval {
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
     pub kind: String,
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
     pub status: String,
     #[serde(default)]
+    pub requester_actor_id: String,
+    #[serde(default)]
+    pub action_snapshot: Option<ActionSnapshot>,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 impl Approval {
     pub fn is_pending(&self) -> bool {
         self.status == "pending"
+    }
+
+    /// A decision is offered only while this card is pending and still binds
+    /// an action snapshot. `invalid` is not a grant.
+    pub fn can_decide(&self) -> bool {
+        self.is_pending() && self.snapshot_summary().is_some()
+    }
+
+    /// The bound action, when the server stored a snapshot.
+    pub fn snapshot_summary(&self) -> Option<&str> {
+        self.action_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.summary.trim())
+            .filter(|summary| !summary.is_empty())
+    }
+
+    /// Text for the card. A snapshot is the action. A row without one shows
+    /// the stored summary and does not invent a snapshot.
+    pub fn shown_action(&self) -> String {
+        if let Some(summary) = self.snapshot_summary() {
+            return format!("Snapshot: {summary}");
+        }
+        self.summary.clone()
+    }
+
+    /// Kind from the snapshot when the card has one.
+    pub fn shown_kind(&self) -> String {
+        if let Some(kind) = self
+            .action_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.kind.trim())
+            .filter(|kind| !kind.is_empty())
+        {
+            return kind.to_owned();
+        }
+        self.kind.clone()
     }
 }
 
@@ -284,7 +338,11 @@ pub enum ServerEvent {
         session_id: String,
         status: String,
     },
-    Approval(Approval),
+    Approval {
+        event_id: String,
+        cursor: i64,
+        approval: Approval,
+    },
     Task(Task),
     Session(Session),
     Ignored(String),
@@ -470,9 +528,11 @@ pub fn parse_event(text: &str) -> Result<ServerEvent, String> {
             session_id: required(&value, &["sessionId", "session_id"])?,
             status: optional(&value, &["status"]),
         }),
-        "approval.requested" | "approval.updated" => {
-            Ok(ServerEvent::Approval(parse_nested(&value, "approval")?))
-        }
+        "approval.requested" | "approval.updated" => Ok(ServerEvent::Approval {
+            event_id: event_id(&value),
+            cursor: event_cursor(&value),
+            approval: parse_nested(&value, "approval")?,
+        }),
         "task.updated" => Ok(ServerEvent::Task(parse_nested(&value, "task")?)),
         "session.updated" => Ok(ServerEvent::Session(parse_nested(&value, "session")?)),
         "subscribed" => {
@@ -492,7 +552,8 @@ pub fn event_business_cursor(event: &ServerEvent) -> Option<i64> {
         | ServerEvent::Failed { cursor, .. }
         | ServerEvent::Canceled { cursor, .. }
         | ServerEvent::Created { cursor, .. }
-        | ServerEvent::Updated { cursor, .. } => *cursor,
+        | ServerEvent::Updated { cursor, .. }
+        | ServerEvent::Approval { cursor, .. } => *cursor,
         _ => 0,
     };
     (cursor > 0).then_some(cursor)
@@ -659,11 +720,17 @@ mod tests {
             r#"{"type":"approval.requested","id":"ap","sessionId":"s","kind":"draft_action","summary":"note","status":"pending","createdAt":"2026-11-08T00:00:00Z"}"#,
         )
         .unwrap();
-        let ServerEvent::Approval(approval) = flat else {
+        let ServerEvent::Approval {
+            approval, cursor, ..
+        } = &flat
+        else {
             panic!("flat approval");
         };
+        assert_eq!(*cursor, 0);
         assert!(approval.is_pending());
-        assert_eq!(approval.summary, "note");
+        assert!(approval.action_snapshot.is_none());
+        assert_eq!(approval.shown_action(), "note");
+        assert_eq!(event_business_cursor(&flat), None);
 
         let nested = parse_event(
             r#"{"type":"task.updated","task":{"id":"t","sessionId":"s","status":"running","source":"philo-server","result":"saved"}}"#,
@@ -674,6 +741,64 @@ mod tests {
         };
         assert_eq!(task.result_text(), "saved");
         assert_eq!(task.source, "philo-server");
+    }
+
+    #[test]
+    fn approval_card_uses_the_stored_snapshot() {
+        let live = parse_event(
+            r#"{"type":"approval.requested","id":"card-new","sessionId":"sess","messageId":"msg","kind":"draft_action","summary":"send the revised note","status":"pending","requesterActorId":"actor-test","actionSnapshot":{"kind":"draft_action","summary":"send the revised note"},"createdAt":"2026-11-10T00:00:00Z","updatedAt":"2026-11-10T00:00:01Z"}"#,
+        )
+        .unwrap();
+        let ServerEvent::Approval {
+            event_id,
+            cursor,
+            approval,
+        } = &live
+        else {
+            panic!("live approval");
+        };
+        assert_eq!(event_id, "card-new");
+        assert_eq!(*cursor, 0);
+        assert_eq!(approval.id, "card-new");
+        assert_eq!(approval.message_id, "msg");
+        assert_eq!(approval.requester_actor_id, "actor-test");
+        assert_eq!(approval.updated_at, "2026-11-10T00:00:01Z");
+        assert!(approval.can_decide());
+        assert_eq!(approval.shown_kind(), "draft_action");
+        assert_eq!(approval.shown_action(), "Snapshot: send the revised note");
+
+        let stored = parse_event(
+            r#"{"type":"approval.updated","id":"event-1","cursor":7,"sessionId":"sess","messageId":"msg","approval":{"id":"card-old","sessionId":"sess","messageId":"msg","kind":"draft_action","summary":"send the weekly note","status":"invalid","requesterActorId":"actor-test","actionSnapshot":{"kind":"draft_action","summary":"send the weekly note"},"createdAt":"2026-11-10T00:00:00Z","updatedAt":"2026-11-10T00:00:02Z"}}"#,
+        )
+        .unwrap();
+        let ServerEvent::Approval {
+            event_id,
+            cursor,
+            approval,
+        } = &stored
+        else {
+            panic!("stored approval");
+        };
+        assert_eq!(event_id, "event-1");
+        assert_eq!(*cursor, 7);
+        assert_eq!(event_business_cursor(&stored), Some(7));
+        assert_eq!(approval.id, "card-old");
+        assert_eq!(approval.status, "invalid");
+        assert!(!approval.is_pending());
+        assert!(!approval.can_decide());
+        assert_eq!(approval.shown_action(), "Snapshot: send the weekly note");
+
+        let empty = parse_event(
+            r#"{"type":"approval.updated","id":"card-blank","sessionId":"sess","summary":"send the weekly note"}"#,
+        )
+        .unwrap();
+        let ServerEvent::Approval { approval, .. } = &empty else {
+            panic!("blank approval");
+        };
+        assert!(!approval.is_pending());
+        assert!(!approval.can_decide());
+        assert_eq!(approval.status, "");
+        assert_eq!(approval.shown_action(), "send the weekly note");
     }
 
     #[test]
@@ -762,13 +887,16 @@ mod tests {
             content: "red".into(),
             ..Message::default()
         }];
-        replace_transcript(&mut messages, vec![Message {
-            id: "m".into(),
-            role: "assistant".into(),
-            content: "redgreen".into(),
-            status: "complete".into(),
-            ..Message::default()
-        }]);
+        replace_transcript(
+            &mut messages,
+            vec![Message {
+                id: "m".into(),
+                role: "assistant".into(),
+                content: "redgreen".into(),
+                status: "complete".into(),
+                ..Message::default()
+            }],
+        );
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "redgreen");
         assert!(event_inside_snapshot(2, 4));

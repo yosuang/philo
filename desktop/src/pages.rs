@@ -463,40 +463,26 @@ fn approval_card(store: Store, approval: ReadSignal<Approval>) -> impl IntoEleme
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_size(px(13.0)),
         )
+        .child(when(
+            move || !approval.with(|item| item.shown_kind().is_empty()),
+            move || {
+                text(move || approval.with(|item| item.shown_kind()))
+                    .text_size(px(12.0))
+                    .text_color(move || theme().muted_foreground)
+            },
+        ))
         .child(
-            text(move || {
-                approval.with(|item| {
-                    if item.kind.is_empty() {
-                        "draft_action".to_owned()
-                    } else {
-                        item.kind.clone()
-                    }
-                })
-            })
-            .text_size(px(12.0))
-            .text_color(move || theme().muted_foreground),
-        )
-        .child(
-            text(move || approval.with(|item| item.summary.clone()))
+            text(move || approval.with(|item| item.shown_action()))
                 .text_size(px(15.0))
                 .text_color(move || theme().card_foreground),
         )
         .child(
-            text(move || {
-                let status = approval.with(|item| {
-                    if item.status.is_empty() {
-                        "pending".to_owned()
-                    } else {
-                        item.status.clone()
-                    }
-                });
-                format!("Status: {status}")
-            })
-            .text_size(px(12.0))
-            .text_color(move || theme().muted_foreground),
+            text(move || format!("Status: {}", approval.with(|item| item.status.clone())))
+                .text_size(px(12.0))
+                .text_color(move || theme().muted_foreground),
         )
         .child(when(
-            move || approval.with(Approval::is_pending),
+            move || approval.with(Approval::can_decide),
             move || {
                 view()
                     .flex_row()
