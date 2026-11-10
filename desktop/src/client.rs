@@ -376,6 +376,27 @@ pub async fn retry(base: &str, message_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub async fn edit_approval(base: &str, id: &str, summary: &str) -> Result<Approval, String> {
+    let value = send_json(
+        "POST",
+        &endpoint(base, &format!("/v1/approvals/{id}/edit"))?,
+        json!({ "summary": summary }),
+    )
+    .await?;
+    parse_approval(&value)
+}
+
+pub async fn list_approvals(base: &str, session_id: &str) -> Result<Vec<Approval>, String> {
+    let value = get_json(&endpoint_query(
+        base,
+        "/v1/approvals",
+        "sessionId",
+        session_id,
+    )?)
+    .await?;
+    parse_list(&value, "approvals")
+}
+
 pub async fn decide(base: &str, id: &str, decision: &str) -> Result<Approval, String> {
     let value = send_json(
         "POST",

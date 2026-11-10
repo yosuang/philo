@@ -224,6 +224,9 @@ pub struct Store {
     catchup_lock: Stored<Arc<Mutex<()>>>,
     business_high_water: Signal<i64>,
     applied_event_ids: Stored<HashSet<String>>,
+    /// Approval ids this process already posted to the production edit route
+    /// because `PHILO_TEST_EDIT_SUMMARY` is set. Not a desktop editor.
+    transport_ids: Stored<HashSet<String>>,
     submit_serial: Signal<u64>,
     pending_submit: Stored<Option<(String, String, String)>>,
 }
@@ -291,6 +294,7 @@ impl Store {
             catchup_lock: stored(Arc::new(Mutex::new(()))),
             business_high_water: signal(0),
             applied_event_ids: stored(HashSet::new()),
+            transport_ids: stored(HashSet::new()),
             submit_serial: signal(0),
             pending_submit: stored(None),
         };
@@ -645,7 +649,21 @@ impl Store {
                         store.load_transcript(session_id).await;
                     }
                 }
-                Err(err) => store.action_error.set(Some(err)),
+                Err(err) => {
+                    store.action_error.set(Some(err));
+                    if let Some(session_id) = store.selected_session.get() {
+                        match client::list_approvals(&store.server_url.get(), &session_id).await {
+                            Ok(cards) => {
+                                if store.selected_session.get().as_deref()
+                                    == Some(session_id.as_str())
+                                {
+                                    store.approvals.set(cards);
+                                }
+                            }
+                            Err(reload_err) => log::warn!("approval reload: {reload_err}"),
+                        }
+                    }
+                }
             }
         });
     }
@@ -1839,7 +1857,21 @@ impl Store {
                 }
                 self.remember_event(&event_id, cursor);
             }
-            ServerEvent::Approval(approval) => self.upsert_approval(approval),
+            ServerEvent::Approval {
+                event_id,
+                cursor,
+                approval,
+            } => {
+                let session_id = approval.session_id.clone();
+                if !session_id.is_empty()
+                    && self.selected_session.get().as_deref() != Some(session_id.as_str())
+                {
+                    self.note_foreign(&session_id);
+                    return;
+                }
+                self.upsert_approval(approval);
+                self.remember_event(&event_id, cursor);
+            }
             ServerEvent::Task(task) => self.upsert_task(task),
             ServerEvent::Session(session) => self.upsert_session(session),
             ServerEvent::Ignored(kind) => {
@@ -1921,7 +1953,10 @@ impl Store {
         let mut installed = Vec::new();
         replace_transcript(&mut installed, messages);
         self.messages.set(installed);
-        self.approvals.set(approvals);
+        self.approvals.set(approvals.clone());
+        for approval in approvals {
+            self.follow_transport(approval);
+        }
         self.business_high_water.set(high_water);
         self.applied_event_ids.with(|seen| seen.clear());
     }
@@ -1945,6 +1980,9 @@ impl Store {
                 event_id, cursor, ..
             }
             | ServerEvent::Updated {
+                event_id, cursor, ..
+            }
+            | ServerEvent::Approval {
                 event_id, cursor, ..
             } => (event_id, *cursor),
             _ => return false,
@@ -2019,11 +2057,68 @@ impl Store {
         {
             return;
         }
+        let follow = approval.clone();
         self.approvals.update(|list| {
             if let Some(slot) = list.iter_mut().find(|item| item.id == approval.id) {
                 *slot = approval;
             } else {
                 list.push(approval);
+            }
+        });
+        self.follow_transport(follow);
+    }
+
+    /// When `PHILO_TEST_EDIT_SUMMARY` names a different summary, post one
+    /// production edit for this pending card, then one decision on the old
+    /// id, then replace the cards with `GET /v1/approvals`. The window has
+    /// no editor. Unset, this posts nothing. The summary is not a credential.
+    fn follow_transport(self, approval: Approval) {
+        let Some(next) = test_edit_summary() else {
+            return;
+        };
+        if approval.status != "pending" || approval.id.is_empty() {
+            return;
+        }
+        let Some(current) = approval.snapshot_summary() else {
+            return;
+        };
+        if current == next {
+            return;
+        }
+        let id = approval.id.clone();
+        if !self.transport_ids.with(|seen| seen.insert(id.clone())) {
+            return;
+        }
+        let session_id = if approval.session_id.is_empty() {
+            self.selected_session.get().unwrap_or_default()
+        } else {
+            approval.session_id.clone()
+        };
+        let store = self;
+        go(async move {
+            let url = store.server_url.get();
+            let edited = client::edit_approval(&url, &id, &next).await;
+            let stale = client::decide(&url, &id, "approve").await;
+            match client::list_approvals(&url, &session_id).await {
+                Ok(cards) => {
+                    if store.selected_session.get().as_deref() == Some(session_id.as_str()) {
+                        store.approvals.set(cards);
+                    }
+                }
+                Err(err) => log::warn!("approval list: {err}"),
+            }
+            if let Err(err) = edited {
+                store.transport_ids.with(|seen| {
+                    seen.remove(&id);
+                });
+                store.action_error.set(Some(err));
+                return;
+            }
+            match stale {
+                Err(err) => store.action_error.set(Some(err)),
+                Ok(_) => store
+                    .action_error
+                    .set(Some("the edited card accepted a decision".to_owned())),
             }
         });
     }
@@ -2138,6 +2233,7 @@ mod tests {
             catchup_lock: stored(Arc::new(Mutex::new(()))),
             business_high_water: signal(0),
             applied_event_ids: stored(HashSet::new()),
+            transport_ids: stored(HashSet::new()),
             submit_serial: signal(0),
             pending_submit: stored(None),
         }
@@ -2442,6 +2538,18 @@ mod tests {
     }
 }
 
+/// One replacement summary for the production edit route. Production leaves
+/// this unset, and the window never shows an editor for the action.
+fn test_edit_summary() -> Option<String> {
+    let raw = std::env::var("PHILO_TEST_EDIT_SUMMARY").ok()?;
+    let summary = raw.trim().to_owned();
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
+    }
+}
+
 fn restart_url() -> Option<String> {
     let raw = std::env::var("PHILO_RESTART_URL").ok()?;
     let trimmed = raw.trim().trim_end_matches('/').to_owned();
@@ -2474,7 +2582,7 @@ fn event_session(event: &crate::model::ServerEvent) -> Option<&str> {
         | ServerEvent::Canceled { session_id, .. }
         | ServerEvent::Updated { session_id, .. } => session_id.as_str(),
         ServerEvent::Created { message, .. } => message.session_id.as_str(),
-        ServerEvent::Approval(approval) => approval.session_id.as_str(),
+        ServerEvent::Approval { approval, .. } => approval.session_id.as_str(),
         ServerEvent::Task(task) => task.session_id.as_str(),
         ServerEvent::Session(session) => session.id.as_str(),
         ServerEvent::Ignored(_) => return None,
