@@ -56,6 +56,7 @@ type server struct {
 	cfg   config.Config
 	authn auth.Authenticator
 	http  *http.Client
+	live  *makez.Client
 }
 
 // New builds the HTTP handler. The pool must already be migrated.
@@ -69,6 +70,16 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 	if pool == nil {
 		return nil, errors.New("database pool is required")
 	}
+	if err := cfg.LiveMakez(); err != nil {
+		return nil, err
+	}
+	var live *makez.Client
+	if cfg.MakezTestBinding() {
+		live, err = makez.NewClient(cfg.MakezAPIURL, cfg.MakezAPIToken, cfg.MakezWorkspaceID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	st := store.New(pool)
 	h := hub.New()
 	eng := engine.New(st, ad, h, cfg.DevFixture())
@@ -79,6 +90,7 @@ func New(pool *pgxpool.Pool, cfg config.Config) (*App, error) {
 		cfg:   cfg,
 		authn: auth.New(cfg.Credentials),
 		http:  &http.Client{Timeout: 2 * time.Second},
+		live:  live,
 	}
 	mux := http.NewServeMux()
 	s.routes(mux)
@@ -450,6 +462,32 @@ func (s *server) postMessage(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.DevFixture() {
 		execution = "fixture"
 	}
+	var projected *store.Message
+	if s.live != nil && !s.cfg.DevFixture() {
+		execution = "test-binding"
+		sess, err := s.store.GetSession(r.Context(), id)
+		if err != nil {
+			s.storeErr(w, err, "session not found")
+			return
+		}
+		binding := store.LiveBinding{
+			Label:          store.TestBindingLabel,
+			OwnerID:        p.OwnerID,
+			ConversationID: id,
+			TurnID:         result.TurnID,
+			BotID:          sess.AgentID,
+			WorkspaceID:    s.cfg.MakezWorkspaceID,
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		_, consumeErr := makez.ConsumeNoKey(ctx, s.store, s.live, binding)
+		cancel()
+		if consumeErr != nil {
+			log.Printf("makez test binding consume: %v", consumeErr)
+		}
+		if msg, err := s.store.TurnAssistant(r.Context(), result.TurnID); err == nil {
+			projected = &msg
+		}
+	}
 	out := map[string]any{
 		"turnId":      result.TurnID,
 		"replayed":    result.Replayed,
@@ -458,6 +496,9 @@ func (s *server) postMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.Assistant != nil {
 		out["assistantMessage"] = result.Assistant
+	}
+	if projected != nil {
+		out["assistantMessage"] = projected
 	}
 	writeJSON(w, http.StatusOK, out)
 }

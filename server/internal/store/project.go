@@ -57,6 +57,9 @@ type ProjectResult struct {
 }
 
 type observationRow struct {
+	WorkspaceID    string
+	TaskID         string
+	RunID          string
 	MessageID      string
 	EventID        string
 	OutboxID       string
@@ -85,7 +88,11 @@ func (s *Store) ProjectCapturedFailure(ctx context.Context, in CaptureInput, fau
 	if err != nil {
 		return ProjectResult{}, err
 	}
-	if parsed.task != nil && parsed.task.ConversationID != in.Binding.CapturedConversationID {
+	return s.applyProjection(ctx, in.Binding, parsed, fault)
+}
+
+func (s *Store) applyProjection(ctx context.Context, binding TestBinding, parsed parsedCapture, fault FaultPoint) (ProjectResult, error) {
+	if parsed.task != nil && parsed.task.ConversationID != binding.CapturedConversationID {
 		return ProjectResult{}, ErrBindingMismatch
 	}
 	if len(parsed.logs) == 0 && parsed.task == nil {
@@ -101,10 +108,10 @@ func (s *Store) ProjectCapturedFailure(ctx context.Context, in CaptureInput, fau
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := lockConversation(ctx, tx, in.Binding); err != nil {
+	if _, err := lockConversation(ctx, tx, binding); err != nil {
 		return ProjectResult{}, err
 	}
-	if _, err := lockTurn(ctx, tx, in.Binding); err != nil {
+	if _, err := lockTurn(ctx, tx, binding); err != nil {
 		return ProjectResult{}, err
 	}
 
@@ -129,7 +136,7 @@ func (s *Store) ProjectCapturedFailure(ctx context.Context, in CaptureInput, fau
 		if err := writeLogs(ctx, tx, pending); err != nil {
 			return ProjectResult{}, err
 		}
-		if parsed.task != nil && len(pending) > 0 {
+		if parsed.task != nil && parsed.task.RunID != "" && len(pending) > 0 {
 			if err := upsertCheckpoint(ctx, tx, *parsed.task, maxSeq(pending)); err != nil {
 				return ProjectResult{}, err
 			}
@@ -147,11 +154,11 @@ func (s *Store) ProjectCapturedFailure(ctx context.Context, in CaptureInput, fau
 	if err != nil {
 		return ProjectResult{}, err
 	}
-	messageID, err := insertAssistantError(ctx, tx, in.Binding, text)
+	messageID, err := insertAssistantError(ctx, tx, binding, text)
 	if err != nil {
 		return ProjectResult{}, err
 	}
-	if err := linkTurn(ctx, tx, in.Binding, *parsed.task); err != nil {
+	if err := linkTurn(ctx, tx, binding, *parsed.task); err != nil {
 		return ProjectResult{}, err
 	}
 	if err := atFault(fault, FaultDedup); err != nil {
@@ -179,7 +186,7 @@ func (s *Store) ProjectCapturedFailure(ctx context.Context, in CaptureInput, fau
 	if err := atFault(fault, FaultOutbox); err != nil {
 		return ProjectResult{}, err
 	}
-	event, outboxID, err := insertFailureOutbox(ctx, tx, in.Binding, messageID, text)
+	event, outboxID, err := insertFailureOutbox(ctx, tx, binding, messageID, text)
 	if err != nil {
 		return ProjectResult{}, err
 	}
@@ -201,6 +208,9 @@ func (s *Store) ProjectCapturedFailure(ctx context.Context, in CaptureInput, fau
 	}
 
 	row := observationRow{
+		WorkspaceID:    parsed.task.WorkspaceID,
+		TaskID:         parsed.task.ID,
+		RunID:          parsed.task.RunID,
 		MessageID:      messageID,
 		EventID:        event.ID,
 		OutboxID:       outboxID,
@@ -328,7 +338,8 @@ func loadObservation(ctx context.Context, q rowQuery, task taskView) (observatio
 	var processing *string
 	var cursor *int64
 	err := q.QueryRow(ctx, `
-		SELECT t.message_id, t.business_event_id, t.outbox_id,
+		SELECT t.workspace_id, t.task_id, t.run_id,
+		       t.message_id, t.business_event_id, t.outbox_id,
 		       o.published_at, r.acked_at,
 		       e.cursor, c.applied_public_seq, c.processing_cursor
 		FROM terminal_observations t
@@ -342,7 +353,7 @@ func loadObservation(ctx context.Context, q rowQuery, task taskView) (observatio
 		WHERE t.workspace_id = $1 AND t.task_id = $2 AND t.run_id = $3
 		  AND t.state = $4 AND t.reason = $5`,
 		task.WorkspaceID, task.ID, task.RunID, "FAILED", "AGENT_FAILED",
-	).Scan(&row.MessageID, &eventID, &outboxID, &row.PublishedAt, &row.AckedAt, &cursor, &applied, &processing)
+	).Scan(&row.WorkspaceID, &row.TaskID, &row.RunID, &row.MessageID, &eventID, &outboxID, &row.PublishedAt, &row.AckedAt, &cursor, &applied, &processing)
 	if errors.Is(mapErr(err), ErrNotFound) {
 		return observationRow{}, false, nil
 	}
@@ -555,11 +566,14 @@ func (s *Store) finishPublish(ctx context.Context, row observationRow, fault Fau
 		if fault == FaultSourceAck {
 			return result, InjectedFault{Point: FaultSourceAck}
 		}
+		if row.WorkspaceID == "" || row.TaskID == "" || row.RunID == "" {
+			return result, fmt.Errorf("local receipt is missing the service task")
+		}
 		tag, err := s.pool.Exec(ctx, `
 			UPDATE projection_receipts SET acked_at = $6
 			WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3
 			  AND state = $4 AND reason = $5 AND acked_at IS NULL`,
-			capturedWorkspaceID, capturedTaskID, capturedRunID, "FAILED", "AGENT_FAILED", now())
+			row.WorkspaceID, row.TaskID, row.RunID, "FAILED", "AGENT_FAILED", now())
 		if err != nil {
 			return result, err
 		}
