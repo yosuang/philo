@@ -42,10 +42,10 @@ fn bot_pill(shell: Shell) -> impl IntoElement {
     button()
         .flex_row()
         .items_center()
-        .gap(px(8.0))
-        .px(px(10.0))
-        .py(px(4.0))
-        .rounded(px(18.0))
+        .gap(px(6.0))
+        .px(px(8.0))
+        .py(px(2.0))
+        .rounded(px(16.0))
         .bg(move || theme().card)
         .shadow_sm()
         .cursor_pointer()
@@ -72,15 +72,15 @@ fn bot_pill(shell: Shell) -> impl IntoElement {
                 }
             })
             .number_of_lines(1)
-            .text_size(px(14.0))
-            .font_weight(FontWeight::SEMIBOLD),
+            .text_size(px(13.0))
+            .font_weight(FontWeight::MEDIUM),
         )
 }
 
 fn header_mark(shell: Shell) -> impl IntoElement {
     view()
-        .size(px(22.0))
-        .rounded(px(11.0))
+        .size(px(18.0))
+        .rounded(px(9.0))
         .items_center()
         .justify_center()
         .flex_shrink_0()
@@ -97,7 +97,7 @@ fn header_mark(shell: Shell) -> impl IntoElement {
                     .map(|bot| bot.mark.to_string())
                     .unwrap_or_else(|| "P".to_owned())
             })
-            .text_size(px(11.0))
+            .text_size(px(10.0))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(white()),
         )
@@ -106,9 +106,9 @@ fn header_mark(shell: Shell) -> impl IntoElement {
 fn share_button(shell: Shell) -> impl IntoElement {
     button()
         .accessibility_label("Share")
-        .px(px(16.0))
-        .py(px(6.0))
-        .rounded(px(18.0))
+        .px(px(14.0))
+        .py(px(5.0))
+        .rounded(px(16.0))
         .bg(move || theme().card)
         .shadow_sm()
         .cursor_pointer()
@@ -122,8 +122,8 @@ fn share_button(shell: Shell) -> impl IntoElement {
         .on_press(move || shell.notice("Share is not available."))
         .child(
             text("Share")
-                .text_size(px(14.0))
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(move || theme().foreground),
         )
 }
@@ -218,8 +218,8 @@ fn message_list(shell: Shell) -> impl IntoElement {
         .keys(move || shell.line_ids())
         .inverted()
         .estimated_item_size(px(84.0))
-        .content_padding(px(16.0))
-        .row_gap(px(10.0))
+        .content_padding(px(12.0))
+        .row_gap(px(6.0))
         .flex_1()
         .element_ref(&shell.transcript)
         .empty(empty_transcript(shell))
@@ -255,32 +255,65 @@ fn empty_transcript(shell: Shell) -> impl IntoElement {
         ))
 }
 
+fn time_mark(shell: Shell) -> impl IntoElement {
+    view()
+        .size(px(14.0))
+        .rounded(px(7.0))
+        .items_center()
+        .justify_center()
+        .bg(move || {
+            rgb(shell
+                .selected_bot()
+                .map(|bot| bot.color)
+                .unwrap_or(0xf93498))
+        })
+        .child(
+            text(move || {
+                shell
+                    .selected_bot()
+                    .map(|bot| bot.mark.to_string())
+                    .unwrap_or_else(|| "P".to_owned())
+            })
+            .text_size(px(8.0))
+            .text_color(white()),
+        )
+}
+
 fn message_row(shell: Shell, at: Position) -> impl IntoElement {
     let mine = move || shell.line_at(at.index()).is_some_and(|line| line.mine);
     view()
         .w_full()
-        .gap(px(6.0))
-        .child(when(
-            move || shell.line_at(at.index()).is_some_and(|line| line.mine),
-            move || {
-                view().w_full().flex_row().justify_center().child(
-                    text("Local · not sent")
-                        .text_size(px(12.0))
-                        .text_color(move || theme().muted_foreground),
+        .gap(px(4.0))
+        .child(
+            view()
+                .w_full()
+                .flex_row()
+                .justify_center()
+                .items_center()
+                .gap(px(6.0))
+                .py(px(2.0))
+                .style_when(
+                    move || !shell.line_at(at.index()).is_some_and(|line| line.mine),
+                    |style| style.hidden(),
                 )
-            },
-        ))
+                .child(time_mark(shell))
+                .child(
+                    text("Local · not sent")
+                        .text_size(px(11.0))
+                        .text_color(move || theme().muted_foreground),
+                ),
+        )
         .child(when(mine, move || user_bubble(shell, at)).otherwise(move || note_bubble(shell, at)))
 }
 
 fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
     view().w_full().flex_row().justify_end().child(
         view()
-            .max_w(relative(0.78))
+            .max_w(relative(0.72))
             .gap(px(6.0))
-            .px(px(14.0))
-            .py(px(10.0))
-            .rounded(px(20.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .rounded(px(18.0))
             .bg(move || theme().primary)
             .child(previews(shell, at))
             .child(
@@ -290,7 +323,7 @@ fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
                         .map(|line| line.body)
                         .unwrap_or_default()
                 })
-                .text_size(px(15.0))
+                .text_size(px(14.0))
                 .text_color(move || theme().primary_foreground),
             ),
     )
@@ -299,10 +332,10 @@ fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
 fn note_bubble(shell: Shell, at: Position) -> impl IntoElement {
     view().w_full().flex_row().justify_start().child(
         view()
-            .max_w(relative(0.78))
-            .px(px(14.0))
-            .py(px(10.0))
-            .rounded(px(20.0))
+            .max_w(relative(0.72))
+            .px(px(12.0))
+            .py(px(8.0))
+            .rounded(px(18.0))
             .bg(move || theme().muted)
             .child(
                 text(move || {
@@ -311,7 +344,7 @@ fn note_bubble(shell: Shell, at: Position) -> impl IntoElement {
                         .map(|line| line.body)
                         .unwrap_or_default()
                 })
-                .text_size(px(15.0))
+                .text_size(px(14.0))
                 .text_color(move || theme().foreground),
             ),
     )
@@ -377,17 +410,10 @@ fn composer(shell: Shell) -> impl IntoElement {
     let can_send =
         move || !shell.draft.get().trim().is_empty() || !shell.previews.with(Vec::is_empty);
     view()
-        .px(px(16.0))
-        .pb(px(16.0))
-        .pt(px(4.0))
-        .gap(px(6.0))
+        .px(px(12.0))
+        .pb(px(12.0))
+        .pt(px(2.0))
         .style_when(move || shell.creating.get(), |style| style.hidden())
-        .child(
-            text("Local only. Nothing is sent, and there is no model reply.")
-                .self_center()
-                .text_size(px(11.0))
-                .text_color(move || theme().muted_foreground),
-        )
         .child(
             view()
                 .gap(px(8.0))

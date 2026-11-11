@@ -55,10 +55,6 @@ fn expanded(shell: Shell) -> impl IntoElement {
         .flex_1()
         .min_h(px(0.0))
         .child(sidebar_header(shell))
-        .child(when(
-            move || shell.search_open.get(),
-            move || search_field(shell),
-        ))
         .child(bot_scroll(shell))
         .child(user_row(shell))
 }
@@ -141,18 +137,10 @@ fn sidebar_header(shell: Shell) -> impl IntoElement {
         .flex_row()
         .items_center()
         .pl(move || title_bar().left + px(8.0))
-        .pr(px(12.0))
+        .pr(px(10.0))
         .gap(px(8.0))
         .window_drag(true)
-        .child(view().flex_1().window_drag(true))
-        .child(ui::icon_button(
-            shell,
-            "Search",
-            "search",
-            false,
-            || true,
-            move || shell.open_search(),
-        ))
+        .child(search_field(shell))
         .child(ui::icon_button(
             shell,
             "New bot",
@@ -164,23 +152,29 @@ fn sidebar_header(shell: Shell) -> impl IntoElement {
 }
 
 fn search_field(shell: Shell) -> impl IntoElement {
-    view().px(px(12.0)).pb(px(8.0)).child(
-        ui::field("Search bots")
-            .element_ref(&shell.search_field)
-            .test_id("search")
-            .value(move || shell.query.get())
-            .on_change(move |text: &str| shell.query.set(text.to_owned()))
-            .w_full(),
-    )
+    ui::field("Search")
+        .element_ref(&shell.search_field)
+        .test_id("search")
+        .value(move || shell.query.get())
+        .on_change(move |text: &str| shell.query.set(text.to_owned()))
+        .flex_1()
+        .h(px(34.0))
+        .px(px(12.0))
+        .py(px(0.0))
+        .rounded(px(17.0))
+        .border(px(0.0))
+        .shadow_sm()
+        .bg(move || theme().card)
+        .text_size(px(13.0))
 }
 
 fn bot_scroll(shell: Shell) -> impl IntoElement {
     scroll().flex_1().min_h(px(0.0)).child(
         view()
             .px(px(8.0))
-            .pb(px(12.0))
-            .gap(px(2.0))
-            .child(when(move || shell.pin_visible(), move || pin(shell)))
+            .pt(px(4.0))
+            .pb(px(8.0))
+            .gap(px(4.0))
             .child(group(shell, "demo", "Demo"))
             .child(group(shell, "unassigned", "Unassigned"))
             .child(when(
@@ -196,29 +190,6 @@ fn bot_scroll(shell: Shell) -> impl IntoElement {
                 },
             )),
     )
-}
-
-fn pin(shell: Shell) -> impl IntoElement {
-    button()
-        .w_full()
-        .items_center()
-        .gap(px(6.0))
-        .pt(px(8.0))
-        .pb(px(14.0))
-        .cursor_pointer()
-        .rounded(px(16.0))
-        .hover(|style| style.bg(move || theme().sidebar_accent))
-        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
-        .accessibility_label("Philo")
-        .on_press(move || shell.select("philo".to_owned()))
-        .child(ui::mark('P', 0xf93498, 64.0))
-        .child(
-            text("Philo")
-                .text_size(px(14.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(move || theme().sidebar_foreground),
-        )
-        .child(ui::quiet("Demo"))
 }
 
 fn group(shell: Shell, id: &'static str, title: &'static str) -> impl IntoElement {
@@ -243,8 +214,8 @@ fn group_header(shell: Shell, id: &'static str, title: &'static str) -> impl Int
         .flex_row()
         .items_center()
         .px(px(10.0))
-        .py(px(6.0))
-        .rounded(px(10.0))
+        .py(px(4.0))
+        .rounded(px(12.0))
         .cursor_pointer()
         .bg(move || {
             if shell.group_open(id) {
@@ -278,10 +249,10 @@ fn bot_row(shell: Shell, bot: ReadSignal<crate::local::Bot>) -> impl IntoElement
         .w_full()
         .flex_row()
         .items_center()
-        .gap(px(10.0))
+        .gap(px(8.0))
         .px(px(8.0))
-        .py(px(8.0))
-        .rounded(px(12.0))
+        .py(px(6.0))
+        .rounded(px(14.0))
         .cursor_pointer()
         .bg(move || {
             let selected = shell.selected.get();
@@ -298,7 +269,7 @@ fn bot_row(shell: Shell, bot: ReadSignal<crate::local::Bot>) -> impl IntoElement
         .child(ui::mark(
             bot.with(|item| item.mark),
             bot.with(|item| item.color),
-            36.0,
+            32.0,
         ))
         .child(
             view()
@@ -308,8 +279,8 @@ fn bot_row(shell: Shell, bot: ReadSignal<crate::local::Bot>) -> impl IntoElement
                 .child(
                     text(move || bot.with(|item| item.name.clone()))
                         .number_of_lines(1)
-                        .text_size(px(14.0))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(move || theme().sidebar_foreground),
                 )
                 .child(
@@ -325,9 +296,9 @@ fn user_row(shell: Shell) -> impl IntoElement {
     view()
         .flex_row()
         .items_center()
-        .gap(px(10.0))
-        .px(px(12.0))
-        .py(px(10.0))
+        .gap(px(8.0))
+        .px(px(10.0))
+        .py(px(8.0))
         .border_t_1()
         .border_color(move || theme().sidebar_border)
         .child(
@@ -347,12 +318,12 @@ fn user_row(shell: Shell) -> impl IntoElement {
                 .on_press(move || {
                     shell.notice("This is a demo profile. Accounts are not available.");
                 })
-                .child(ui::mark('D', 0x8b909a, 32.0))
+                .child(ui::mark('D', 0x8b909a, 26.0))
                 .child(
                     view().flex_1().min_w(px(0.0)).child(
                         text("Demo")
                             .number_of_lines(1)
-                            .text_size(px(14.0))
+                            .text_size(px(13.0))
                             .text_color(move || theme().sidebar_foreground),
                     ),
                 ),
@@ -417,7 +388,7 @@ fn identity(shell: Shell) -> impl IntoElement {
         .items_center()
         .gap(px(8.0))
         .pt(px(4.0))
-        .child(live_mark(shell, 72.0))
+        .child(live_mark(shell, 64.0))
         .child(
             text(move || {
                 shell

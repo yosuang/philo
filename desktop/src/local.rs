@@ -157,7 +157,7 @@ impl Shell {
     pub fn bots_in(self, group: &str) -> Vec<Bot> {
         let query = self.query.get();
         let query = query.trim().to_lowercase();
-        let searching = self.search_open.get() && !query.is_empty();
+        let searching = !query.is_empty();
         self.bots.with(|bots| {
             bots.iter()
                 .filter(|bot| bot.group == group && (!searching || bot.matches(&query)))
@@ -168,7 +168,7 @@ impl Shell {
 
     pub fn group_open(self, group: &str) -> bool {
         let query = self.query.get();
-        let searching = self.search_open.get() && !query.trim().is_empty();
+        let searching = !query.trim().is_empty();
         if searching {
             return true;
         }
@@ -179,18 +179,6 @@ impl Shell {
 
     pub fn any_match(self) -> bool {
         !self.bots_in("demo").is_empty() || !self.bots_in("unassigned").is_empty()
-    }
-
-    pub fn pin_visible(self) -> bool {
-        let query = self.query.get();
-        let query = query.trim().to_lowercase();
-        if !(self.search_open.get() && !query.is_empty()) {
-            return true;
-        }
-        self.bots.with(|bots| {
-            bots.iter()
-                .any(|bot| bot.id == "philo" && bot.matches(&query))
-        })
     }
 
     pub fn toggle_group(self, group: &str) {
@@ -379,7 +367,7 @@ impl Shell {
 
     /// Escape leaves the top local layer and does not close the window.
     pub fn dismiss_top(self) {
-        if self.search_open.get() {
+        if !self.query.get().trim().is_empty() || self.search_open.get() {
             self.search_open.set(false);
             self.query.set(String::new());
         } else if self.creating.get() {
