@@ -297,7 +297,7 @@ fn under_pill(shell: Shell, at: Position) -> bool {
 }
 
 fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
-    let top = if under_pill(shell, at) { 34.0 } else { 8.0 };
+    let top = if under_pill(shell, at) { 52.0 } else { 8.0 };
     view().w_full().flex_row().justify_end().child(
         view()
             .max_w(relative(0.92))
