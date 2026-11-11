@@ -16,15 +16,21 @@ pub fn column(shell: Shell) -> impl IntoElement {
         .relative()
         .overflow_hidden()
         .bg(move || theme().background)
-        .child(header(shell))
         .child(notice(shell))
         .child(new_bot(shell))
         .child(transcript(shell))
         .child(composer(shell))
+        .child(header(shell))
 }
 
 fn header(shell: Shell) -> impl IntoElement {
+    // The pills float on the thread. The row itself is clear, so a bubble
+    // can run behind the name. Share stays in its own bounds.
     view()
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .right(px(0.0))
         .h(move || {
             let top = title_bar().top.0;
             px(top.max(52.0))
@@ -33,13 +39,11 @@ fn header(shell: Shell) -> impl IntoElement {
         .items_center()
         .px(px(12.0))
         .pr(move || title_bar().right + px(12.0))
-        .flex_shrink_0()
         .z_index(2)
-        .bg(move || theme().background)
-        .window_drag(true)
-        .child(view().flex_1().window_drag(true))
+        .pointer_events(PointerEvents::BoxNone)
+        .child(view().flex_1())
         .child(bot_pill(shell))
-        .child(view().flex_1().window_drag(true))
+        .child(view().flex_1())
         .child(share_button(shell))
 }
 
@@ -251,8 +255,10 @@ fn time_mark(shell: Shell) -> impl IntoElement {
 
 fn message_row(shell: Shell, at: Position) -> impl IntoElement {
     let mine = move || shell.line_at(at.index()).is_some_and(|line| line.mine);
+    // Right inset keeps bubble glyphs clear of the Share pill.
     view()
         .w_full()
+        .pr(px(120.0))
         .gap(px(4.0))
         .child(
             view()
@@ -279,7 +285,7 @@ fn message_row(shell: Shell, at: Position) -> impl IntoElement {
 fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
     view().w_full().flex_row().justify_end().child(
         view()
-            .max_w(relative(0.72))
+            .max_w(relative(0.92))
             .gap(px(6.0))
             .px(px(12.0))
             .py(px(8.0))
@@ -302,7 +308,7 @@ fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
 fn note_bubble(shell: Shell, at: Position) -> impl IntoElement {
     view().w_full().flex_row().justify_start().child(
         view()
-            .max_w(relative(0.72))
+            .max_w(relative(0.92))
             .px(px(12.0))
             .py(px(8.0))
             .rounded(px(18.0))

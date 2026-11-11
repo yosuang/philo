@@ -513,8 +513,8 @@ fn bot(id: &str, name: &str, summary: &str, group: &str, shape: u8) -> Bot {
 }
 
 fn seed_lines() -> Vec<Line> {
-    // Newest first. The whole first bubble stays below the header.
-    // Relay has one local demo line. Desk and Shelf stay empty.
+    // Newest first. The oldest note is wide enough to pass behind the
+    // name pill. Relay has one local demo line. Desk and Shelf stay empty.
     let notes = [
         "Demo note. Sample text.",
         "Demo note. No model was asked.",
@@ -522,6 +522,7 @@ fn seed_lines() -> Vec<Line> {
         "Demo note. The window wrote this.",
         "Demo note. Not a run.",
         "Demo note. Older sample.",
+        "Demo note. Older sample, still in this window only.",
     ];
     let mine = [
         "Demo line. Kept in this window.",
@@ -530,6 +531,7 @@ fn seed_lines() -> Vec<Line> {
         "Demo line, still not sent.",
         "One more demo line.",
         "Demo line near the older end.",
+        "Demo line. The one at the older end.",
     ];
     let mut lines = Vec::new();
     for index in 0..notes.len() {
