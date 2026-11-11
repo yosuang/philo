@@ -1,851 +1,782 @@
-//! Two columns by default. The details column opens on the right.
-//! Unfinished destinations stay in that column and say they are not available.
+//! Three columns: bot list, chat, and a details drawer that can close.
 
 use nsh_base::{button, theme};
+use nsh_core::element::desktop::title_bar;
 use nsh_core::prelude::*;
 
-use crate::model::Agent;
+use crate::local::Shell;
 use crate::pages;
-use crate::store::{Route, Store};
 use crate::ui;
 
-pub fn shell(store: Store) -> impl IntoElement {
+const SIDEBAR: f32 = 276.0;
+const RAIL: f32 = 76.0;
+const DETAILS: f32 = 300.0;
+
+pub fn shell(shell: Shell) -> impl IntoElement {
     view()
         .flex_1()
         .flex_row()
-        .items_stretch()
         .overflow_hidden()
         .bg(move || theme().background)
-        .child(sidebar(store))
-        .child(main_column(store))
-        .child(details(store))
+        .text_color(move || theme().foreground)
+        .child(sidebar(shell))
+        .child(pages::column(shell))
+        .child(details(shell))
 }
 
-fn sidebar(store: Store) -> impl IntoElement {
+fn bar_height() -> Points {
+    let top = title_bar().top.0;
+    px(top.max(52.0))
+}
+
+fn sidebar(shell: Shell) -> impl IntoElement {
     view()
-        .w(px(248.0))
+        .w(move || {
+            if shell.sidebar_collapsed.get() {
+                px(RAIL)
+            } else {
+                px(SIDEBAR)
+            }
+        })
         .flex_shrink_0()
         .h_full()
         .overflow_hidden()
         .bg(move || theme().sidebar)
         .border_r_1()
         .border_color(move || theme().sidebar_border)
-        .child(sidebar_tools(store))
-        .child(brand())
-        .child(agent_pane(store))
-        .child(sidebar_footer(store))
-}
-
-fn main_column(store: Store) -> impl IntoElement {
-    view()
-        .flex_1()
-        .min_w(px(0.0))
-        .h_full()
-        .bg(move || theme().background)
-        .child(banners(store))
-        .child(pages::chat(store))
-        .child(pages::agent_form(store))
-        .child(pages::settings(store))
-        .child(pages::connectors(store))
-        .child(pages::unavailable(
-            store,
-            Route::Attachments,
-            "Attachments",
-            "File attachments are not available yet. Messages in this version are text only.",
-        ))
-        .child(pages::unavailable(
-            store,
-            Route::Notifications,
-            "Notifications",
-            "Notifications are not available yet. Philo does not deliver or list them.",
-        ))
-        .child(pages::unavailable(
-            store,
-            Route::Skills,
-            "Skills",
-            "Skills are not available yet. An agent cannot load or run a skill from here.",
-        ))
-        .child(pages::unavailable(
-            store,
-            Route::Memory,
-            "Memory",
-            "Memory is not available yet. Philo does not keep notes beyond the server transcript.",
-        ))
-        .child(pages::unavailable(
-            store,
-            Route::Routines,
-            "Routines",
-            "Routines are not available yet. Nothing here runs on a schedule.",
-        ))
-        .child(pages::unavailable(
-            store,
-            Route::ToolCalls,
-            "Tool calls",
-            "Tool-call transcripts are not available yet. The one action this version runs is the approval-backed draft, in the bot's chat.",
-        ))
-}
-
-fn sidebar_tools(store: Store) -> impl IntoElement {
-    view()
-        .flex_row()
-        .justify_end()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .pt_3()
-        .child(ui::round_button(
-            "Search",
-            "⌕",
-            false,
-            || true,
-            move || store.not_available("Search"),
-        ))
-        .child(ui::round_button(
-            "New bot",
-            "+",
-            false,
-            move || !store.sending.get(),
-            move || store.open_new_agent(),
-        ))
-}
-
-fn brand() -> impl IntoElement {
-    view()
-        .items_center()
-        .px_3()
-        .pt_3()
-        .pb_2()
-        .gap_1()
         .child(
-            view()
-                .w(px(52.0))
-                .h(px(52.0))
-                .rounded(px(26.0))
-                .items_center()
-                .justify_center()
-                .bg(move || theme().primary)
-                .child(
-                    text("P")
-                        .text_size(px(22.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(move || theme().primary_foreground),
-                ),
-        )
-        .child(
-            text("Philo")
-                .text_size(px(15.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(move || theme().sidebar_foreground),
-        )
-        .child(
-            text("Your agent, your friend. Always on for you.")
-                .text_size(px(11.0))
-                .text_color(move || theme().muted_foreground),
+            when(move || shell.sidebar_collapsed.get(), move || rail(shell))
+                .otherwise(move || expanded(shell)),
         )
 }
 
-fn sidebar_footer(store: Store) -> impl IntoElement {
-    view()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .py_3()
-        .border_t_1()
-        .border_color(move || theme().sidebar_border)
-        .child(
-            view()
-                .w(px(28.0))
-                .h(px(28.0))
-                .rounded(px(14.0))
-                .items_center()
-                .justify_center()
-                .bg(move || theme().sidebar_accent)
-                .child(
-                    text("P")
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(move || theme().sidebar_foreground),
-                ),
-        )
-        .child(
-            text("Philo")
-                .flex_1()
-                .number_of_lines(1)
-                .text_size(px(13.0))
-                .text_color(move || theme().sidebar_foreground),
-        )
-        .child(ui::round_button(
-            "More",
-            "▣",
-            false,
-            || true,
-            move || store.toggle_details(),
-        ))
-}
-
-fn agent_pane(store: Store) -> impl IntoElement {
-    let agents = store.agents;
+fn expanded(shell: Shell) -> impl IntoElement {
     view()
         .flex_1()
         .min_h(px(0.0))
-        .px_2()
+        .child(sidebar_header(shell))
         .child(when(
-            move || agents.with(Vec::is_empty),
-            move || {
-                view().px_2().py_2().child(if_error_or(
-                    store,
-                    "No bots yet. Create one to start a chat.",
-                    "Bots will show here once the server responds.",
-                ))
-            },
+            move || shell.search_open.get(),
+            move || search_field(shell),
         ))
-        .child(agent_list(store, agents))
+        .child(bot_scroll(shell))
+        .child(user_row(shell))
 }
 
-fn agent_list(store: Store, agents: Signal<Vec<Agent>>) -> impl IntoElement {
-    virtual_list(
-        move || agents.with(Vec::len),
-        move |at| {
-            button()
-                .w_full()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .rounded(px(8.0))
-                .bg(move || {
-                    let selected = store.selected_agent.get();
-                    let mine = agents.with(|list| {
-                        list.get(at.index())
-                            .is_some_and(|agent| Some(&agent.id) == selected.as_ref())
-                    });
-                    if mine {
-                        theme().sidebar_accent
-                    } else {
-                        theme().sidebar
-                    }
-                })
-                .hover(|style| style.bg(move || theme().sidebar_accent))
-                .on_press(move || {
-                    if let Some(id) =
-                        agents.with(|list| list.get(at.index()).map(|agent| agent.id.clone()))
-                    {
-                        store.select_agent(id);
-                    }
-                })
-                .child(initial_mark(move || {
-                    agents.with(|list| {
-                        list.get(at.index())
-                            .and_then(|agent| agent.name.chars().next())
-                            .unwrap_or('P')
-                    })
-                }))
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(
-                            text(move || {
-                                agents.with(|list| {
-                                    list.get(at.index())
-                                        .map(|agent| agent.name.clone())
-                                        .unwrap_or_default()
-                                })
-                            })
-                            .number_of_lines(1)
-                            .text_size(px(14.0))
-                            .text_color(move || theme().sidebar_foreground),
-                        )
-                        .child(
-                            text(move || {
-                                agents.with(|list| {
-                                    list.get(at.index())
-                                        .map(|agent| store.preview(&agent.id))
-                                        .unwrap_or_else(|| "No messages yet".to_owned())
-                                })
-                            })
-                            .number_of_lines(1)
-                            .text_size(px(12.0))
-                            .text_color(move || theme().muted_foreground),
-                        ),
-                )
-        },
-    )
-    .keys(move || {
-        agents.with(|list| {
-            list.iter()
-                .map(|agent| agent.id.clone())
-                .collect::<Vec<_>>()
-        })
-    })
-    .estimated_item_size(px(40.0))
-    .row_gap(px(4.0))
-    .flex_1()
-}
-
-fn details(store: Store) -> impl IntoElement {
+fn rail(shell: Shell) -> impl IntoElement {
     view()
-        .w(px(268.0))
-        .flex_shrink_0()
-        .h_full()
-        .overflow_hidden()
-        .bg(move || theme().background)
-        .border_l_1()
-        .border_color(move || theme().border)
-        .style_when(move || !store.details_open.get(), |style| style.hidden())
-        .child(details_bar(store))
-        .child(
-            scroll().flex_1().min_h(px(0.0)).child(
-                view()
-                    .px_3()
-                    .pb_4()
-                    .gap_3()
-                    .child(details_identity(store))
-                    .child(details_tabs(store))
-                    .child(
-                        when(move || store.library_tab.get(), move || library_pane())
-                            .otherwise(move || activity_pane(store)),
-                    ),
-            ),
-        )
-}
-
-fn details_bar(store: Store) -> impl IntoElement {
-    view()
-        .flex_row()
-        .justify_end()
-        .px_2()
-        .pt_2()
-        .child(ui::round_button(
-            "Close details",
-            "×",
+        .flex_1()
+        .min_h(px(0.0))
+        .items_center()
+        .pt(move || title_bar().top)
+        .gap(px(8.0))
+        .child(ui::icon_button(
+            shell,
+            "Search",
+            "search",
             false,
             || true,
-            move || store.set_details(false),
+            move || shell.open_search(),
         ))
+        .child(ui::icon_button(
+            shell,
+            "New bot",
+            "plus",
+            false,
+            || true,
+            move || shell.open_new(),
+        ))
+        .child(
+            scroll().flex_1().min_h(px(0.0)).w_full().child(
+                view()
+                    .w_full()
+                    .items_center()
+                    .gap(px(8.0))
+                    .py(px(8.0))
+                    .child(each(
+                        move || shell.bots.get(),
+                        |bot| bot.id.clone(),
+                        move |bot, _| {
+                            let id = bot.with(|item| item.id.clone());
+                            let mark = bot.with(|item| item.mark);
+                            let color = bot.with(|item| item.color);
+                            let name = bot.with(|item| item.name.clone());
+                            button()
+                                .accessibility_label(name)
+                                .rounded(px(18.0))
+                                .p(px(2.0))
+                                .cursor_pointer()
+                                .bg(move || {
+                                    let selected = shell.selected.get();
+                                    let mine = bot.with(|item| Some(&item.id) == selected.as_ref());
+                                    if mine {
+                                        theme().sidebar_accent
+                                    } else {
+                                        theme().sidebar
+                                    }
+                                })
+                                .focus(|style| {
+                                    style.outline(px(2.0)).outline_color(move || theme().ring)
+                                })
+                                .on_press(move || shell.select(id.clone()))
+                                .child(ui::mark(mark, color, 32.0))
+                        },
+                    )),
+            ),
+        )
+        .child(ui::icon_button(
+            shell,
+            "Expand sidebar",
+            "grid",
+            false,
+            || true,
+            move || shell.toggle_sidebar(),
+        ))
+        .child(view().h(px(8.0)))
 }
 
-fn details_identity(store: Store) -> impl IntoElement {
+fn sidebar_header(shell: Shell) -> impl IntoElement {
     view()
-        .items_center()
-        .gap_2()
-        .pt_1()
-        .child(
-            view()
-                .w(px(64.0))
-                .h(px(64.0))
-                .rounded(px(32.0))
-                .items_center()
-                .justify_center()
-                .bg(move || theme().primary)
-                .child(
-                    text(move || {
-                        let name = store.selected_agent_name();
-                        name.chars()
-                            .next()
-                            .map(|ch| ch.to_string())
-                            .unwrap_or_else(|| "P".to_owned())
-                    })
-                    .text_size(px(26.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(move || theme().primary_foreground),
-                ),
-        )
-        .child(
-            text(move || {
-                let name = store.selected_agent_name();
-                if name.is_empty() {
-                    "Philo".to_owned()
-                } else {
-                    name
-                }
-            })
-            .text_size(px(18.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .number_of_lines(1),
-        )
-}
-
-fn details_tabs(store: Store) -> impl IntoElement {
-    view()
+        .h(move || bar_height())
         .flex_row()
-        .justify_center()
-        .gap_4()
-        .child(tab_button(store, "Activity", false))
-        .child(tab_button(store, "Library", true))
-}
-
-fn tab_button(store: Store, label: &'static str, library: bool) -> impl IntoElement {
-    button()
-        .px_2()
-        .py_1()
-        .rounded(px(8.0))
-        .bg(move || {
-            if store.library_tab.get() == library {
-                theme().muted
-            } else {
-                theme().background
-            }
-        })
-        .on_press(move || store.show_library(library))
-        .child(
-            text(label)
-                .text_size(px(14.0))
-                .text_color(move || theme().foreground),
-        )
-}
-
-fn library_pane() -> impl IntoElement {
-    view()
-        .gap_2()
-        .child(ui::section_label("Library"))
-        .child(ui::body(
-            "Not available yet. Philo does not keep a library of files or prompts in this version.",
-        ))
-}
-
-fn activity_pane(store: Store) -> impl IntoElement {
-    view()
-        .gap_3()
-        .child(ui::section_label("Chat"))
-        .child(
-            ui::card()
-                .child(
-                    text(move || {
-                        let name = store.selected_agent_name();
-                        if name.is_empty() {
-                            "No bot".to_owned()
-                        } else {
-                            name
-                        }
-                    })
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(px(14.0)),
-                )
-                .child(
-                    text(move || {
-                        if store.selected_agent.get().is_none() {
-                            "No bot selected".to_owned()
-                        } else if store.streaming() {
-                            "Streaming a reply".to_owned()
-                        } else if store.messages.with(|list| list.is_empty()) {
-                            "No messages yet".to_owned()
-                        } else {
-                            "Idle".to_owned()
-                        }
-                    })
-                    .text_size(px(12.0))
-                    .number_of_lines(2)
-                    .text_color(move || theme().muted_foreground),
-                )
-                .child(ui::muted("Live chat state, not a review status.")),
-        )
-        .child(
-            view()
-                .flex_row()
-                .gap_2()
-                .child(ui::secondary_button(
-                    "Configure bot",
-                    move || store.selected_agent.get().is_some(),
-                    move || store.open_edit_agent(),
-                ))
-                .child(ui::secondary_button(
-                    "Reload",
-                    move || store.selected_agent.get().is_some(),
-                    move || store.reload_transcript(),
-                )),
-        )
-        .child(
-            text(move || format!("Business cursor: {}", store.business_cursor()))
-                .text_size(px(12.0))
-                .text_color(move || theme().foreground),
-        )
-        .child(
-            text(move || format!("Message seq: {}", store.message_seq()))
-                .text_size(px(12.0))
-                .text_color(move || theme().foreground),
-        )
-        .child(
-            text(move || store.socket_label.get())
-                .text_size(px(12.0))
-                .text_color(move || theme().muted_foreground),
-        )
-        .child(
-            view()
-                .flex_row()
-                .gap_2()
-                .child(ui::secondary_button(
-                    "Disconnect",
-                    move || store.selected_session.get().is_some(),
-                    move || store.disconnect_events(),
-                ))
-                .child(ui::secondary_button(
-                    "Reconnect",
-                    move || store.selected_session.get().is_some(),
-                    move || store.reconnect_events(),
-                )),
-        )
-        .child(when(
-            move || store.restart_enabled(),
-            move || {
-                view()
-                    .gap_2()
-                    .child(ui::secondary_button(
-                        "Kill server",
-                        move || true,
-                        move || store.kill_server(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Start server",
-                        move || true,
-                        move || store.start_server(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Arm during log",
-                        move || true,
-                        move || store.arm_during_log(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Arm after log",
-                        move || true,
-                        move || store.arm_after_log(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Unset fixture",
-                        move || true,
-                        move || store.unset_fixture(),
-                    ))
-                    .child(
-                        text(move || store.restart_note.get())
-                            .text_size(px(12.0))
-                            .text_color(move || theme().muted_foreground),
-                    )
-            },
-        ))
-        .child(when(
-            move || store.fixture_suffix_available(),
-            move || {
-                view()
-                    .gap_2()
-                    .child(ui::secondary_button(
-                        "Fixture suffix",
-                        move || store.selected_session.get().is_some(),
-                        move || store.post_fixture_suffix(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Stage expired cursor",
-                        move || store.selected_session.get().is_some(),
-                        move || store.stage_expired_cursor(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Hold subscribe",
-                        move || store.selected_session.get().is_some(),
-                        move || store.hold_subscribe(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Hold next subscribe",
-                        move || true,
-                        move || store.hold_next_subscribe(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Release subscribe",
-                        move || true,
-                        move || store.release_subscribe(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Fail reads",
-                        move || store.selected_session.get().is_some(),
-                        move || store.fail_reads(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Release reads",
-                        move || store.selected_session.get().is_some(),
-                        move || store.release_reads(),
-                    ))
-                    .child(
-                        text(move || format!("Business reads: {}", store.business_reads()))
-                            .text_size(px(12.0))
-                            .text_color(move || theme().foreground),
-                    )
-                    .child(ui::secondary_button(
-                        "Gap event",
-                        move || store.selected_session.get().is_some(),
-                        move || store.post_gap_event(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Stage during read",
-                        move || store.selected_session.get().is_some(),
-                        move || store.stage_during_read(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Stream delta",
-                        move || store.selected_session.get().is_some(),
-                        move || store.post_stream_delta(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Abandon socket",
-                        move || store.selected_session.get().is_some(),
-                        move || store.abandon_socket(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Old socket delta",
-                        move || store.selected_session.get().is_some(),
-                        move || store.post_old_socket_delta(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Foreign event",
-                        move || true,
-                        move || store.post_foreign_event(),
-                    ))
-                    .child(ui::secondary_button(
-                        "Foreign stream",
-                        move || true,
-                        move || store.post_foreign_stream(),
-                    ))
-                    .child(
-                        text(move || store.fixture_suffix_note.get())
-                            .text_size(px(12.0))
-                            .text_color(move || theme().muted_foreground),
-                    )
-            },
-        ))
-        .child(ui::section_label("Suggested"))
-        .child(nav_button(store, Route::Skills, "Skills", true))
-        .child(nav_button(store, Route::Routines, "Routines", true))
-        .child(ui::section_label("Computer"))
-        .child(makez_card(store))
-        .child(ui::section_label("Voice chat"))
-        .child(ui::muted("Voice chat is not available yet."))
-        .child(ui::section_label("More"))
-        .child(nav_button(
-            store,
-            Route::Notifications,
-            "Notifications",
-            true,
-        ))
-        .child(nav_button(store, Route::Memory, "Memory", true))
-        .child(nav_button(store, Route::Attachments, "Attachments", true))
-        .child(nav_button(store, Route::ToolCalls, "Tool calls", true))
-        .child(nav_button(store, Route::Settings, "Settings", false))
-        .child(nav_button(store, Route::Connectors, "Connectors", false))
-        .child(nav_button(store, Route::Chat, "Chat", false))
-}
-
-fn makez_card(store: Store) -> impl IntoElement {
-    ui::card()
-        .child(
-            text("Makez")
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_size(px(14.0)),
-        )
-        .child(
-            text(move || {
-                let reported = store.connectors.with(|list| {
-                    list.iter()
-                        .find(|item| {
-                            item.id.eq_ignore_ascii_case("makez")
-                                || item.name.eq_ignore_ascii_case("makez")
-                        })
-                        .map(|item| {
-                            if item.connected {
-                                "Connected".to_owned()
-                            } else if item.reason.trim().is_empty() {
-                                "Not connected".to_owned()
-                            } else {
-                                format!("Not connected. {}", item.reason)
-                            }
-                        })
-                });
-                if let Some(line) = reported {
-                    line
-                } else if store.health.with(|health| {
-                    health
-                        .as_ref()
-                        .is_some_and(|item| item.makez == "disconnected")
-                }) {
-                    "Not connected. Makez is not configured.".to_owned()
-                } else {
-                    "Connector status is not available until the server responds.".to_owned()
-                }
-            })
-            .text_size(px(12.0))
-            .text_color(move || theme().muted_foreground),
-        )
-}
-
-fn initial_mark(letter: impl Fn() -> char + 'static) -> impl IntoElement {
-    view()
-        .w(px(28.0))
-        .h(px(28.0))
-        .rounded(px(14.0))
         .items_center()
-        .justify_center()
-        .bg(move || theme().primary)
-        .child(
-            text(move || letter().to_string())
-                .text_size(px(13.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(move || theme().primary_foreground),
-        )
+        .pl(move || title_bar().left + px(8.0))
+        .pr(px(12.0))
+        .gap(px(8.0))
+        .window_drag(true)
+        .child(view().flex_1().window_drag(true))
+        .child(ui::icon_button(
+            shell,
+            "Search",
+            "search",
+            false,
+            || true,
+            move || shell.open_search(),
+        ))
+        .child(ui::icon_button(
+            shell,
+            "New bot",
+            "plus",
+            false,
+            || true,
+            move || shell.open_new(),
+        ))
 }
 
-fn nav_button(
-    store: Store,
-    route: Route,
-    label: &'static str,
-    unfinished: bool,
-) -> impl IntoElement {
+fn search_field(shell: Shell) -> impl IntoElement {
+    view().px(px(12.0)).pb(px(8.0)).child(
+        ui::field("Search bots")
+            .element_ref(&shell.search_field)
+            .test_id("search")
+            .value(move || shell.query.get())
+            .on_change(move |text: &str| shell.query.set(text.to_owned()))
+            .w_full(),
+    )
+}
+
+fn bot_scroll(shell: Shell) -> impl IntoElement {
+    scroll().flex_1().min_h(px(0.0)).child(
+        view()
+            .px(px(8.0))
+            .pb(px(12.0))
+            .gap(px(2.0))
+            .child(when(move || shell.pin_visible(), move || pin(shell)))
+            .child(group(shell, "demo", "Demo"))
+            .child(group(shell, "unassigned", "Unassigned"))
+            .child(when(
+                move || {
+                    shell.search_open.get()
+                        && !shell.query.get().trim().is_empty()
+                        && !shell.any_match()
+                },
+                || {
+                    view().px(px(12.0)).py(px(16.0)).child(ui::quiet(
+                        "No bots match. Demo rows are the only ones here.",
+                    ))
+                },
+            )),
+    )
+}
+
+fn pin(shell: Shell) -> impl IntoElement {
+    button()
+        .w_full()
+        .items_center()
+        .gap(px(6.0))
+        .pt(px(8.0))
+        .pb(px(14.0))
+        .cursor_pointer()
+        .rounded(px(16.0))
+        .hover(|style| style.bg(move || theme().sidebar_accent))
+        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+        .accessibility_label("Philo")
+        .on_press(move || shell.select("philo".to_owned()))
+        .child(ui::mark('P', 0xf93498, 64.0))
+        .child(
+            text("Philo")
+                .text_size(px(14.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(move || theme().sidebar_foreground),
+        )
+        .child(ui::quiet("Demo"))
+}
+
+fn group(shell: Shell, id: &'static str, title: &'static str) -> impl IntoElement {
+    view()
+        .gap(px(2.0))
+        .child(group_header(shell, id, title))
+        .child(when(
+            move || shell.group_open(id) && !shell.bots_in(id).is_empty(),
+            move || {
+                view().gap(px(2.0)).child(each(
+                    move || shell.bots_in(id),
+                    |bot| bot.id.clone(),
+                    move |bot, _| bot_row(shell, bot),
+                ))
+            },
+        ))
+}
+
+fn group_header(shell: Shell, id: &'static str, title: &'static str) -> impl IntoElement {
     button()
         .w_full()
         .flex_row()
         .items_center()
-        .gap_2()
-        .px_3()
-        .py_1()
-        .rounded(px(8.0))
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded(px(10.0))
+        .cursor_pointer()
         .bg(move || {
-            if store.route.get() == route {
+            if shell.group_open(id) {
+                theme().sidebar
+            } else {
+                theme().sidebar_accent
+            }
+        })
+        .hover(|style| style.bg(move || theme().sidebar_accent))
+        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+        .accessibility_label(title)
+        .on_press(move || shell.toggle_group(id))
+        .child(
+            text(title)
+                .flex_1()
+                .text_size(px(13.0))
+                .text_color(move || theme().muted_foreground),
+        )
+        .child(
+            when(
+                move || shell.group_open(id),
+                move || ui::glyph(shell, "chevron-down", false),
+            )
+            .otherwise(move || ui::glyph(shell, "chevron-right", false)),
+        )
+}
+
+fn bot_row(shell: Shell, bot: ReadSignal<crate::local::Bot>) -> impl IntoElement {
+    let id = bot.with(|item| item.id.clone());
+    button()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .px(px(8.0))
+        .py(px(8.0))
+        .rounded(px(12.0))
+        .cursor_pointer()
+        .bg(move || {
+            let selected = shell.selected.get();
+            let mine = bot.with(|item| Some(&item.id) == selected.as_ref());
+            if mine {
                 theme().sidebar_accent
             } else {
                 theme().sidebar
             }
         })
         .hover(|style| style.bg(move || theme().sidebar_accent))
-        .on_press(move || store.show(route))
+        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+        .on_press(move || shell.select(id.clone()))
+        .child(ui::mark(
+            bot.with(|item| item.mark),
+            bot.with(|item| item.color),
+            36.0,
+        ))
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap(px(2.0))
+                .child(
+                    text(move || bot.with(|item| item.name.clone()))
+                        .number_of_lines(1)
+                        .text_size(px(14.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(move || theme().sidebar_foreground),
+                )
+                .child(
+                    text(move || bot.with(|item| item.summary.clone()))
+                        .number_of_lines(1)
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                ),
+        )
+}
+
+fn user_row(shell: Shell) -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .px(px(12.0))
+        .py(px(10.0))
+        .border_t_1()
+        .border_color(move || theme().sidebar_border)
+        .child(
+            button()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .cursor_pointer()
+                .rounded(px(10.0))
+                .px(px(4.0))
+                .py(px(4.0))
+                .hover(|style| style.bg(move || theme().sidebar_accent))
+                .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+                .accessibility_label("Demo account")
+                .on_press(move || {
+                    shell.notice("This is a demo profile. Accounts are not available.");
+                })
+                .child(ui::mark('D', 0x8b909a, 32.0))
+                .child(
+                    view().flex_1().min_w(px(0.0)).child(
+                        text("Demo")
+                            .number_of_lines(1)
+                            .text_size(px(14.0))
+                            .text_color(move || theme().sidebar_foreground),
+                    ),
+                ),
+        )
+        .child(ui::icon_button(
+            shell,
+            "Collapse sidebar",
+            "grid",
+            false,
+            || true,
+            move || shell.toggle_sidebar(),
+        ))
+}
+
+fn details(shell: Shell) -> impl IntoElement {
+    view()
+        .w(px(DETAILS))
+        .flex_shrink_0()
+        .h_full()
+        .overflow_hidden()
+        .bg(move || theme().background)
+        .border_l_1()
+        .border_color(move || theme().border)
+        .style_when(move || !shell.details_open.get(), |style| style.hidden())
+        .child(details_bar(shell))
+        .child(
+            scroll().flex_1().min_h(px(0.0)).child(
+                view()
+                    .px(px(16.0))
+                    .pb(px(24.0))
+                    .gap(px(14.0))
+                    .child(identity(shell))
+                    .child(tabs(shell))
+                    .child(
+                        when(move || shell.library.get(), move || library(shell))
+                            .otherwise(move || activity(shell)),
+                    ),
+            ),
+        )
+}
+
+fn details_bar(shell: Shell) -> impl IntoElement {
+    view()
+        .h(move || bar_height())
+        .flex_row()
+        .items_center()
+        .justify_end()
+        .pr(move || title_bar().right + px(10.0))
+        .window_drag(true)
+        .child(ui::icon_button(
+            shell,
+            "Close details",
+            "close",
+            false,
+            || true,
+            move || shell.close_details(),
+        ))
+}
+
+fn identity(shell: Shell) -> impl IntoElement {
+    view()
+        .items_center()
+        .gap(px(8.0))
+        .pt(px(4.0))
+        .child(live_mark(shell, 72.0))
+        .child(
+            text(move || {
+                shell
+                    .selected_bot()
+                    .map(|bot| bot.name)
+                    .unwrap_or_else(|| "Philo".to_owned())
+            })
+            .text_size(px(18.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .number_of_lines(1),
+        )
+        .child(ui::quiet(move || {
+            if shell.selected_bot().is_some_and(|bot| bot.demo) {
+                "Demo".to_owned()
+            } else {
+                "Local".to_owned()
+            }
+        }))
+}
+
+fn tabs(shell: Shell) -> impl IntoElement {
+    view()
+        .self_center()
+        .flex_row()
+        .p(px(3.0))
+        .gap(px(2.0))
+        .rounded(px(18.0))
+        .bg(move || theme().muted)
+        .child(tab(shell, "Activity", false))
+        .child(tab(shell, "Library", true))
+}
+
+fn tab(shell: Shell, label: &'static str, library: bool) -> impl IntoElement {
+    button()
+        .px(px(16.0))
+        .py(px(6.0))
+        .rounded(px(14.0))
+        .cursor_pointer()
+        .bg(move || {
+            if shell.library.get() == library {
+                theme().card
+            } else {
+                theme().muted
+            }
+        })
+        .shadow_sm()
+        .style_when(
+            move || shell.library.get() != library,
+            |style| style.shadow_none(),
+        )
+        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+        .accessibility_label(label)
+        .on_press(move || shell.show_library(library))
         .child(
             text(label)
-                .flex_1()
-                .number_of_lines(1)
-                .text_size(px(13.0))
-                .text_color(move || theme().sidebar_foreground),
+                .text_size(px(14.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || theme().foreground),
         )
-        .child(when(
-            move || unfinished,
-            || {
-                text("Not yet")
-                    .text_size(px(11.0))
-                    .text_color(move || theme().muted_foreground)
-            },
-        ))
 }
 
-fn banners(store: Store) -> impl IntoElement {
+fn activity(shell: Shell) -> impl IntoElement {
     view()
-        .child(when(
-            move || {
-                store
-                    .health
-                    .with(|health| health.as_ref().is_some_and(|item| item.adapter == "dev"))
-            },
-            || {
-                view()
-                    .px_4()
-                    .py_2()
-                    .bg(move || theme().muted)
-                    .border_b_1()
-                    .border_color(move || theme().border)
-                    .child(
-                        text("Development adapter. This is not a live model.")
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(move || theme().foreground),
-                    )
-            },
-        ))
-        .child(when(
-            move || {
-                store.health.with(|health| {
-                    health
-                        .as_ref()
-                        .is_some_and(|item| !item.adapter.is_empty() && item.adapter != "dev")
-                })
-            },
-            move || {
-                view().px_4().py_2().child(
-                    text(move || {
-                        store.health.with(|health| {
-                            health
-                                .as_ref()
-                                .map(|item| format!("Adapter: {}", item.adapter))
-                                .unwrap_or_default()
-                        })
-                    })
-                    .text_size(px(13.0))
-                    .text_color(move || theme().foreground),
-                )
-            },
-        ))
-        .child(when(
-            move || {
-                store.health.with(|health| {
-                    health
-                        .as_ref()
-                        .is_some_and(|item| item.makez == "disconnected")
-                })
-            },
-            || {
-                view().px_4().pb_2().child(
-                    text("Makez is not connected.")
-                        .text_size(px(13.0))
-                        .text_color(move || theme().muted_foreground),
-                )
-            },
-        ))
-        .child(when(
-            move || store.rebuilt_from_snapshot.get(),
-            || {
-                view().px_4().pb_2().child(
-                    text("Business cursor expired. This chat was rebuilt from the snapshot.")
-                        .text_size(px(13.0))
-                        .text_color(move || theme().foreground),
-                )
-            },
-        ))
-        .child(error_line(store, true))
-        .child(error_line(store, false))
+        .gap(px(16.0))
+        .child(ui::section_label("Demo"))
+        .child(activity_card(shell))
+        .child(suggested(shell))
+        .child(files_block(shell))
+        .child(computer(shell))
 }
 
-fn error_line(store: Store, server: bool) -> impl IntoElement {
-    when(
-        move || {
-            if server {
-                store.server_error.get().is_some()
-            } else {
-                store.action_error.get().is_some()
-            }
-        },
-        move || {
+fn activity_card(shell: Shell) -> impl IntoElement {
+    view().gap(px(8.0)).child(
+        when(
+            move || shell.activity().is_empty(),
+            || {
+                card().child(ui::quiet(
+                    "No activity. Demo rows are samples, and nothing here is a run.",
+                ))
+            },
+        )
+        .otherwise(move || {
             view()
-                .px_4()
-                .py_2()
-                .bg(move || theme().card)
-                .border_b_1()
-                .border_color(move || theme().destructive)
-                .child(
-                    text(move || {
-                        if server {
-                            store.server_error.get().unwrap_or_default()
-                        } else {
-                            store.action_error.get().unwrap_or_default()
-                        }
-                    })
-                    .text_size(px(13.0))
-                    .text_color(move || theme().destructive),
-                )
-        },
+                .gap(px(8.0))
+                .child(card().child(each(
+                    move || shell.activity(),
+                    |row| row.title.clone(),
+                    move |row, _| activity_row(shell, row),
+                )))
+                .child(when(
+                    move || {
+                        !shell.activity_more.get()
+                            && shell.selected_bot().is_some_and(|bot| bot.demo)
+                    },
+                    move || {
+                        button()
+                            .self_center()
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(8.0))
+                            .focus(|style| {
+                                style.outline(px(2.0)).outline_color(move || theme().ring)
+                            })
+                            .accessibility_label("Show more")
+                            .on_press(move || shell.activity_more.set(true))
+                            .child(ui::quiet("Show more"))
+                    },
+                ))
+        }),
     )
 }
 
-fn if_error_or(store: Store, empty: &'static str, failed: &'static str) -> Text {
-    text(move || {
-        if store.server_error.get().is_some() {
-            failed.to_owned()
-        } else {
-            empty.to_owned()
-        }
+fn activity_row(shell: Shell, row: ReadSignal<crate::local::Activity>) -> impl IntoElement {
+    button()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .py(px(8.0))
+        .cursor_pointer()
+        .rounded(px(8.0))
+        .hover(|style| style.bg(move || theme().accent))
+        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+        .on_press(move || {
+            shell.notice("Demo sample. This is not a run, and no model was asked.");
+        })
+        .child(
+            view()
+                .size(px(18.0))
+                .rounded(px(9.0))
+                .bg(move || theme().muted),
+        )
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    text(move || row.with(|item| item.title.clone()))
+                        .number_of_lines(1)
+                        .text_size(px(14.0)),
+                )
+                .child(
+                    text(move || row.with(|item| item.detail.clone()))
+                        .number_of_lines(1)
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                ),
+        )
+        .child(ui::glyph(shell, "chevron-right", false))
+}
+
+fn suggested(shell: Shell) -> impl IntoElement {
+    view()
+        .gap(px(8.0))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .child(ui::section_label("Suggested").flex_1())
+                .child(
+                    button()
+                        .cursor_pointer()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(8.0))
+                        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+                        .accessibility_label("Hide suggested")
+                        .on_press(move || {
+                            shell.suggested_hidden.update(|hidden| *hidden = !*hidden);
+                        })
+                        .child(ui::quiet(move || {
+                            if shell.suggested_hidden.get() {
+                                "Show".to_owned()
+                            } else {
+                                "Hide".to_owned()
+                            }
+                        })),
+                ),
+        )
+        .child(when(
+            move || !shell.suggested_hidden.get(),
+            move || {
+                card()
+                    .child(suggest_row(shell, "Share", "Not available", move || {
+                        shell.notice("Share is not available.");
+                    }))
+                    .child(suggest_row(shell, "Voice", "Not available", move || {
+                        shell.notice("Voice is not available. The microphone stays off.");
+                    }))
+            },
+        ))
+}
+
+fn suggest_row(
+    shell: Shell,
+    title: &'static str,
+    detail: &'static str,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    button()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .py(px(8.0))
+        .cursor_pointer()
+        .rounded(px(8.0))
+        .hover(|style| style.bg(move || theme().accent))
+        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+        .accessibility_label(title)
+        .on_press(on_press)
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(text(title).text_size(px(14.0)))
+                .child(
+                    text(detail)
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground),
+                ),
+        )
+        .child(ui::glyph(shell, "chevron-right", false))
+}
+
+fn files_block(shell: Shell) -> impl IntoElement {
+    view()
+        .gap(px(8.0))
+        .child(ui::section_label("Files"))
+        .child(file_list(shell))
+}
+
+fn library(shell: Shell) -> impl IntoElement {
+    view()
+        .gap(px(8.0))
+        .child(ui::section_label("Files"))
+        .child(ui::quiet(
+            "Local names only. Nothing is uploaded, and Connect is not available.",
+        ))
+        .child(file_list(shell))
+}
+
+fn file_list(shell: Shell) -> impl IntoElement {
+    when(
+        move || shell.files().is_empty(),
+        || card().child(ui::quiet("No files in this window.")),
+    )
+    .otherwise(move || {
+        card().child(each(
+            move || shell.files(),
+            |name| name.clone(),
+            move |name, _| {
+                button()
+                    .w_full()
+                    .flex_row()
+                    .items_center()
+                    .py(px(8.0))
+                    .cursor_pointer()
+                    .rounded(px(8.0))
+                    .hover(|style| style.bg(move || theme().accent))
+                    .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+                    .on_press(move || {
+                        shell.notice("Demo file. It is not opened, and it is not sent.");
+                    })
+                    .child(
+                        view()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(
+                                text(move || name.get())
+                                    .number_of_lines(1)
+                                    .text_size(px(14.0)),
+                            )
+                            .child(ui::quiet("Demo file")),
+                    )
+                    .child(ui::glyph(shell, "chevron-right", false))
+            },
+        ))
     })
-    .text_size(px(12.0))
-    .text_color(move || theme().muted_foreground)
+}
+
+fn computer(shell: Shell) -> impl IntoElement {
+    view()
+        .gap(px(8.0))
+        .child(ui::section_label("Computer"))
+        .child(
+            button()
+                .w_full()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .p(px(12.0))
+                .rounded(px(16.0))
+                .border_1()
+                .border_color(move || theme().border)
+                .bg(move || theme().card)
+                .cursor_pointer()
+                .hover(|style| style.bg(move || theme().accent))
+                .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+                .accessibility_label("Connect")
+                .on_press(move || shell.notice("Connect is not available."))
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .gap(px(2.0))
+                        .child(
+                            text("This computer")
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::SEMIBOLD),
+                        )
+                        .child(ui::quiet("Connect is not available.")),
+                )
+                .child(
+                    view()
+                        .w(px(72.0))
+                        .h(px(48.0))
+                        .rounded(px(10.0))
+                        .items_center()
+                        .justify_center()
+                        .bg(move || theme().muted)
+                        .child(ui::quiet("Not connected")),
+                ),
+        )
+}
+
+fn live_mark(shell: Shell, size: f32) -> impl IntoElement {
+    let font = (size * 0.42).clamp(11.0, 28.0);
+    view()
+        .size(px(size))
+        .rounded(px(size / 2.0))
+        .items_center()
+        .justify_center()
+        .bg(move || {
+            rgb(shell
+                .selected_bot()
+                .map(|bot| bot.color)
+                .unwrap_or(0xf93498))
+        })
+        .child(
+            text(move || {
+                shell
+                    .selected_bot()
+                    .map(|bot| bot.mark.to_string())
+                    .unwrap_or_else(|| "P".to_owned())
+            })
+            .text_size(px(font))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(white()),
+        )
+}
+
+fn card() -> View {
+    view()
+        .p(px(12.0))
+        .gap(px(2.0))
+        .rounded(px(16.0))
+        .border_1()
+        .border_color(move || theme().border)
+        .bg(move || theme().card)
 }
