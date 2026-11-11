@@ -16,25 +16,23 @@ pub fn column(shell: Shell) -> impl IntoElement {
         .relative()
         .overflow_hidden()
         .bg(move || theme().background)
+        .child(header(shell))
         .child(notice(shell))
         .child(new_bot(shell))
         .child(transcript(shell))
         .child(composer(shell))
-        .child(header(shell))
 }
 
 fn header(shell: Shell) -> impl IntoElement {
-    // The pills float on the thread. The row itself is clear, so a bubble
-    // can run behind the name. Share stays in its own bounds.
+    // Clear row, painted above the thread. The transcript tucks up under it
+    // so the name pill rests on a bubble's top edge, not on its glyphs.
     view()
-        .absolute()
-        .top(px(0.0))
-        .left(px(0.0))
-        .right(px(0.0))
         .h(move || {
             let top = title_bar().top.0;
             px(top.max(52.0))
         })
+        .mb(px(-28.0))
+        .flex_shrink_0()
         .flex_row()
         .items_center()
         .px(px(12.0))
@@ -210,7 +208,7 @@ fn message_list(shell: Shell) -> impl IntoElement {
         .inverted()
         .estimated_item_size(px(84.0))
         .content_padding(px(12.0))
-        .row_gap(px(6.0))
+        .row_gap(px(3.0))
         .flex_1()
         .element_ref(&shell.transcript)
         .empty(empty_transcript(shell))
@@ -288,7 +286,8 @@ fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
             .max_w(relative(0.92))
             .gap(px(6.0))
             .px(px(12.0))
-            .py(px(8.0))
+            .pt(px(34.0))
+            .pb(px(8.0))
             .rounded(px(18.0))
             .bg(rgb(0xca317e))
             .child(previews(shell, at))
@@ -310,7 +309,8 @@ fn note_bubble(shell: Shell, at: Position) -> impl IntoElement {
         view()
             .max_w(relative(0.92))
             .px(px(12.0))
-            .py(px(8.0))
+            .pt(px(34.0))
+            .pb(px(8.0))
             .rounded(px(18.0))
             .bg(move || theme().muted)
             .child(
