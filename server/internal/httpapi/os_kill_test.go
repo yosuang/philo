@@ -1345,7 +1345,7 @@ func waitHealthy(t *testing.T, p *philoProc, execution string) {
 func buildPhiloServer(t *testing.T) string {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "philo-server")
-	cmd := exec.Command("go", "build", "-o", out, "./server")
+	cmd := exec.Command("go", "build", "-o", out, ".")
 	cmd.Dir = moduleRoot(t)
 	cmd.Env = os.Environ()
 	raw, err := cmd.CombinedOutput()
