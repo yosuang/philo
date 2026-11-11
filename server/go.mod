@@ -1,4 +1,4 @@
-module github.com/yosuang/philo
+module github.com/yosuang/philo/server
 
 go 1.22.2
 

@@ -3,7 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/philo-server ./server
+RUN CGO_ENABLED=0 go build -o /out/philo-server .
 
 FROM debian:bookworm-slim
 RUN apt-get update \

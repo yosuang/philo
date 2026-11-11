@@ -21,8 +21,8 @@ services:
 
   server:
     build:
-      context: .
-      dockerfile: server/Dockerfile
+      context: ./server
+      dockerfile: Dockerfile
     environment:
       PHILO_DATABASE_URL: postgres://philo:philo@postgres:5432/philo?sslmode=disable
       PHILO_HTTP_ADDR: ":8080"
