@@ -1,19 +1,24 @@
-//! Philo desktop client. The window is Native Shell. A bot's chat is restored
-//! from the Go server; the user does not pick a session.
+//! Philo desktop. The window is a local three-column shell.
+//! The server client stays in the crate and is not started.
 
+#[allow(dead_code)]
 mod client;
+mod local;
+#[allow(dead_code)]
 mod model;
 mod pages;
 mod shell;
+#[allow(dead_code)]
 mod store;
 mod ui;
 
-use nsh_base::theme;
-use nsh_core::desktop::{MenuRole, WindowFrame};
-use nsh_core::element::desktop::{MenuItem, set_application_menu, set_frame, set_title};
+use nsh_core::desktop::{MenuRole, TitleBarStyle, WindowFrame};
+use nsh_core::element::desktop::{
+    MenuItem, set_application_menu, set_frame, set_title, set_title_bar,
+};
 use nsh_core::prelude::*;
 
-use crate::store::{AppearanceChoice, Route, Store};
+use crate::local::{AppearanceChoice, Shell};
 
 /// The crate's UI set (`nsh.json` `"rust"`).
 #[native_module("philo/native")]
@@ -25,22 +30,34 @@ fn native(registry: &mut Registry) {
 #[component]
 pub fn App() -> impl IntoElement {
     let _ = env_logger::try_init();
-    let store = Store::boot();
-    set_title("Philo");
-    set_frame(WindowFrame {
-        width: Some(px(1024.0)),
-        height: Some(px(748.0)),
-        ..WindowFrame::default()
+    // `nsh run` reads `nsh.json`'s theme. The binary applies the same file
+    // itself, so a direct launch is not stuck on the default neutral theme.
+    if let Ok(theme) = nsh_base::Theme::from_json(include_str!("../theme.json")) {
+        set_tokens(theme.into_tokens());
+    }
+    let shell = Shell::boot();
+    effect(|| {
+        set_title("Philo");
+        // One window, the size `main` already asked for. Outer frame on
+        // macOS and Windows, GTK's default size on Linux. Not a new size.
+        set_frame(WindowFrame {
+            width: Some(px(1024.0)),
+            height: Some(px(748.0)),
+            ..WindowFrame::default()
+        });
+        set_title_bar(TitleBarStyle::Hidden, Some(px(52.0)));
     });
-    install_menu(store);
+    install_menu(shell);
+    on_key("escape", move |_| shell.dismiss_top());
+    on_key("mod+f", move |_| shell.open_search());
     view()
         .flex_1()
-        .bg(move || theme().background)
-        .text_color(move || theme().foreground)
-        .child(shell::shell(store))
+        .bg(move || nsh_base::theme().background)
+        .text_color(move || nsh_base::theme().foreground)
+        .child(shell::shell(shell))
 }
 
-fn install_menu(store: Store) {
+fn install_menu(shell: Shell) {
     effect(move || {
         set_application_menu(vec![
             MenuItem::submenu(
@@ -48,9 +65,7 @@ fn install_menu(store: Store) {
                 [
                     MenuItem::new("New bot")
                         .shortcut("mod+n")
-                        .on_select(move || store.open_new_agent()),
-                    MenuItem::separator(),
-                    MenuItem::new("Settings").on_select(move || store.show(Route::Settings)),
+                        .on_select(move || shell.open_new()),
                     MenuItem::separator(),
                     MenuItem::role(MenuRole::Quit).label("Quit"),
                 ],
@@ -71,11 +86,15 @@ fn install_menu(store: Store) {
                 "View",
                 [
                     MenuItem::new("Light appearance")
-                        .on_select(move || store.set_appearance(AppearanceChoice::Light)),
+                        .on_select(move || shell.set_appearance(AppearanceChoice::Light)),
                     MenuItem::new("Dark appearance")
-                        .on_select(move || store.set_appearance(AppearanceChoice::Dark)),
+                        .on_select(move || shell.set_appearance(AppearanceChoice::Dark)),
                     MenuItem::new("System appearance")
-                        .on_select(move || store.set_appearance(AppearanceChoice::System)),
+                        .on_select(move || shell.set_appearance(AppearanceChoice::System)),
+                    MenuItem::separator(),
+                    MenuItem::new("Details")
+                        .shortcut("mod+shift+d")
+                        .on_select(move || shell.toggle_details()),
                 ],
             ),
         ]);
