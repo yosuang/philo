@@ -13,28 +13,34 @@ pub fn column(shell: Shell) -> impl IntoElement {
         .flex_1()
         .min_w(px(0.0))
         .h_full()
+        .relative()
         .bg(move || theme().background)
-        .child(header(shell))
         .child(notice(shell))
         .child(new_bot(shell))
         .child(transcript(shell))
         .child(composer(shell))
+        .child(header(shell))
 }
 
 fn header(shell: Shell) -> impl IntoElement {
     view()
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .right(px(0.0))
         .h(move || {
             let top = title_bar().top.0;
             px(top.max(52.0))
         })
+        .z_index(2)
         .flex_row()
         .items_center()
         .px(px(12.0))
         .pr(move || title_bar().right + px(12.0))
-        .window_drag(true)
-        .child(view().flex_1().window_drag(true))
+        .pointer_events(PointerEvents::BoxNone)
+        .child(view().flex_1())
         .child(bot_pill(shell))
-        .child(view().flex_1().window_drag(true))
+        .child(view().flex_1())
         .child(share_button(shell))
 }
 
@@ -78,29 +84,10 @@ fn bot_pill(shell: Shell) -> impl IntoElement {
 }
 
 fn header_mark(shell: Shell) -> impl IntoElement {
-    view()
-        .size(px(18.0))
-        .rounded(px(9.0))
-        .items_center()
-        .justify_center()
-        .flex_shrink_0()
-        .bg(move || {
-            rgb(shell
-                .selected_bot()
-                .map(|bot| bot.color)
-                .unwrap_or(0xf93498))
-        })
-        .child(
-            text(move || {
-                shell
-                    .selected_bot()
-                    .map(|bot| bot.mark.to_string())
-                    .unwrap_or_else(|| "P".to_owned())
-            })
-            .text_size(px(10.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(white()),
-        )
+    ui::blob_live(
+        move || shell.selected_bot().map(|bot| bot.shape).unwrap_or(0),
+        18.0,
+    )
 }
 
 fn share_button(shell: Shell) -> impl IntoElement {
@@ -133,6 +120,7 @@ fn notice(shell: Shell) -> impl IntoElement {
         move || shell.notice.get().is_some(),
         move || {
             view()
+                .mt(px(52.0))
                 .mx(px(16.0))
                 .mb(px(4.0))
                 .px(px(12.0))
@@ -152,7 +140,7 @@ fn notice(shell: Shell) -> impl IntoElement {
                     shell,
                     "Dismiss",
                     "close",
-                    false,
+                    ui::Circle::White,
                     || true,
                     move || shell.dismiss_notice(),
                 ))
@@ -164,7 +152,9 @@ fn new_bot(shell: Shell) -> impl IntoElement {
     view()
         .flex_1()
         .min_h(px(0.0))
-        .p(px(24.0))
+        .pt(px(64.0))
+        .px(px(24.0))
+        .pb(px(24.0))
         .gap(px(12.0))
         .style_when(move || !shell.creating.get(), |style| style.hidden())
         .child(
@@ -256,27 +246,10 @@ fn empty_transcript(shell: Shell) -> impl IntoElement {
 }
 
 fn time_mark(shell: Shell) -> impl IntoElement {
-    view()
-        .size(px(14.0))
-        .rounded(px(7.0))
-        .items_center()
-        .justify_center()
-        .bg(move || {
-            rgb(shell
-                .selected_bot()
-                .map(|bot| bot.color)
-                .unwrap_or(0xf93498))
-        })
-        .child(
-            text(move || {
-                shell
-                    .selected_bot()
-                    .map(|bot| bot.mark.to_string())
-                    .unwrap_or_else(|| "P".to_owned())
-            })
-            .text_size(px(8.0))
-            .text_color(white()),
-        )
+    ui::blob_live(
+        move || shell.selected_bot().map(|bot| bot.shape).unwrap_or(0),
+        14.0,
+    )
 }
 
 fn message_row(shell: Shell, at: Position) -> impl IntoElement {
@@ -314,7 +287,7 @@ fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
             .px(px(12.0))
             .py(px(8.0))
             .rounded(px(18.0))
-            .bg(move || theme().primary)
+            .bg(rgb(0xca317e))
             .child(previews(shell, at))
             .child(
                 text(move || {
@@ -398,7 +371,7 @@ fn jump(shell: Shell) -> impl IntoElement {
                     shell,
                     "Jump to bottom",
                     "down",
-                    false,
+                    ui::Circle::White,
                     || true,
                     move || shell.jump_bottom(),
                 ))
@@ -449,7 +422,7 @@ fn composer(shell: Shell) -> impl IntoElement {
                             shell,
                             "Attach a local preview",
                             "plus",
-                            false,
+                            ui::Circle::Bare,
                             || true,
                             move || shell.add_preview(),
                         ))
@@ -458,7 +431,7 @@ fn composer(shell: Shell) -> impl IntoElement {
                             shell,
                             "Voice is not available",
                             "mic",
-                            false,
+                            ui::Circle::Gray,
                             || true,
                             move || {
                                 shell.notice("Voice is not available. The microphone stays off.");
@@ -469,7 +442,7 @@ fn composer(shell: Shell) -> impl IntoElement {
                             shell,
                             "Show in this window",
                             "up",
-                            true,
+                            ui::Circle::Send,
                             can_send,
                             move || shell.send(),
                         )),

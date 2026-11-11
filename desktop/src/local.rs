@@ -49,8 +49,8 @@ pub struct Bot {
     pub name: String,
     pub summary: String,
     pub group: String,
-    pub mark: char,
-    pub color: u32,
+    /// Which blob drawing this bot uses. Not a letter.
+    pub shape: u8,
     /// Seed rows. A bot the window creates locally is not seed data.
     pub demo: bool,
 }
@@ -237,16 +237,14 @@ impl Shell {
             return;
         }
         let id = self.alloc("bot");
-        let mark = name.chars().next().unwrap_or('B').to_ascii_uppercase();
-        let color = PALETTE[self.bots.with(Vec::len) % PALETTE.len()];
+        let shape = (self.bots.with(Vec::len) % 8) as u8;
         self.bots.update(|bots| {
             bots.push(Bot {
                 id: id.clone(),
                 name,
                 summary: "Local · no messages yet".to_owned(),
                 group: "unassigned".to_owned(),
-                mark,
-                color,
+                shape,
                 demo: false,
             });
         });
@@ -445,8 +443,6 @@ impl Shell {
     }
 }
 
-const PALETTE: [u32; 6] = [0x3d9a78, 0x3b82c4, 0xe0a23a, 0x7c6ad6, 0xde5d4a, 0x4aa3a8];
-
 fn seed_bots() -> Vec<Bot> {
     vec![
         bot(
@@ -454,100 +450,64 @@ fn seed_bots() -> Vec<Bot> {
             "Philo",
             "Demo · a local bot in this window",
             "demo",
-            'P',
-            0xf93498,
+            0,
         ),
         bot(
             "notes",
             "Notes",
             "Demo · sample lines stay in this window",
             "demo",
-            'N',
-            0x2f9d78,
+            1,
         ),
         bot(
             "field",
             "Field",
             "Demo · nothing here is a model run",
             "demo",
-            'F',
-            0x3b82c4,
+            4,
         ),
-        bot(
-            "desk",
-            "Desk",
-            "Demo · an empty chat",
-            "demo",
-            'D',
-            0xe0a23a,
-        ),
-        bot(
-            "lamp",
-            "Lamp",
-            "Demo · a short sample",
-            "demo",
-            'L',
-            0x7c6ad6,
-        ),
-        bot(
-            "harbor",
-            "Harbor",
-            "Demo · another sample row",
-            "demo",
-            'H',
-            0xde5d4a,
-        ),
+        bot("desk", "Desk", "Demo · an empty chat", "demo", 5),
+        bot("lamp", "Lamp", "Demo · a short sample", "demo", 6),
+        bot("harbor", "Harbor", "Demo · another sample row", "demo", 2),
         bot(
             "kit",
             "Kit",
             "Demo · extra row so the list can scroll",
             "demo",
-            'K',
-            0x4aa3a8,
+            7,
         ),
         bot(
             "grove",
             "Grove",
             "Demo · another row for the sidebar scroll",
             "demo",
-            'G',
-            0x6a8f4e,
+            1,
         ),
-        bot(
-            "nook",
-            "Nook",
-            "Demo · one more sidebar row",
-            "demo",
-            'O',
-            0xc47a3a,
-        ),
+        bot("nook", "Nook", "Demo · one more sidebar row", "demo", 5),
         bot(
             "shelf",
             "Shelf",
             "Demo · unassigned and empty",
             "unassigned",
-            'S',
-            0x8b909a,
+            3,
         ),
         bot(
             "relay",
             "Relay",
             "Demo · unassigned sample",
             "unassigned",
-            'R',
-            0x5c7c99,
+            4,
         ),
     ]
 }
 
-fn bot(id: &str, name: &str, summary: &str, group: &str, mark: char, color: u32) -> Bot {
+fn bot(id: &str, name: &str, summary: &str, group: &str, shape: u8) -> Bot {
     Bot {
         id: id.to_owned(),
         name: name.to_owned(),
         summary: summary.to_owned(),
         group: group.to_owned(),
-        mark,
-        color,
+        shape,
         demo: true,
     }
 }
@@ -562,6 +522,8 @@ fn seed_lines() -> Vec<Line> {
         "Demo note. The window wrote this.",
         "Demo note. Not a run, and not a reply.",
         "Demo note. Older sample, still not a model.",
+        "Demo note. One more so the thread fills the window.",
+        "Demo note. The top line can sit under the name.",
     ];
     let mine = [
         "Demo line. Kept in this window.",
@@ -570,6 +532,8 @@ fn seed_lines() -> Vec<Line> {
         "Demo line, still not sent.",
         "One more demo line.",
         "Demo line near the older end.",
+        "Demo line. Still only in this window.",
+        "Demo line under the name pill.",
     ];
     let mut lines = Vec::new();
     for index in 0..notes.len() {

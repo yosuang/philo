@@ -55,6 +55,10 @@ fn expanded(shell: Shell) -> impl IntoElement {
         .flex_1()
         .min_h(px(0.0))
         .child(sidebar_header(shell))
+        .child(when(
+            move || shell.search_open.get(),
+            move || search_field(shell),
+        ))
         .child(bot_scroll(shell))
         .child(user_row(shell))
 }
@@ -70,7 +74,7 @@ fn rail(shell: Shell) -> impl IntoElement {
             shell,
             "Search",
             "search",
-            false,
+            ui::Circle::White,
             || true,
             move || shell.open_search(),
         ))
@@ -78,7 +82,7 @@ fn rail(shell: Shell) -> impl IntoElement {
             shell,
             "New bot",
             "plus",
-            false,
+            ui::Circle::White,
             || true,
             move || shell.open_new(),
         ))
@@ -94,8 +98,7 @@ fn rail(shell: Shell) -> impl IntoElement {
                         |bot| bot.id.clone(),
                         move |bot, _| {
                             let id = bot.with(|item| item.id.clone());
-                            let mark = bot.with(|item| item.mark);
-                            let color = bot.with(|item| item.color);
+                            let shape = bot.with(|item| item.shape);
                             let name = bot.with(|item| item.name.clone());
                             button()
                                 .accessibility_label(name)
@@ -115,7 +118,7 @@ fn rail(shell: Shell) -> impl IntoElement {
                                     style.outline(px(2.0)).outline_color(move || theme().ring)
                                 })
                                 .on_press(move || shell.select(id.clone()))
-                                .child(ui::mark(mark, color, 32.0))
+                                .child(ui::blob(shape, 32.0))
                         },
                     )),
             ),
@@ -124,7 +127,7 @@ fn rail(shell: Shell) -> impl IntoElement {
             shell,
             "Expand sidebar",
             "grid",
-            false,
+            ui::Circle::White,
             || true,
             move || shell.toggle_sidebar(),
         ))
@@ -140,32 +143,40 @@ fn sidebar_header(shell: Shell) -> impl IntoElement {
         .pr(px(10.0))
         .gap(px(8.0))
         .window_drag(true)
-        .child(search_field(shell))
+        .child(view().flex_1().window_drag(true))
+        .child(ui::icon_button(
+            shell,
+            "Search",
+            "search",
+            ui::Circle::White,
+            || true,
+            move || shell.open_search(),
+        ))
         .child(ui::icon_button(
             shell,
             "New bot",
             "plus",
-            false,
+            ui::Circle::White,
             || true,
             move || shell.open_new(),
         ))
 }
 
 fn search_field(shell: Shell) -> impl IntoElement {
-    ui::field("Search")
-        .element_ref(&shell.search_field)
-        .test_id("search")
-        .value(move || shell.query.get())
-        .on_change(move |text: &str| shell.query.set(text.to_owned()))
-        .flex_1()
-        .h(px(34.0))
-        .px(px(12.0))
-        .py(px(0.0))
-        .rounded(px(17.0))
-        .border(px(0.0))
-        .shadow_sm()
-        .bg(move || theme().card)
-        .text_size(px(13.0))
+    view().px(px(12.0)).pb(px(6.0)).child(
+        ui::field("Search")
+            .element_ref(&shell.search_field)
+            .test_id("search")
+            .value(move || shell.query.get())
+            .on_change(move |text: &str| shell.query.set(text.to_owned()))
+            .w_full()
+            .h(px(34.0))
+            .rounded(px(17.0))
+            .border(px(0.0))
+            .shadow_sm()
+            .bg(move || theme().card)
+            .text_size(px(13.0)),
+    )
 }
 
 fn bot_scroll(shell: Shell) -> impl IntoElement {
@@ -214,14 +225,20 @@ fn group_header(shell: Shell, id: &'static str, title: &'static str) -> impl Int
         .flex_row()
         .items_center()
         .px(px(10.0))
-        .py(px(4.0))
-        .rounded(px(12.0))
+        .h(move || {
+            if shell.group_open(id) {
+                px(22.0)
+            } else {
+                px(32.0)
+            }
+        })
+        .rounded(px(10.0))
         .cursor_pointer()
         .bg(move || {
             if shell.group_open(id) {
                 theme().sidebar
             } else {
-                theme().sidebar_accent
+                rgb(0xe9e9e9).into()
             }
         })
         .hover(|style| style.bg(move || theme().sidebar_accent))
@@ -234,13 +251,10 @@ fn group_header(shell: Shell, id: &'static str, title: &'static str) -> impl Int
                 .text_size(px(13.0))
                 .text_color(move || theme().muted_foreground),
         )
-        .child(
-            when(
-                move || shell.group_open(id),
-                move || ui::glyph(shell, "chevron-down", false),
-            )
-            .otherwise(move || ui::glyph(shell, "chevron-right", false)),
-        )
+        .child(when(
+            move || !shell.group_open(id),
+            move || ui::glyph(shell, "chevron-right", false),
+        ))
 }
 
 fn bot_row(shell: Shell, bot: ReadSignal<crate::local::Bot>) -> impl IntoElement {
@@ -249,9 +263,9 @@ fn bot_row(shell: Shell, bot: ReadSignal<crate::local::Bot>) -> impl IntoElement
         .w_full()
         .flex_row()
         .items_center()
-        .gap(px(8.0))
+        .gap(px(10.0))
         .px(px(8.0))
-        .py(px(6.0))
+        .py(px(9.0))
         .rounded(px(14.0))
         .cursor_pointer()
         .bg(move || {
@@ -266,11 +280,7 @@ fn bot_row(shell: Shell, bot: ReadSignal<crate::local::Bot>) -> impl IntoElement
         .hover(|style| style.bg(move || theme().sidebar_accent))
         .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
         .on_press(move || shell.select(id.clone()))
-        .child(ui::mark(
-            bot.with(|item| item.mark),
-            bot.with(|item| item.color),
-            32.0,
-        ))
+        .child(ui::blob(bot.with(|item| item.shape), 36.0))
         .child(
             view()
                 .flex_1()
@@ -279,8 +289,8 @@ fn bot_row(shell: Shell, bot: ReadSignal<crate::local::Bot>) -> impl IntoElement
                 .child(
                     text(move || bot.with(|item| item.name.clone()))
                         .number_of_lines(1)
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::MEDIUM)
+                        .text_size(px(14.0))
+                        .font_weight(FontWeight::SEMIBOLD)
                         .text_color(move || theme().sidebar_foreground),
                 )
                 .child(
@@ -318,7 +328,7 @@ fn user_row(shell: Shell) -> impl IntoElement {
                 .on_press(move || {
                     shell.notice("This is a demo profile. Accounts are not available.");
                 })
-                .child(ui::mark('D', 0x8b909a, 26.0))
+                .child(ui::portrait(26.0))
                 .child(
                     view().flex_1().min_w(px(0.0)).child(
                         text("Demo")
@@ -332,7 +342,7 @@ fn user_row(shell: Shell) -> impl IntoElement {
             shell,
             "Collapse sidebar",
             "grid",
-            false,
+            ui::Circle::White,
             || true,
             move || shell.toggle_sidebar(),
         ))
@@ -377,7 +387,7 @@ fn details_bar(shell: Shell) -> impl IntoElement {
             shell,
             "Close details",
             "close",
-            false,
+            ui::Circle::White,
             || true,
             move || shell.close_details(),
         ))
@@ -388,7 +398,10 @@ fn identity(shell: Shell) -> impl IntoElement {
         .items_center()
         .gap(px(8.0))
         .pt(px(4.0))
-        .child(live_mark(shell, 64.0))
+        .child(ui::blob_live(
+            move || shell.selected_bot().map(|bot| bot.shape).unwrap_or(0),
+            64.0,
+        ))
         .child(
             text(move || {
                 shell
@@ -452,11 +465,10 @@ fn tab(shell: Shell, label: &'static str, library: bool) -> impl IntoElement {
 
 fn activity(shell: Shell) -> impl IntoElement {
     view()
-        .gap(px(16.0))
+        .gap(px(10.0))
         .child(ui::section_label("Demo"))
         .child(activity_card(shell))
         .child(suggested(shell))
-        .child(files_block(shell))
         .child(computer(shell))
 }
 
@@ -516,12 +528,18 @@ fn activity_row(shell: Shell, row: ReadSignal<crate::local::Activity>) -> impl I
         .on_press(move || {
             shell.notice("Demo sample. This is not a run, and no model was asked.");
         })
-        .child(
-            view()
-                .size(px(18.0))
-                .rounded(px(9.0))
-                .bg(move || theme().muted),
-        )
+        .child(ui::tinted(
+            if row.with(|item| item.title.contains("sample")) {
+                "sparkle"
+            } else {
+                "check"
+            },
+            if row.with(|item| item.title.contains("sample")) {
+                "#f93598"
+            } else {
+                "#2f9d78"
+            },
+        ))
         .child(
             view()
                 .flex_1()
@@ -601,6 +619,14 @@ fn suggest_row(
         .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
         .accessibility_label(title)
         .on_press(on_press)
+        .child(ui::tinted(
+            if title == "Voice" { "mic" } else { "sparkle" },
+            if title == "Voice" {
+                "#6f6f6f"
+            } else {
+                "#7c6ad6"
+            },
+        ))
         .child(
             view()
                 .flex_1()
@@ -613,13 +639,6 @@ fn suggest_row(
                 ),
         )
         .child(ui::glyph(shell, "chevron-right", false))
-}
-
-fn files_block(shell: Shell) -> impl IntoElement {
-    view()
-        .gap(px(8.0))
-        .child(ui::section_label("Files"))
-        .child(file_list(shell))
 }
 
 fn library(shell: Shell) -> impl IntoElement {
@@ -713,32 +732,6 @@ fn computer(shell: Shell) -> impl IntoElement {
                         .bg(move || theme().muted)
                         .child(ui::quiet("Not connected")),
                 ),
-        )
-}
-
-fn live_mark(shell: Shell, size: f32) -> impl IntoElement {
-    let font = (size * 0.42).clamp(11.0, 28.0);
-    view()
-        .size(px(size))
-        .rounded(px(size / 2.0))
-        .items_center()
-        .justify_center()
-        .bg(move || {
-            rgb(shell
-                .selected_bot()
-                .map(|bot| bot.color)
-                .unwrap_or(0xf93498))
-        })
-        .child(
-            text(move || {
-                shell
-                    .selected_bot()
-                    .map(|bot| bot.mark.to_string())
-                    .unwrap_or_else(|| "P".to_owned())
-            })
-            .text_size(px(font))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(white()),
         )
 }
 
