@@ -1,0 +1,40 @@
+# Go 1.22.2 is the language version in server/go.mod. server/Dockerfile
+# uses golang:1.22-bookworm, the same 1.22 line, and there is no toolchain
+# directive. Rust 1.92.0 is the earliest stable release that satisfies the
+# highest rust-version in desktop/Cargo.lock: gtk4 0.11.5 and the other
+# gtk-rs 0.22 crates declare 1.92. Edition 2024 needs 1.85 or newer, and
+# there is no rust-toolchain file. This is not a floating "latest" and not
+# a version copied from a machine that happened to build the desktop.
+[tools]
+go = "1.22.2"
+rust = "1.92.0"
+
+# mise run dev starts only the native desktop. It does not start Postgres,
+# the Go server, or Docker. The full stack is mise run stack. depends and
+# wait_for run only after a task exits, so they cannot order a database, a
+# server, and a desktop that stay up. Daemons stay up after the task exits.
+# scripts/dev.sh stack waits until each is ready, and on Ctrl-C or a failed
+# exit stops only the processes that run started.
+[tasks.dev]
+description = "Start the native desktop"
+raw = true
+run = "bash scripts/dev.sh"
+
+[tasks.stack]
+description = "Start Postgres, the Go server, and the native desktop"
+raw = true
+run = "bash scripts/dev.sh stack"
+
+[tasks.build]
+description = "Build the Go server and the native desktop"
+run = [
+  "go -C server build -o philo-server .",
+  "cargo build --manifest-path desktop/Cargo.toml",
+]
+
+[tasks.test]
+description = "Test the Go server and the desktop library"
+run = [
+  "go -C server test ./...",
+  "cargo test --manifest-path desktop/Cargo.toml --lib",
+]
