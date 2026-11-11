@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Start the local Postgres dependency, the Go server, and the native desktop.
+# With no arguments, start only the native desktop. mise run dev uses that
+# path and does not start Postgres, the Go server, or Docker.
+# With "stack", start Postgres, then the Go server, then the desktop.
 # mise's depends and wait_for wait until a task exits, and its daemons keep
-# running after the task exits, so this script owns the order and the cleanup.
+# running after the task exits, so the stack path owns the order and the cleanup.
 set +x
 set -euo pipefail
 
 root=""
 run_dir=""
 lock_dir=""
+task_name="dev"
 server_pid=""
 desktop_pid=""
 watcher_pid=""
@@ -41,14 +44,28 @@ main() {
   umask 077
   root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
   cd -- "$root"
+  case "${1:-}" in
+    "") task_name="dev" ;;
+    stack) task_name="stack" ;;
+    *)
+      printf '%s\n' "Usage: scripts/dev.sh [stack]" >&2
+      exit 1
+      ;;
+  esac
   acquire_lock
   trap 'finish $?' EXIT
   trap 'finish 130' INT
   trap 'finish 143' TERM
   trap 'finish 129' HUP
-  run_dir=$(mktemp -d "${TMPDIR:-/tmp}/philo-mise-dev.XXXXXX")
+  run_dir=$(mktemp -d "${TMPDIR:-/tmp}/philo-mise-${task_name}.XXXXXX")
   chmod 700 "$run_dir"
 
+  if [[ "$task_name" == "dev" ]]; then
+    if ! check_native; then
+      exit 1
+    fi
+    start_desktop_only
+  fi
   if ! preflight; then
     exit 1
   fi
@@ -61,18 +78,18 @@ main() {
 
 acquire_lock() {
   local id old cmd
-  id=$(printf '%s' "$root" | cksum | awk '{print $1}')
-  lock_dir="${TMPDIR:-/tmp}/philo-mise-dev-lock-$id"
+  id=$(printf '%s' "$task_name $root" | cksum | awk '{print $1}')
+  lock_dir="${TMPDIR:-/tmp}/philo-mise-${task_name}-lock-$id"
   if [[ -d "$lock_dir" ]]; then
     old=""
     if [[ -f "$lock_dir/pid" ]]; then
       old=$(tr -d '[:space:]' <"$lock_dir/pid" || true)
     fi
     if [[ "$old" =~ ^[0-9]+$ ]] && kill -0 "$old" 2>/dev/null; then
-      cmd=$(ps -p "$old" -o command= 2>/dev/null || true)
-      if [[ "$cmd" == *scripts/dev.sh* ]]; then
+      cmd=$(ps -ww -p "$old" -o command= 2>/dev/null || true)
+      if same_task_command "$cmd"; then
         printf '%s\n' \
-          "mise run dev is already running for this checkout." \
+          "mise run ${task_name} is already running for this checkout." \
           "This task will not start a second copy, and it will not stop that run." >&2
         exit 1
       fi
@@ -81,6 +98,15 @@ acquire_lock() {
   fi
   mkdir "$lock_dir"
   printf '%s\n' "$$" >"$lock_dir/pid"
+}
+
+same_task_command() {
+  local cmd="$1"
+  if [[ "$task_name" == "stack" ]]; then
+    [[ "$cmd" == *"scripts/dev.sh stack"* ]]
+    return
+  fi
+  [[ "$cmd" == *"scripts/dev.sh"* && "$cmd" != *"scripts/dev.sh stack"* ]]
 }
 
 release_lock() {
@@ -101,7 +127,7 @@ preflight() {
     printf '%s\n' \
       "Port 5432 on 127.0.0.1 is already in use." \
       "This task will not start another Postgres. It does not stop the existing process and it does not delete database volumes." \
-      "Free the port, then run mise run dev again." >&2
+      "Free the port, then run mise run stack again." >&2
     failed=1
   else
     rc=$?
@@ -113,7 +139,7 @@ preflight() {
     printf '%s\n' \
       "Port 8080 on 127.0.0.1 is already in use." \
       "This task will not start another server." \
-      "Free the port, then run mise run dev again." >&2
+      "Free the port, then run mise run stack again." >&2
     failed=1
   else
     rc=$?
@@ -164,14 +190,14 @@ check_docker() {
   if ! docker compose version >/dev/null 2>&1; then
     printf '%s\n' \
       "Docker Compose is not available." \
-      "Install the Docker Compose plugin (docker compose) and run mise run dev again." \
+      "Install the Docker Compose plugin (docker compose) and run mise run stack again." \
       "This task does not install it." >&2
     return 1
   fi
   if ! docker info >/dev/null 2>&1; then
     printf '%s\n' \
       "Docker is installed, but the Docker daemon is not running." \
-      "Start Docker and run mise run dev again." >&2
+      "Start Docker and run mise run stack again." >&2
     return 1
   fi
   return 0
@@ -637,6 +663,32 @@ health_ok() {
     exit 1 unless defined $line;
     exit($line =~ m{\AHTTP/\d+(?:\.\d+)? 200\b} ? 0 : 1);
   '
+}
+
+write_desktop_only_script() {
+  local var
+  {
+    printf '%s\n' '#!/bin/bash' 'set +x' 'set -euo pipefail'
+    while IFS= read -r var; do
+      printf 'unset %s\n' "$var"
+    done < <(fixture_vars)
+    printf 'unset %s\n' PHILO_DATABASE_URL PHILO_AUTH_CREDENTIALS
+    printf 'cd %q\n' "$root/desktop"
+    printf 'exec cargo run --manifest-path %q\n' "$root/desktop/Cargo.toml"
+  } >"$run_dir/desktop.sh"
+  chmod 700 "$run_dir/desktop.sh"
+}
+
+start_desktop_only() {
+  write_desktop_only_script
+  printf '%s\n' "Starting the desktop."
+  bash "$run_dir/desktop.sh" &
+  desktop_pid=$!
+  set +e
+  wait "$desktop_pid"
+  local status=$?
+  set -e
+  exit "$status"
 }
 
 start_desktop() {

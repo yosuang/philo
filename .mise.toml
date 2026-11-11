@@ -9,14 +9,21 @@
 go = "1.22.2"
 rust = "1.92.0"
 
-# depends and wait_for run only after a task exits, so they cannot order a
-# database, a server, and a desktop that stay up. Daemons stay up after the
-# task exits. scripts/dev.sh starts them, waits until each is ready, and on
-# Ctrl-C or a failed exit stops only the processes that run started.
+# mise run dev starts only the native desktop. It does not start Postgres,
+# the Go server, or Docker. The full stack is mise run stack. depends and
+# wait_for run only after a task exits, so they cannot order a database, a
+# server, and a desktop that stay up. Daemons stay up after the task exits.
+# scripts/dev.sh stack waits until each is ready, and on Ctrl-C or a failed
+# exit stops only the processes that run started.
 [tasks.dev]
-description = "Start Postgres, the Go server, and the native desktop"
+description = "Start the native desktop"
 raw = true
 run = "bash scripts/dev.sh"
+
+[tasks.stack]
+description = "Start Postgres, the Go server, and the native desktop"
+raw = true
+run = "bash scripts/dev.sh stack"
 
 [tasks.build]
 description = "Build the Go server and the native desktop"
