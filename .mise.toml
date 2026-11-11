@@ -1,13 +1,15 @@
 # Go 1.22.2 is the language version in server/go.mod. server/Dockerfile
 # uses golang:1.22-bookworm, the same 1.22 line, and there is no toolchain
-# directive. Rust 1.92.0 is the earliest stable release that satisfies the
-# highest rust-version in desktop/Cargo.lock: gtk4 0.11.5 and the other
-# gtk-rs 0.22 crates declare 1.92. Edition 2024 needs 1.85 or newer, and
+# directive. Rust 1.97.0 is the earliest stable release that covers the
+# features nsh-core 0.4.0 calls. if-let guards on match arms stabilized in
+# 1.95.0, and <integer>::isolate_lowest_one stabilized in 1.97.0. gtk4
+# 0.11.5 and the other gtk-rs 0.22 crates declare rust-version 1.92, which
+# is not enough for that crate. Edition 2024 needs 1.85 or newer, and
 # there is no rust-toolchain file. This is not a floating "latest" and not
 # a version copied from a machine that happened to build the desktop.
 [tools]
 go = "1.22.2"
-rust = "1.92.0"
+rust = "1.97.0"
 
 # mise run dev starts only the native desktop. It does not start Postgres,
 # the Go server, or Docker. The full stack is mise run stack. depends and
