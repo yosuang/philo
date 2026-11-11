@@ -15,32 +15,28 @@ pub fn column(shell: Shell) -> impl IntoElement {
         .h_full()
         .relative()
         .bg(move || theme().background)
+        .child(header(shell))
         .child(notice(shell))
         .child(new_bot(shell))
         .child(transcript(shell))
         .child(composer(shell))
-        .child(header(shell))
 }
 
 fn header(shell: Shell) -> impl IntoElement {
     view()
-        .absolute()
-        .top(px(0.0))
-        .left(px(0.0))
-        .right(px(0.0))
         .h(move || {
             let top = title_bar().top.0;
             px(top.max(52.0))
         })
-        .z_index(2)
         .flex_row()
         .items_center()
         .px(px(12.0))
         .pr(move || title_bar().right + px(12.0))
-        .pointer_events(PointerEvents::BoxNone)
-        .child(view().flex_1())
+        .bg(move || theme().background)
+        .window_drag(true)
+        .child(view().flex_1().window_drag(true))
         .child(bot_pill(shell))
-        .child(view().flex_1())
+        .child(view().flex_1().window_drag(true))
         .child(share_button(shell))
 }
 
@@ -120,7 +116,6 @@ fn notice(shell: Shell) -> impl IntoElement {
         move || shell.notice.get().is_some(),
         move || {
             view()
-                .mt(px(52.0))
                 .mx(px(16.0))
                 .mb(px(4.0))
                 .px(px(12.0))
@@ -152,9 +147,7 @@ fn new_bot(shell: Shell) -> impl IntoElement {
     view()
         .flex_1()
         .min_h(px(0.0))
-        .pt(px(64.0))
-        .px(px(24.0))
-        .pb(px(24.0))
+        .p(px(24.0))
         .gap(px(12.0))
         .style_when(move || !shell.creating.get(), |style| style.hidden())
         .child(
