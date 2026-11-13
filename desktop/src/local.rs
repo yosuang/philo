@@ -267,8 +267,22 @@ impl Shell {
         self.sidebar_collapsed.update(|open| *open = !*open);
     }
 
-    pub fn open_search(self) {
+    /// The rail has no field. Expand, show whatever query is already set,
+    /// and focus that field. This does not clear the query.
+    pub fn reveal_search(self) {
         self.sidebar_collapsed.set(false);
+        self.search_open.set(true);
+        let field = self.search_field;
+        set_timeout(std::time::Duration::from_millis(16), move || field.focus());
+    }
+
+    pub fn open_search(self) {
+        // The field is not on the rail. Opening search from there shows it
+        // and keeps the query. The header toggle is only while expanded.
+        if self.sidebar_collapsed.get() {
+            self.reveal_search();
+            return;
+        }
         self.search_open.update(|open| *open = !*open);
         if self.search_open.get() {
             let field = self.search_field;
@@ -278,6 +292,11 @@ impl Shell {
             self.set_query(String::new());
             self.focus_active_field();
         }
+    }
+
+    /// The portrait is a demo. It does not open an account.
+    pub fn show_demo_profile(self) {
+        self.notice("This is a demo profile. Accounts are not available.");
     }
 
     /// Search closed. The new-bot form keeps the keyboard when it is open.

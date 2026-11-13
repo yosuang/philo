@@ -92,6 +92,9 @@ fn install_menu(shell: Shell) {
                     MenuItem::new("System appearance")
                         .on_select(move || shell.set_appearance(AppearanceChoice::System)),
                     MenuItem::separator(),
+                    MenuItem::new("Sidebar")
+                        .shortcut("mod+shift+b")
+                        .on_select(move || shell.toggle_sidebar()),
                     MenuItem::new("Details")
                         .shortcut("mod+shift+d")
                         .on_select(move || shell.toggle_details()),

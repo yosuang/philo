@@ -76,7 +76,7 @@ fn rail(shell: Shell) -> impl IntoElement {
             "search",
             ui::Circle::White,
             || true,
-            move || shell.open_search(),
+            move || shell.reveal_search(),
         ))
         .child(ui::icon_button(
             shell,
@@ -122,6 +122,17 @@ fn rail(shell: Shell) -> impl IntoElement {
                         },
                     )),
             ),
+        )
+        .child(
+            button()
+                .accessibility_label("Demo account")
+                .rounded(px(16.0))
+                .p(px(2.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(move || theme().sidebar_accent))
+                .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+                .on_press(move || shell.show_demo_profile())
+                .child(ui::portrait(32.0)),
         )
         .child(ui::icon_button(
             shell,
@@ -339,9 +350,7 @@ fn user_row(shell: Shell) -> impl IntoElement {
                 .hover(|style| style.bg(move || theme().sidebar_accent))
                 .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
                 .accessibility_label("Demo account")
-                .on_press(move || {
-                    shell.notice("This is a demo profile. Accounts are not available.");
-                })
+                .on_press(move || shell.show_demo_profile())
                 .child(ui::portrait(26.0))
                 .child(
                     view().flex_1().min_w(px(0.0)).child(
