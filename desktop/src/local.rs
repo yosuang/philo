@@ -377,13 +377,10 @@ impl Shell {
     }
 
     pub fn select(self, id: String) {
-        let same = self.selected.get().as_deref() == Some(id.as_str());
-        if !same {
-            // The line in the composer belongs to the bot that was open.
-            // The next bot gets its own unsent line back, still local.
-            self.remember_unsent();
-            self.apply_unsent(&id);
-            self.selected.set(Some(id.clone()));
+        let mut drafts = self.drafts();
+        let changed = drafts.select(id.clone());
+        self.store_drafts(drafts);
+        if changed {
             self.away_from_bottom.set(false);
             self.show_newest(false);
             // The transcript's row count changes in this same turn. A scroll
@@ -403,30 +400,22 @@ impl Shell {
         self.focus_composer();
     }
 
-    /// Puts the open composer's text and previews aside for that bot.
-    fn remember_unsent(self) {
-        let Some(bot_id) = self.selected.get() else {
-            return;
-        };
-        let text = self.draft.get();
-        let previews = self.previews.get();
-        self.unsent
-            .update(|rows| park_unsent(rows, bot_id, text, previews));
+    fn drafts(self) -> BotDraft {
+        BotDraft {
+            selected: self.selected.get(),
+            draft: self.draft.get(),
+            previews: self.previews.get(),
+            unsent: self.unsent.get(),
+            next_id: self.ids.get(),
+        }
     }
 
-    /// Shows the unsent line for `bot_id`, or an empty composer.
-    fn apply_unsent(self, bot_id: &str) {
-        let found = self.unsent.with(|rows| parked(rows, bot_id).cloned());
-        match found {
-            Some(row) => {
-                self.draft.set(row.text);
-                self.previews.set(row.previews);
-            }
-            None => {
-                self.draft.set(String::new());
-                self.previews.set(Vec::new());
-            }
-        }
+    fn store_drafts(self, drafts: BotDraft) {
+        self.selected.set(drafts.selected);
+        self.draft.set(drafts.draft);
+        self.previews.set(drafts.previews);
+        self.unsent.set(drafts.unsent);
+        self.ids.replace(drafts.next_id);
     }
 
     fn drop_unsent(self, bot_id: &str) {
@@ -564,6 +553,7 @@ impl Shell {
         if self.choosing.replace(true) {
             return;
         }
+        // Captured now. The callback below does not ask which bot is current.
         let opener = self.selected.get();
         // `spawn` cancels a task when its handle is dropped.
         std::mem::forget(spawn(async move {
@@ -573,36 +563,29 @@ impl Shell {
                     .button_label("Open"),
             )
             .await;
-            self.choosing.replace(false);
-            match files_from_dialog(picked) {
-                Ok(files) if files.is_empty() => {}
-                Ok(files) => {
-                    if let Some(opener) = opener {
-                        self.apply_choice(&opener, files);
-                    }
-                }
-                Err(message) => {
-                    log::warn!("file dialog: {message}");
-                    self.notice("Could not open the file dialog.");
-                }
-            }
+            self.finish_file_choice(opener, picked);
         }));
     }
 
-    fn apply_choice(self, opener: &str, files: Vec<ChosenFile>) {
-        let current = self.selected.get();
-        let on_screen = current.as_deref() == Some(opener);
-        let (composer, unsent) = land_on_opener(
-            opener,
-            current.as_deref(),
-            self.previews.get(),
-            self.unsent.get(),
-            files,
-            || self.alloc("preview"),
-        );
-        self.unsent.set(unsent);
-        if on_screen {
-            self.previews.set(composer);
+    /// The dialog callback. `opener` is the bot captured when the dialog
+    /// opened. It does not read which bot is selected now.
+    fn finish_file_choice(
+        self,
+        opener: Option<String>,
+        picked: Result<Option<Vec<PathBuf>>, String>,
+    ) {
+        self.choosing.replace(false);
+        let mut drafts = self.drafts();
+        let show = match drafts.finish_file_choice(opener, picked) {
+            Ok(show) => show,
+            Err(message) => {
+                log::warn!("file dialog: {message}");
+                self.notice("Could not open the file dialog.");
+                return;
+            }
+        };
+        self.store_drafts(drafts);
+        if show {
             self.show_newest(false);
             self.focus_composer();
         }
@@ -1213,6 +1196,75 @@ fn composer_fill(creating: bool, has_bot: bool, prompt: &str) -> Option<String> 
     }
 }
 
+/// The open bot's composer and the drafts parked for the others.
+struct BotDraft {
+    selected: Option<String>,
+    draft: String,
+    previews: Vec<Preview>,
+    unsent: Vec<Unsent>,
+    next_id: u32,
+}
+
+impl BotDraft {
+    /// Parks the open composer and shows `id`. `false` when `id` is already open.
+    fn select(&mut self, id: String) -> bool {
+        if self.selected.as_deref() == Some(id.as_str()) {
+            return false;
+        }
+        if let Some(bot_id) = self.selected.clone() {
+            park_unsent(
+                &mut self.unsent,
+                bot_id,
+                self.draft.clone(),
+                self.previews.clone(),
+            );
+        }
+        if let Some(row) = self.unsent.iter().find(|row| row.bot_id == id) {
+            self.draft.clone_from(&row.text);
+            self.previews.clone_from(&row.previews);
+        } else {
+            self.draft.clear();
+            self.previews.clear();
+        }
+        self.selected = Some(id);
+        true
+    }
+
+    /// Dialog callback. `opener` was captured when the dialog opened.
+    /// `Ok(true)` when that bot is the one on screen, so the window scrolls
+    /// to the new file. The other bot's composer is not changed.
+    fn finish_file_choice(
+        &mut self,
+        opener: Option<String>,
+        picked: Result<Option<Vec<PathBuf>>, String>,
+    ) -> Result<bool, String> {
+        let files = files_from_dialog(picked)?;
+        let Some(opener) = opener else {
+            return Ok(false);
+        };
+        if files.is_empty() {
+            return Ok(false);
+        }
+        let showing = self.selected.as_deref() == Some(opener.as_str());
+        let mut next_id = self.next_id;
+        let (composer, unsent) = land_on_opener(
+            &opener,
+            self.selected.as_deref(),
+            std::mem::take(&mut self.previews),
+            std::mem::take(&mut self.unsent),
+            files,
+            || {
+                next_id = next_id.wrapping_add(1);
+                format!("preview-{next_id}")
+            },
+        );
+        self.next_id = next_id;
+        self.unsent = unsent;
+        self.previews = composer;
+        Ok(showing)
+    }
+}
+
 /// Puts `files` on `opener`. `composer` is the bot on screen. When that bot
 /// is not `opener`, the composer is left as it was and the files join the
 /// opener's parked draft, including a decode failure. An empty `files`
@@ -1608,60 +1660,49 @@ mod tests {
 
     #[test]
     fn a_dialog_result_lands_on_the_opener_not_the_bot_on_screen() {
-        let rose = fixture("rose.png");
-        let broken = fixture("broken.bin");
-        let files = files_from_dialog(Ok(Some(vec![
-            std::path::PathBuf::from(&rose),
-            std::path::PathBuf::from(&broken),
-        ])))
-        .expect("picked files");
+        let mut drafts = BotDraft {
+            selected: None,
+            draft: String::new(),
+            previews: Vec::new(),
+            unsent: Vec::new(),
+            next_id: 100,
+        };
+        drafts.select("philo".to_owned());
+        drafts.draft = "philo draft".to_owned();
+        let opener = drafts.selected.clone();
+        assert_eq!(opener.as_deref(), Some("philo"));
+        drafts.select("desk".to_owned());
+        drafts.draft = "desk draft".to_owned();
         let desk_only = Preview {
-            id: "desk-draft".to_owned(),
+            id: "desk-mark".to_owned(),
             path: "desk-only".to_owned(),
             error: None,
         };
-        let mut n = 0;
-        let (composer, unsent) = land_on_opener(
-            "philo",
-            Some("desk"),
-            vec![desk_only.clone()],
-            vec![Unsent {
-                bot_id: "philo".to_owned(),
-                text: "kept draft".to_owned(),
-                previews: Vec::new(),
-            }],
-            files,
-            || {
-                n += 1;
-                format!("preview-{n}")
-            },
-        );
-        assert_eq!(composer, vec![desk_only]);
-        assert!(
-            composer
-                .iter()
-                .all(|item| !item.path.ends_with("rose.png") && item.error.is_none())
-        );
-        let philo = parked(&unsent, "philo").expect("opener keeps the files");
-        assert_eq!(philo.text, "kept draft");
-        assert!(philo.previews[0].path.ends_with("rose.png"));
-        assert!(philo.previews[0].error.is_none());
-        assert_eq!(philo.previews[1].error.as_deref(), Some(DECODE_FAILURE));
-        assert!(parked(&unsent, "desk").is_none());
-
-        let still_open =
-            files_from_dialog(Ok(Some(vec![std::path::PathBuf::from(&rose)]))).expect("rose");
-        let (composer, unsent) = land_on_opener(
-            "philo",
-            Some("philo"),
-            Vec::new(),
-            Vec::new(),
-            still_open,
-            || "preview-open".to_owned(),
-        );
-        assert!(unsent.is_empty());
-        assert_eq!(composer.len(), 1);
-        assert!(composer[0].path.ends_with("rose.png"));
-        assert!(composer[0].error.is_none());
+        drafts.previews = vec![desk_only.clone()];
+        let rose = fixture("rose.png");
+        let broken = fixture("broken.bin");
+        let show = drafts
+            .finish_file_choice(
+                opener,
+                Ok(Some(vec![
+                    std::path::PathBuf::from(&rose),
+                    std::path::PathBuf::from(&broken),
+                ])),
+            )
+            .expect("dialog answered");
+        assert!(!show);
+        assert_eq!(drafts.selected.as_deref(), Some("desk"));
+        assert_eq!(drafts.draft, "desk draft");
+        assert_eq!(drafts.previews, vec![desk_only.clone()]);
+        drafts.select("philo".to_owned());
+        assert_eq!(drafts.draft, "philo draft");
+        assert_eq!(drafts.previews.len(), 2);
+        assert!(drafts.previews[0].path.ends_with("rose.png"));
+        assert!(drafts.previews[0].error.is_none());
+        assert!(drafts.previews[1].path.ends_with("broken.bin"));
+        assert_eq!(drafts.previews[1].error.as_deref(), Some(DECODE_FAILURE));
+        drafts.select("desk".to_owned());
+        assert_eq!(drafts.draft, "desk draft");
+        assert_eq!(drafts.previews, vec![desk_only]);
     }
 }
