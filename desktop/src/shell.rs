@@ -174,7 +174,17 @@ fn sidebar_header(shell: Shell) -> impl IntoElement {
 }
 
 fn search_field(shell: Shell) -> impl IntoElement {
-    view().px(px(12.0)).pb(px(6.0)).child(
+    // The rail's timer is cancelled when the rail unmounts, before this
+    // field exists. Layout means the field is in the tree, so focus here.
+    view()
+        .on_layout(move |_frame: &Bounds<Points>| {
+            if shell.take_search_focus() {
+                shell.search_field.focus();
+            }
+        })
+        .px(px(12.0))
+        .pb(px(6.0))
+        .child(
         ui::field("Search")
             .element_ref(&shell.search_field)
             .test_id("search")

@@ -94,6 +94,9 @@ pub struct Shell {
     pub previews: Signal<Vec<Preview>>,
     pub query: Signal<String>,
     pub search_open: Signal<bool>,
+    /// The rail asked for the search field. The field takes this once it
+    /// is mounted. A timer started on the rail is dropped with the rail.
+    search_focus: Stored<bool>,
     pub collapsed_groups: Signal<Vec<String>>,
     /// Groups folded while a query is set. Clearing the query drops this
     /// and the saved collapse returns. Unassigned starts collapsed.
@@ -125,6 +128,7 @@ impl Shell {
             previews: signal(Vec::new()),
             query: signal(String::new()),
             search_open: signal(false),
+            search_focus: stored(false),
             collapsed_groups: signal(vec!["unassigned".to_owned()]),
             search_collapsed: signal(Vec::new()),
             sidebar_collapsed: signal(false),
@@ -267,36 +271,26 @@ impl Shell {
         self.sidebar_collapsed.update(|open| *open = !*open);
     }
 
-    /// The rail has no field. Expand, show whatever query is already set,
-    /// and focus that field. This does not clear the query.
+    /// The rail has no field. Expand and keep the query. The field focuses
+    /// itself when it mounts. This does not clear the query.
     pub fn reveal_search(self) {
+        self.search_focus.with(|flag| *flag = true);
         self.sidebar_collapsed.set(false);
         self.search_open.set(true);
-        self.focus_search_field();
     }
 
-    /// The expand mounts the field. A focus sent before that node exists
-    /// does not stick, so this keeps trying. A closed search, or the
-    /// new-bot form, keeps the keyboard.
-    fn focus_search_field(self) {
-        let field = self.search_field;
-        if field.node().is_some() {
-            set_timeout(std::time::Duration::from_millis(16), move || {
-                if self.search_open.get() && !self.creating.get() {
-                    field.focus();
-                }
-            });
-            return;
+    /// Called from the mounted search field. One request, then it is spent.
+    pub fn take_search_focus(self) -> bool {
+        if self.creating.get() {
+            return false;
         }
-        for step in 1u64..=180 {
-            let field = self.search_field;
-            set_timeout(std::time::Duration::from_millis(16 * step), move || {
-                if !self.search_open.get() || self.creating.get() || field.node().is_none() {
-                    return;
-                }
-                field.focus();
-            });
-        }
+        self.search_focus.with(|flag| {
+            if !*flag {
+                return false;
+            }
+            *flag = false;
+            true
+        })
     }
 
     pub fn open_search(self) {
