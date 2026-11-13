@@ -94,7 +94,7 @@ fn rail(shell: Shell) -> impl IntoElement {
                     .gap(px(8.0))
                     .py(px(8.0))
                     .child(each(
-                        move || shell.bots.get(),
+                        move || shell.visible_bots(),
                         |bot| bot.id.clone(),
                         move |bot, _| {
                             let id = bot.with(|item| item.id.clone());
@@ -168,7 +168,7 @@ fn search_field(shell: Shell) -> impl IntoElement {
             .element_ref(&shell.search_field)
             .test_id("search")
             .value(move || shell.query.get())
-            .on_change(move |text: &str| shell.query.set(text.to_owned()))
+            .on_change(move |text: &str| shell.set_query(text))
             .w_full()
             .h(px(34.0))
             .rounded(px(17.0))
@@ -212,19 +212,25 @@ fn bot_scroll(shell: Shell) -> impl IntoElement {
 }
 
 fn group(shell: Shell, id: &'static str, title: &'static str) -> impl IntoElement {
-    view()
-        .gap(px(2.0))
-        .child(group_header(shell, id, title))
-        .child(when(
-            move || shell.group_open(id) && !shell.bots_in(id).is_empty(),
-            move || {
-                view().gap(px(2.0)).child(each(
-                    move || shell.bots_in(id),
-                    |bot| bot.id.clone(),
-                    move |bot, _| bot_row(shell, bot),
+    // A query hides a group that has no name match. An empty header is not a row.
+    when(
+        move || shell.query.get().trim().is_empty() || !shell.bots_in(id).is_empty(),
+        move || {
+            view()
+                .gap(px(2.0))
+                .child(group_header(shell, id, title))
+                .child(when(
+                    move || shell.group_open(id) && !shell.bots_in(id).is_empty(),
+                    move || {
+                        view().gap(px(2.0)).child(each(
+                            move || shell.bots_in(id),
+                            |bot| bot.id.clone(),
+                            move |bot, _| bot_row(shell, bot),
+                        ))
+                    },
                 ))
-            },
-        ))
+        },
+    )
 }
 
 fn group_header(shell: Shell, id: &'static str, title: &'static str) -> impl IntoElement {
