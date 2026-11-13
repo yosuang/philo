@@ -214,7 +214,7 @@ impl Shell {
         self.draft.set(String::new());
         self.previews.set(Vec::new());
         self.away_from_bottom.set(false);
-        self.transcript.scroll_to_end(false);
+        self.show_newest(false);
     }
 
     pub fn open_new(self) {
@@ -322,7 +322,7 @@ impl Shell {
         self.draft.set(String::new());
         self.previews.set(Vec::new());
         self.away_from_bottom.set(false);
-        self.transcript.scroll_to_end(false);
+        self.show_newest(false);
     }
 
     pub fn add_preview(self) {
@@ -334,7 +334,7 @@ impl Shell {
                 label: format!("Local preview {n}"),
             });
         });
-        self.transcript.scroll_to_end(false);
+        self.show_newest(false);
     }
 
     pub fn remove_preview(self, id: String) {
@@ -377,9 +377,18 @@ impl Shell {
         }
     }
 
+    /// Puts item 0, the newest line, at the bottom of the inverted transcript.
+    ///
+    /// `scroll_to_end` on that list is content offset 0, which is the oldest
+    /// line. The list rests at the high offset, where item 0 is in view.
+    pub fn show_newest(self, animated: bool) {
+        self.transcript
+            .scroll_to_index(0, percentage(0.0), px(0.0), animated);
+    }
+
     pub fn jump_bottom(self) {
         self.away_from_bottom.set(false);
-        self.transcript.scroll_to_end(true);
+        self.show_newest(true);
     }
 
     pub fn note_scroll(self, offset_y: f32, content_h: f32, view_h: f32) {
