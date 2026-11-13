@@ -85,6 +85,15 @@ pub struct Preview {
     pub label: String,
 }
 
+/// Text and local previews left on a bot that is not the one on screen.
+/// Nothing here is sent.
+#[derive(Clone, PartialEq, Eq)]
+struct Unsent {
+    bot_id: String,
+    text: String,
+    previews: Vec<Preview>,
+}
+
 #[derive(Clone, Copy)]
 pub struct Shell {
     pub bots: Signal<Vec<Bot>>,
@@ -92,6 +101,8 @@ pub struct Shell {
     pub selected: Signal<Option<String>>,
     pub draft: Signal<String>,
     pub previews: Signal<Vec<Preview>>,
+    /// Unsent lines for bots other than the one open now.
+    unsent: Signal<Vec<Unsent>>,
     pub query: Signal<String>,
     pub search_open: Signal<bool>,
     /// The rail asked for the search field. The field takes this once it
@@ -126,6 +137,7 @@ impl Shell {
             selected: signal(Some("philo".to_owned())),
             draft: signal(String::new()),
             previews: signal(Vec::new()),
+            unsent: signal(Vec::new()),
             query: signal(String::new()),
             search_open: signal(false),
             search_focus: stored(false),
@@ -327,13 +339,72 @@ impl Shell {
     }
 
     pub fn select(self, id: String) {
-        self.selected.set(Some(id));
+        let same = self.selected.get().as_deref() == Some(id.as_str());
+        if !same {
+            // The line in the composer belongs to the bot that was open.
+            // The next bot gets its own unsent line back, still local.
+            self.remember_unsent();
+            self.apply_unsent(&id);
+            self.selected.set(Some(id.clone()));
+            self.away_from_bottom.set(false);
+            self.show_newest(false);
+            // The transcript's row count changes in this same turn. A scroll
+            // then misses the new rows, so the newest line is asked again
+            // once the list has them.
+            let shell = self;
+            let expected = id;
+            set_timeout(std::time::Duration::from_millis(48), move || {
+                if shell.selected.get().as_deref() != Some(expected.as_str()) {
+                    return;
+                }
+                shell.show_newest(false);
+                shell.away_from_bottom.set(false);
+            });
+        }
         self.creating.set(false);
-        self.draft.set(String::new());
-        self.previews.set(Vec::new());
-        self.away_from_bottom.set(false);
-        self.show_newest(false);
         self.focus_composer();
+    }
+
+    /// Puts the open composer's text and previews aside for that bot.
+    fn remember_unsent(self) {
+        let Some(bot_id) = self.selected.get() else {
+            return;
+        };
+        let text = self.draft.get();
+        let previews = self.previews.get();
+        self.unsent.update(|rows| {
+            rows.retain(|row| row.bot_id != bot_id);
+            if !text.is_empty() || !previews.is_empty() {
+                rows.push(Unsent {
+                    bot_id,
+                    text,
+                    previews,
+                });
+            }
+        });
+    }
+
+    /// Shows the unsent line for `bot_id`, or an empty composer.
+    fn apply_unsent(self, bot_id: &str) {
+        let found = self
+            .unsent
+            .with(|rows| rows.iter().find(|row| row.bot_id == bot_id).cloned());
+        match found {
+            Some(row) => {
+                self.draft.set(row.text);
+                self.previews.set(row.previews);
+            }
+            None => {
+                self.draft.set(String::new());
+                self.previews.set(Vec::new());
+            }
+        }
+    }
+
+    fn drop_unsent(self, bot_id: &str) {
+        let bot_id = bot_id.to_owned();
+        self.unsent
+            .update(|rows| rows.retain(|row| row.bot_id != bot_id));
     }
 
     pub fn open_new(self) {
@@ -441,6 +512,7 @@ impl Shell {
         });
         self.draft.set(String::new());
         self.previews.set(Vec::new());
+        self.drop_unsent(&bot_id);
         self.away_from_bottom.set(false);
         self.show_newest(false);
         self.focus_composer();
