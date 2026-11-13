@@ -151,17 +151,32 @@ impl Shell {
         shell
     }
 
-    /// Puts the keyboard in the message field on the next turn, once that
-    /// field is mounted. The new-bot form keeps the keyboard if it opened
-    /// in the meantime.
+    /// Puts the keyboard in the message field once that field can take it.
+    /// On open the field has no node yet, and a focus sent before the
+    /// native widget is ready does not stick, so this keeps trying.
+    /// The new-bot form keeps the keyboard if it opened in the meantime.
+    /// An open search field keeps it too.
     pub fn focus_composer(self) {
         let field = self.composer;
-        set_timeout(std::time::Duration::from_millis(16), move || {
-            if self.creating.get() {
-                return;
-            }
-            field.focus();
-        });
+        if field.node().is_some() {
+            set_timeout(std::time::Duration::from_millis(16), move || {
+                if !self.creating.get() {
+                    field.focus();
+                }
+            });
+            return;
+        }
+        // 16ms steps for about three seconds. The waits are scheduled
+        // here: the field is not mounted on the first one.
+        for step in 1u64..=180 {
+            let field = self.composer;
+            set_timeout(std::time::Duration::from_millis(16 * step), move || {
+                if self.creating.get() || self.search_open.get() || field.node().is_none() {
+                    return;
+                }
+                field.focus();
+            });
+        }
     }
 
     pub fn set_appearance(self, choice: AppearanceChoice) {
