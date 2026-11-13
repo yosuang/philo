@@ -461,16 +461,23 @@ fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
             .rounded(px(18.0))
             .bg(rgb(0xca317e))
             .child(previews(shell, at))
-            .child(
-                text(move || {
+            .child(when(
+                move || {
                     shell
                         .line_at(at.index())
-                        .map(|line| line.body)
-                        .unwrap_or_default()
-                })
-                .text_size(px(14.0))
-                .text_color(move || theme().primary_foreground),
-            ),
+                        .is_some_and(|line| !line.body.is_empty())
+                },
+                move || {
+                    text(move || {
+                        shell
+                            .line_at(at.index())
+                            .map(|line| line.body)
+                            .unwrap_or_default()
+                    })
+                    .text_size(px(14.0))
+                    .text_color(move || theme().primary_foreground)
+                },
+            )),
     )
 }
 
@@ -585,29 +592,129 @@ fn previews(shell: Shell, at: Position) -> impl IntoElement {
                 .is_some_and(|line| !line.previews.is_empty())
         },
         move || {
-            view().flex_row().gap(px(6.0)).child(each(
+            view().flex_row().flex_wrap().gap(px(6.0)).child(each(
                 move || {
                     shell
                         .line_at(at.index())
                         .map(|line| line.previews)
                         .unwrap_or_default()
                 },
-                |label| label.clone(),
-                move |label, _| {
-                    view()
-                        .px(px(8.0))
-                        .py(px(6.0))
-                        .rounded(px(8.0))
-                        .bg(move || theme().card)
-                        .child(
-                            text(move || label.get())
-                                .text_size(px(12.0))
-                                .text_color(move || theme().foreground),
-                        )
+                |preview| preview.id.clone(),
+                move |preview, _| {
+                    let line_id = shell
+                        .line_at(at.index())
+                        .map(|line| line.id)
+                        .unwrap_or_default();
+                    preview_tile(shell, preview, 84.0, Some(line_id))
                 },
             ))
         },
     )
+}
+
+/// One local picture, or the failure when that file cannot be decoded.
+/// `line_id` is set for a picture already stored on a line. The composer
+/// omits it and keeps the remove control.
+fn preview_tile(
+    shell: Shell,
+    preview: ReadSignal<crate::local::Preview>,
+    size: f32,
+    line_id: Option<String>,
+) -> impl IntoElement {
+    let id = preview.with(|item| item.id.clone());
+    let remove_id = id.clone();
+    let show_remove = line_id.is_none();
+    view()
+        .relative()
+        .size(px(size))
+        .flex_shrink_0()
+        .rounded(px(10.0))
+        .overflow_hidden()
+        .bg(move || {
+            if preview.with(|item| item.error.is_some()) {
+                rgb(0xfff1f2).into()
+            } else {
+                theme().muted
+            }
+        })
+        .border_1()
+        .border_color(move || {
+            if preview.with(|item| item.error.is_some()) {
+                rgb(0xbe123c).into()
+            } else {
+                theme().border
+            }
+        })
+        .items_center()
+        .justify_center()
+        .child(preview_media(shell, preview, size, line_id, id))
+        .child(when(show_remove, move || {
+            let remove_id = remove_id.clone();
+            button()
+                .absolute()
+                .top(px(2.0))
+                .right(px(2.0))
+                .size(px(18.0))
+                .rounded(px(9.0))
+                .items_center()
+                .justify_center()
+                .bg(move || theme().card)
+                .shadow_sm()
+                .cursor_pointer()
+                .accessibility_label("Remove preview")
+                .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+                .on_press(move || shell.remove_preview(remove_id.clone()))
+                .child(ui::glyph(shell, "close", false))
+        }))
+}
+
+fn preview_media(
+    shell: Shell,
+    preview: ReadSignal<crate::local::Preview>,
+    size: f32,
+    line_id: Option<String>,
+    preview_id: String,
+) -> impl IntoElement {
+    when(
+        move || preview.with(|item| item.error.is_some()),
+        move || {
+            view()
+                .size(px(size))
+                .px(px(4.0))
+                .items_center()
+                .justify_center()
+                .label("Could not decode image")
+                .child(
+                    text(move || {
+                        preview
+                            .with(|item| item.error.clone())
+                            .filter(|message| !message.is_empty())
+                            .unwrap_or_else(|| crate::local::DECODE_FAILURE.to_owned())
+                    })
+                    .text_size(px(11.0))
+                    .text_center()
+                    .number_of_lines(3)
+                    .text_color(rgb(0x9f1239)),
+                )
+        },
+    )
+    .otherwise(move || {
+        let line_id = line_id.clone();
+        let preview_id = preview_id.clone();
+        image(move || preview.with(|item| item.path.clone()))
+            .size(px(size))
+            .object_fit(ResizeMode::Cover)
+            .flex_shrink_0()
+            .label("Local image")
+            .on_error(move |message: &str| {
+                let message = message.to_owned();
+                if let Some(line_id) = line_id.clone() {
+                    shell.fail_line_preview(line_id, preview_id.clone(), message);
+                } else {
+                    shell.fail_preview(preview_id.clone(), message);
+                }
+            })
+    })
 }
 
 fn jump(shell: Shell) -> impl IntoElement {
@@ -715,48 +822,10 @@ fn attachment_row(shell: Shell) -> impl IntoElement {
     when(
         move || !shell.previews.with(Vec::is_empty),
         move || {
-            view().flex_row().gap(px(8.0)).child(each(
+            view().flex_row().flex_wrap().gap(px(8.0)).child(each(
                 move || shell.previews.get(),
                 |preview| preview.id.clone(),
-                move |preview, _| {
-                    let id = preview.with(|item| item.id.clone());
-                    view()
-                        .relative()
-                        .size(px(64.0))
-                        .rounded(px(10.0))
-                        .overflow_hidden()
-                        .bg(move || theme().muted)
-                        .border_1()
-                        .border_color(move || theme().border)
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            text(move || preview.with(|item| item.label.clone()))
-                                .text_size(px(10.0))
-                                .text_center()
-                                .number_of_lines(2)
-                                .text_color(move || theme().muted_foreground),
-                        )
-                        .child(
-                            button()
-                                .absolute()
-                                .top(px(2.0))
-                                .right(px(2.0))
-                                .size(px(18.0))
-                                .rounded(px(9.0))
-                                .items_center()
-                                .justify_center()
-                                .bg(move || theme().card)
-                                .shadow_sm()
-                                .cursor_pointer()
-                                .accessibility_label("Remove preview")
-                                .focus(|style| {
-                                    style.outline(px(2.0)).outline_color(move || theme().ring)
-                                })
-                                .on_press(move || shell.remove_preview(id.clone()))
-                                .child(ui::glyph(shell, "close", false)),
-                        )
-                },
+                move |preview, _| preview_tile(shell, preview, 72.0, None),
             ))
         },
     )
