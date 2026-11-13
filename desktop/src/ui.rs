@@ -168,8 +168,12 @@ pub fn quiet(label: impl IntoReactive<SharedString>) -> Text {
 }
 
 pub fn tinted(name: &'static str, color: &'static str) -> impl IntoElement {
+    tinted_size(name, color, 16.0)
+}
+
+pub fn tinted_size(name: &'static str, color: &'static str, size: f32) -> impl IntoElement {
     image(data_svg(&svg_body(name, color)))
-        .size(px(16.0))
+        .size(px(size))
         .object_fit(ResizeMode::Contain)
         .flex_shrink_0()
 }

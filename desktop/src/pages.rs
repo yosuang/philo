@@ -5,7 +5,7 @@ use nsh_base::{button, input, theme};
 use nsh_core::element::desktop::title_bar;
 use nsh_core::prelude::*;
 
-use crate::local::Shell;
+use crate::local::{Shell, LOCAL_CAPTION, starter_cards, starter_chips};
 use crate::ui;
 
 pub fn column(shell: Shell) -> impl IntoElement {
@@ -221,11 +221,13 @@ fn message_list(shell: Shell) -> impl IntoElement {
         })
 }
 
-/// Centered in the thread. The list's own empty cell is only as tall as its
-/// text, and an inverted list then pins that short cell to the bottom.
+/// Cards and chips for a bot with no lines. A press writes that prompt into
+/// the composer. It does not send, and it does not add a transcript line.
+/// The list's own empty cell is only as tall as its text, and an inverted
+/// list then pins that short cell to the bottom, so this layer fills the thread.
 fn empty_transcript(shell: Shell) -> impl IntoElement {
     when(
-        move || shell.line_count() == 0,
+        move || shell.shows_suggestions(),
         move || {
             view()
                 .absolute()
@@ -233,25 +235,165 @@ fn empty_transcript(shell: Shell) -> impl IntoElement {
                 .left(px(0.0))
                 .right(px(0.0))
                 .bottom(px(0.0))
+                .px(px(20.0))
+                .pt(px(28.0))
+                .pb(px(6.0))
                 .items_center()
-                .justify_center()
-                .p(px(24.0))
-                .gap(px(6.0))
-                .pointer_events(PointerEvents::None)
                 .child(
-                    text("No messages yet")
-                        .text_size(px(16.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_center(),
+                    view()
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(0.0))
+                        .items_center()
+                        .justify_center()
+                        .gap(px(16.0))
+                        .child(empty_mark())
+                        .child(empty_heading())
+                        .child(suggestion_grid(shell)),
                 )
-                .child(
-                    ui::quiet(
-                        "What you type stays in this window. Nothing is sent, and there is no model reply.",
-                    )
-                    .text_center(),
-                )
+                .child(suggestion_chips(shell))
         },
     )
+}
+
+fn empty_mark() -> impl IntoElement {
+    view()
+        .size(px(48.0))
+        .rounded(px(16.0))
+        .items_center()
+        .justify_center()
+        .bg(move || theme().card)
+        .shadow_sm()
+        .child(ui::tinted_size("sparkle", "#f93598", 22.0))
+}
+
+fn empty_heading() -> impl IntoElement {
+    view()
+        .w_full()
+        .max_w(px(460.0))
+        .items_center()
+        .gap(px(6.0))
+        .child(
+            text("Start with a prompt")
+                .text_size(px(26.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_center(),
+        )
+        .child(
+            text("A prompt fills the composer.")
+                .text_size(px(14.0))
+                .text_center()
+                .text_color(move || theme().muted_foreground),
+        )
+        .child(
+            text("Nothing is sent, and there is no model reply.")
+                .text_size(px(14.0))
+                .text_center()
+                .text_color(move || theme().muted_foreground),
+        )
+}
+
+fn suggestion_grid(shell: Shell) -> impl IntoElement {
+    let cards = starter_cards();
+    view()
+        .w_full()
+        .max_w(px(640.0))
+        .gap(px(10.0))
+        .child(suggestion_row(shell, &cards[0], &cards[1]))
+        .child(suggestion_row(shell, &cards[2], &cards[3]))
+}
+
+fn suggestion_row(
+    shell: Shell,
+    left: &'static crate::local::Starter,
+    right: &'static crate::local::Starter,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .gap(px(10.0))
+        .child(suggestion_card(shell, left))
+        .child(suggestion_card(shell, right))
+}
+
+fn suggestion_card(shell: Shell, card: &'static crate::local::Starter) -> impl IntoElement {
+    button()
+        .flex_1()
+        .min_w(px(0.0))
+        .min_h(px(108.0))
+        .p(px(14.0))
+        .rounded(px(16.0))
+        .bg(move || theme().card)
+        .border_1()
+        .border_color(move || theme().border)
+        .cursor_pointer()
+        .hover(|style| style.bg(move || theme().accent))
+        .focus(|style| {
+            style
+                .outline(px(2.0))
+                .outline_offset(px(2.0))
+                .outline_color(move || theme().ring)
+        })
+        .accessibility_label(card.title)
+        .on_press(move || shell.fill_composer(card.prompt))
+        .child(
+            view()
+                .w_full()
+                .gap(px(8.0))
+                .child(ui::tinted(card.icon, card.color))
+                .child(
+                    text(card.title)
+                        .text_size(px(14.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .number_of_lines(1),
+                )
+                .child(
+                    text(card.detail)
+                        .text_size(px(12.0))
+                        .text_color(move || theme().muted_foreground)
+                        .number_of_lines(2),
+                ),
+        )
+}
+
+fn suggestion_chips(shell: Shell) -> impl IntoElement {
+    let chips = starter_chips();
+    view()
+        .w_full()
+        .flex_row()
+        .flex_wrap()
+        .justify_center()
+        .gap(px(8.0))
+        .pt(px(10.0))
+        .child(suggestion_chip(shell, &chips[0]))
+        .child(suggestion_chip(shell, &chips[1]))
+        .child(suggestion_chip(shell, &chips[2]))
+        .child(suggestion_chip(shell, &chips[3]))
+}
+
+fn suggestion_chip(shell: Shell, chip: &'static crate::local::Starter) -> impl IntoElement {
+    button()
+        .px(px(14.0))
+        .py(px(7.0))
+        .rounded(px(18.0))
+        .bg(move || theme().card)
+        .border_1()
+        .border_color(move || theme().border)
+        .cursor_pointer()
+        .hover(|style| style.bg(move || theme().accent))
+        .focus(|style| {
+            style
+                .outline(px(2.0))
+                .outline_offset(px(2.0))
+                .outline_color(move || theme().ring)
+        })
+        .accessibility_label(chip.title)
+        .on_press(move || shell.fill_composer(chip.prompt))
+        .child(
+            text(chip.prompt)
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM),
+        )
 }
 
 fn time_mark(shell: Shell) -> impl IntoElement {
@@ -294,7 +436,7 @@ fn time_line(shell: Shell, at: Position) -> impl IntoElement {
         )
         .child(time_mark(shell))
         .child(
-            text("Local · not sent")
+            text(LOCAL_CAPTION)
                 .text_size(px(11.0))
                 .text_color(move || theme().muted_foreground),
         )
