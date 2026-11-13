@@ -100,6 +100,7 @@ struct Unsent {
 
 /// Activity, Library, and Suggested for one bot. The column's open flag is
 /// the window's. Closing the column does not clear this.
+/// `project` is the open blurb under that bot's Project pill.
 #[derive(Clone, PartialEq, Eq)]
 struct Panel {
     bot_id: String,
@@ -107,6 +108,7 @@ struct Panel {
     more: bool,
     suggested_hidden: bool,
     expanded: Vec<String>,
+    project: bool,
 }
 
 impl Panel {
@@ -117,6 +119,7 @@ impl Panel {
             more: false,
             suggested_hidden: false,
             expanded: Vec::new(),
+            project: false,
         }
     }
 }
@@ -609,6 +612,34 @@ impl Shell {
         self.panel().expanded.iter().any(|item| item == id)
     }
 
+    /// Opens the demo blurb, or closes it when it is already open.
+    /// The flag stays on this bot. It does not navigate, share, or send.
+    pub fn toggle_project(self) {
+        self.edit_panel(|panel| panel.project = !panel.project);
+    }
+
+    /// The Project blurb for the bot on screen.
+    pub fn project_on(self) -> bool {
+        self.panel().project
+    }
+
+    /// The mark under this line, if the row draws one.
+    pub fn mark_at(self, index: usize) -> Option<LineMark> {
+        let id = self.selected.get();
+        self.lines.with(|lines| {
+            let mine: Vec<bool> = lines
+                .iter()
+                .filter(|line| Some(&line.bot_id) == id.as_ref())
+                .map(|line| line.mine)
+                .collect();
+            line_mark(&mine, index)
+        })
+    }
+
+    pub fn bot_name(self) -> String {
+        self.selected_bot().map(|bot| bot.name).unwrap_or_default()
+    }
+
     fn panel(self) -> Panel {
         let id = self.selected.get().unwrap_or_default();
         self.panels.with(|rows| read_panel(rows, &id))
@@ -966,6 +997,67 @@ pub fn starter_chips() -> &'static [Starter] {
 /// The caption on a line this window stored. It is not a model reply.
 pub const LOCAL_CAPTION: &str = "Local · not sent";
 
+/// Shown while this bot's Project pill is open. It names no real project.
+pub const PROJECT_BLURB: &str = "Demo project. Nothing is opened or sent.";
+
+/// What a transcript row draws under its bubble.
+/// `mine` in [`line_mark`] is newest first, the same order as `Shell::line_at`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LineMark {
+    /// One bot note, or one local line on its own.
+    Messaged,
+    /// Two or more local lines in a row. Drawn once, on the newest of them.
+    Count(usize),
+}
+
+impl LineMark {
+    /// The words before the bot name. The name and the Project pill follow.
+    pub fn prefix(self) -> String {
+        match self {
+            Self::Messaged => "Messaged".to_owned(),
+            Self::Count(count) => format!("{count} messages with"),
+        }
+    }
+}
+
+/// The mark for `mine[index]`. A bot note is `Messaged`. A local line on its
+/// own is `Messaged`. A run of two or more local lines is the count, and only
+/// the newest line of that run carries it.
+pub fn line_mark(mine: &[bool], index: usize) -> Option<LineMark> {
+    let mine_line = *mine.get(index)?;
+    if !mine_line {
+        return Some(LineMark::Messaged);
+    }
+    let newest = run_newest(mine, index);
+    let count = run_count(mine, newest);
+    if count >= 2 {
+        if index == newest {
+            Some(LineMark::Count(count))
+        } else {
+            None
+        }
+    } else {
+        Some(LineMark::Messaged)
+    }
+}
+
+/// Newest index of the local run that contains `index`. `mine` is newest first,
+/// so the newest line is the smallest index.
+fn run_newest(mine: &[bool], index: usize) -> usize {
+    let mut at = index;
+    while at > 0 && mine[at - 1] {
+        at -= 1;
+    }
+    at
+}
+
+fn run_count(mine: &[bool], newest: usize) -> usize {
+    mine.iter()
+        .skip(newest)
+        .take_while(|mine_line| **mine_line)
+        .count()
+}
+
 fn suggestion_cards_visible(creating: bool, has_bot: bool, line_count: usize) -> bool {
     !creating && has_bot && line_count == 0
 }
@@ -1178,5 +1270,68 @@ mod tests {
         };
         assert!(activity_for(&local, true).is_empty());
         assert!(files_for(&local).is_empty());
+    }
+
+    #[test]
+    fn a_note_and_a_single_local_line_say_messaged() {
+        // Newest first, the way Philo's seed alternates.
+        let mine = [true, false, true, false];
+        assert_eq!(line_mark(&mine, 0), Some(LineMark::Messaged));
+        assert_eq!(line_mark(&mine, 1), Some(LineMark::Messaged));
+        assert_eq!(line_mark(&mine, 2), Some(LineMark::Messaged));
+        assert_eq!(line_mark(&mine, 3), Some(LineMark::Messaged));
+        assert_eq!(LineMark::Messaged.prefix(), "Messaged");
+        assert!(line_mark(&[], 0).is_none());
+    }
+
+    #[test]
+    fn consecutive_local_lines_count_once_on_the_newest() {
+        let mine = [true, true, false, true];
+        assert_eq!(line_mark(&mine, 0), Some(LineMark::Count(2)));
+        assert_eq!(line_mark(&mine, 1), None);
+        assert_eq!(line_mark(&mine, 2), Some(LineMark::Messaged));
+        assert_eq!(line_mark(&mine, 3), Some(LineMark::Messaged));
+        assert_eq!(LineMark::Count(2).prefix(), "2 messages with");
+
+        let three = [true, true, true];
+        assert_eq!(line_mark(&three, 0), Some(LineMark::Count(3)));
+        assert_eq!(line_mark(&three, 1), None);
+        assert_eq!(line_mark(&three, 2), None);
+        assert_eq!(LineMark::Count(3).prefix(), "3 messages with");
+
+        // A run that is not the newest row still counts on its own newest line.
+        let older = [false, true, true, false];
+        assert_eq!(line_mark(&older, 0), Some(LineMark::Messaged));
+        assert_eq!(line_mark(&older, 1), Some(LineMark::Count(2)));
+        assert_eq!(line_mark(&older, 2), None);
+        assert_eq!(line_mark(&older, 3), Some(LineMark::Messaged));
+    }
+
+    #[test]
+    fn the_project_blurb_stays_with_its_bot() {
+        let mut panels = Vec::new();
+        write_panel(&mut panels, "philo", |panel| panel.project = true);
+        assert!(read_panel(&panels, "philo").project);
+        assert!(!read_panel(&panels, "desk").project);
+        write_panel(&mut panels, "desk", |panel| panel.project = true);
+        write_panel(&mut panels, "desk", |panel| panel.project = false);
+        assert!(read_panel(&panels, "philo").project);
+        assert!(!read_panel(&panels, "desk").project);
+        assert_eq!(PROJECT_BLURB, "Demo project. Nothing is opened or sent.");
+    }
+
+    #[test]
+    fn one_sent_line_is_messaged_and_a_second_counts() {
+        let first = local_outgoing("line-1".into(), "desk".into(), "Hello".into(), Vec::new());
+        assert!(first.mine);
+        assert_eq!(line_mark(&[first.mine], 0), Some(LineMark::Messaged));
+        let second = local_outgoing("line-2".into(), "desk".into(), "Again".into(), Vec::new());
+        // Newest first, the order `send` inserts.
+        assert_eq!(
+            line_mark(&[second.mine, first.mine], 0),
+            Some(LineMark::Count(2))
+        );
+        assert_eq!(line_mark(&[second.mine, first.mine], 1), None);
+        assert_eq!(LOCAL_CAPTION, "Local · not sent");
     }
 }
