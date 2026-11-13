@@ -555,14 +555,16 @@ impl Shell {
         self.focus_composer();
     }
 
-    /// Opens the system file dialog. Cancel adds nothing. The file the user
-    /// picks is attached on the open bot. A file that is not a picture is
-    /// still attached, with the decode failure on that preview. If the
-    /// dialog cannot open, a notice is shown and nothing is attached.
+    /// Opens the system file dialog for the bot on screen. Cancel adds
+    /// nothing. The file is attached to that bot even if another bot is
+    /// selected by the time the dialog returns. A file that is not a
+    /// picture is still attached, with the decode failure on that preview.
+    /// If the dialog cannot open, a notice is shown and nothing is attached.
     pub fn choose_file(self) {
         if self.choosing.replace(true) {
             return;
         }
+        let opener = self.selected.get();
         // `spawn` cancels a task when its handle is dropped.
         std::mem::forget(spawn(async move {
             let picked = pick_paths(
@@ -574,7 +576,11 @@ impl Shell {
             self.choosing.replace(false);
             match files_from_dialog(picked) {
                 Ok(files) if files.is_empty() => {}
-                Ok(files) => self.attach_files(files),
+                Ok(files) => {
+                    if let Some(opener) = opener {
+                        self.apply_choice(&opener, files);
+                    }
+                }
                 Err(message) => {
                     log::warn!("file dialog: {message}");
                     self.notice("Could not open the file dialog.");
@@ -583,18 +589,23 @@ impl Shell {
         }));
     }
 
-    fn attach_files(self, files: Vec<ChosenFile>) {
-        let mut attached = Vec::with_capacity(files.len());
-        for file in files {
-            attached.push(Preview {
-                id: self.alloc("preview"),
-                path: file.path,
-                error: file.error,
-            });
+    fn apply_choice(self, opener: &str, files: Vec<ChosenFile>) {
+        let current = self.selected.get();
+        let on_screen = current.as_deref() == Some(opener);
+        let (composer, unsent) = land_on_opener(
+            opener,
+            current.as_deref(),
+            self.previews.get(),
+            self.unsent.get(),
+            files,
+            || self.alloc("preview"),
+        );
+        self.unsent.set(unsent);
+        if on_screen {
+            self.previews.set(composer);
+            self.show_newest(false);
+            self.focus_composer();
         }
-        self.previews.update(|items| items.extend(attached));
-        self.show_newest(false);
-        self.focus_composer();
     }
 
     pub fn remove_preview(self, id: String) {
@@ -1202,6 +1213,43 @@ fn composer_fill(creating: bool, has_bot: bool, prompt: &str) -> Option<String> 
     }
 }
 
+/// Puts `files` on `opener`. `composer` is the bot on screen. When that bot
+/// is not `opener`, the composer is left as it was and the files join the
+/// opener's parked draft, including a decode failure. An empty `files`
+/// changes nothing.
+fn land_on_opener(
+    opener: &str,
+    current: Option<&str>,
+    mut composer: Vec<Preview>,
+    mut unsent: Vec<Unsent>,
+    files: Vec<ChosenFile>,
+    mut next_id: impl FnMut() -> String,
+) -> (Vec<Preview>, Vec<Unsent>) {
+    if files.is_empty() {
+        return (composer, unsent);
+    }
+    let attached: Vec<Preview> = files
+        .into_iter()
+        .map(|file| Preview {
+            id: next_id(),
+            path: file.path,
+            error: file.error,
+        })
+        .collect();
+    if current == Some(opener) {
+        composer.extend(attached);
+        return (composer, unsent);
+    }
+    let (text, mut previews) = unsent
+        .iter()
+        .find(|row| row.bot_id == opener)
+        .map(|row| (row.text.clone(), row.previews.clone()))
+        .unwrap_or_else(|| (String::new(), Vec::new()));
+    previews.extend(attached);
+    park_unsent(&mut unsent, opener.to_owned(), text, previews);
+    (composer, unsent)
+}
+
 fn park_unsent(rows: &mut Vec<Unsent>, bot_id: String, text: String, previews: Vec<Preview>) {
     rows.retain(|row| row.bot_id != bot_id);
     if !text.is_empty() || !previews.is_empty() {
@@ -1556,5 +1604,64 @@ mod tests {
         );
         assert!(!suggestion_cards_visible(false, true, 1));
         assert_eq!(LOCAL_CAPTION, "Local · not sent");
+    }
+
+    #[test]
+    fn a_dialog_result_lands_on_the_opener_not_the_bot_on_screen() {
+        let rose = fixture("rose.png");
+        let broken = fixture("broken.bin");
+        let files = files_from_dialog(Ok(Some(vec![
+            std::path::PathBuf::from(&rose),
+            std::path::PathBuf::from(&broken),
+        ])))
+        .expect("picked files");
+        let desk_only = Preview {
+            id: "desk-draft".to_owned(),
+            path: "desk-only".to_owned(),
+            error: None,
+        };
+        let mut n = 0;
+        let (composer, unsent) = land_on_opener(
+            "philo",
+            Some("desk"),
+            vec![desk_only.clone()],
+            vec![Unsent {
+                bot_id: "philo".to_owned(),
+                text: "kept draft".to_owned(),
+                previews: Vec::new(),
+            }],
+            files,
+            || {
+                n += 1;
+                format!("preview-{n}")
+            },
+        );
+        assert_eq!(composer, vec![desk_only]);
+        assert!(
+            composer
+                .iter()
+                .all(|item| !item.path.ends_with("rose.png") && item.error.is_none())
+        );
+        let philo = parked(&unsent, "philo").expect("opener keeps the files");
+        assert_eq!(philo.text, "kept draft");
+        assert!(philo.previews[0].path.ends_with("rose.png"));
+        assert!(philo.previews[0].error.is_none());
+        assert_eq!(philo.previews[1].error.as_deref(), Some(DECODE_FAILURE));
+        assert!(parked(&unsent, "desk").is_none());
+
+        let still_open =
+            files_from_dialog(Ok(Some(vec![std::path::PathBuf::from(&rose)]))).expect("rose");
+        let (composer, unsent) = land_on_opener(
+            "philo",
+            Some("philo"),
+            Vec::new(),
+            Vec::new(),
+            still_open,
+            || "preview-open".to_owned(),
+        );
+        assert!(unsent.is_empty());
+        assert_eq!(composer.len(), 1);
+        assert!(composer[0].path.ends_with("rose.png"));
+        assert!(composer[0].error.is_none());
     }
 }
