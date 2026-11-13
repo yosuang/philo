@@ -272,8 +272,31 @@ impl Shell {
     pub fn reveal_search(self) {
         self.sidebar_collapsed.set(false);
         self.search_open.set(true);
+        self.focus_search_field();
+    }
+
+    /// The expand mounts the field. A focus sent before that node exists
+    /// does not stick, so this keeps trying. A closed search, or the
+    /// new-bot form, keeps the keyboard.
+    fn focus_search_field(self) {
         let field = self.search_field;
-        set_timeout(std::time::Duration::from_millis(16), move || field.focus());
+        if field.node().is_some() {
+            set_timeout(std::time::Duration::from_millis(16), move || {
+                if self.search_open.get() && !self.creating.get() {
+                    field.focus();
+                }
+            });
+            return;
+        }
+        for step in 1u64..=180 {
+            let field = self.search_field;
+            set_timeout(std::time::Duration::from_millis(16 * step), move || {
+                if !self.search_open.get() || self.creating.get() || field.node().is_none() {
+                    return;
+                }
+                field.focus();
+            });
+        }
     }
 
     pub fn open_search(self) {
