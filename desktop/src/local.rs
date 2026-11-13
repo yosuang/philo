@@ -70,7 +70,8 @@ pub struct Line {
     pub mine: bool,
     /// Shown in the bubble. Demo notes say they are not a model reply.
     pub body: String,
-    pub previews: Vec<String>,
+    /// Pictures kept on this line. Empty for seed rows and notes.
+    pub previews: Vec<Preview>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -83,10 +84,13 @@ pub struct Activity {
     pub note: String,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Preview {
     pub id: String,
-    pub label: String,
+    /// Absolute path of the local file this preview shows.
+    pub path: String,
+    /// Why the file could not be shown. The tile draws this instead of a picture.
+    pub error: Option<String>,
 }
 
 /// Text and local previews left on a bot that is not the one on screen.
@@ -131,6 +135,8 @@ pub struct Shell {
     pub selected: Signal<Option<String>>,
     pub draft: Signal<String>,
     pub previews: Signal<Vec<Preview>>,
+    /// How many files the attach control has offered. The next press takes the next file.
+    preview_seq: Stored<u32>,
     /// Unsent lines for bots other than the one open now.
     unsent: Signal<Vec<Unsent>>,
     pub query: Signal<String>,
@@ -167,6 +173,7 @@ impl Shell {
             selected: signal(Some("philo".to_owned())),
             draft: signal(String::new()),
             previews: signal(Vec::new()),
+            preview_seq: stored(0),
             unsent: signal(Vec::new()),
             query: signal(String::new()),
             search_open: signal(false),
@@ -510,11 +517,8 @@ impl Shell {
     /// Writes `prompt` into the open bot's composer and focuses the field.
     /// The transcript stays as it was. Nothing is sent, and no model is asked.
     pub fn fill_composer(self, prompt: &str) {
-        let Some(text) = composer_fill(
-            self.creating.get(),
-            self.selected.get().is_some(),
-            prompt,
-        ) else {
+        let Some(text) = composer_fill(self.creating.get(), self.selected.get().is_some(), prompt)
+        else {
             return;
         };
         self.draft.set(text);
@@ -527,9 +531,7 @@ impl Shell {
             return;
         };
         let text = self.draft.get().trim().to_owned();
-        let previews: Vec<String> = self
-            .previews
-            .with(|items| items.iter().map(|item| item.label.clone()).collect());
+        let previews = self.previews.get();
         if text.is_empty() && previews.is_empty() {
             return;
         }
@@ -550,14 +552,19 @@ impl Shell {
         self.focus_composer();
     }
 
+    /// Attaches the next local file on the open bot. A file that is not an
+    /// image is still attached, with the decode failure on that preview.
     pub fn add_preview(self) {
-        let n = self.previews.with(Vec::len) + 1;
+        let index = self.preview_seq.with(|n| {
+            let index = *n;
+            *n = index.wrapping_add(1);
+            index as usize
+        });
+        let path = local_path(local_name(index));
+        let error = image_failure(&path);
         let id = self.alloc("preview");
         self.previews.update(|items| {
-            items.push(Preview {
-                id,
-                label: format!("Local preview {n}"),
-            });
+            items.push(Preview { id, path, error });
         });
         self.show_newest(false);
         self.focus_composer();
@@ -567,6 +574,29 @@ impl Shell {
         self.previews
             .update(|items| items.retain(|item| item.id != id));
         self.focus_composer();
+    }
+
+    /// The image view could not load this unsent preview.
+    pub fn fail_preview(self, id: String, message: String) {
+        let message = failure_text(&message);
+        self.previews.update(|items| {
+            if let Some(item) = items.iter_mut().find(|item| item.id == id) {
+                item.error = Some(message);
+            }
+        });
+    }
+
+    /// The image view could not load a picture already stored on a line.
+    pub fn fail_line_preview(self, line_id: String, preview_id: String, message: String) {
+        let message = failure_text(&message);
+        self.lines.update(|lines| {
+            let Some(line) = lines.iter_mut().find(|line| line.id == line_id) else {
+                return;
+            };
+            if let Some(item) = line.previews.iter_mut().find(|item| item.id == preview_id) {
+                item.error = Some(message);
+            }
+        });
     }
 
     pub fn toggle_details(self) {
@@ -649,8 +679,7 @@ impl Shell {
         let Some(id) = self.selected.get() else {
             return;
         };
-        self.panels
-            .update(|rows| write_panel(rows, &id, edit));
+        self.panels.update(|rows| write_panel(rows, &id, edit));
     }
 
     pub fn notice(self, text: impl Into<String>) {
@@ -806,8 +835,16 @@ fn activity_for(bot: &Bot, more: bool) -> Vec<Activity> {
         return Vec::new();
     }
     let mut rows = vec![
-        sample("sample", "Demo sample", "Demo note. This sample is not a run."),
-        sample("label", "Demo label", "Demo note. A label only, still in this window."),
+        sample(
+            "sample",
+            "Demo sample",
+            "Demo note. This sample is not a run.",
+        ),
+        sample(
+            "label",
+            "Demo label",
+            "Demo note. A label only, still in this window.",
+        ),
         sample(
             "reminder",
             "Demo reminder",
@@ -997,6 +1034,59 @@ pub fn starter_chips() -> &'static [Starter] {
 /// The caption on a line this window stored. It is not a model reply.
 pub const LOCAL_CAPTION: &str = "Local · not sent";
 
+/// Shown on a preview whose file is not a picture. Not a stand-in for the picture.
+pub const DECODE_FAILURE: &str = "Could not decode";
+
+/// Files the attach control offers, in order, then from the start.
+/// `broken.bin` is not an image, so that preview shows [`DECODE_FAILURE`].
+fn local_name(index: usize) -> &'static str {
+    const NAMES: [&str; 4] = ["rose.png", "teal.png", "amber.png", "broken.bin"];
+    NAMES[index % NAMES.len()]
+}
+
+fn local_path(name: &str) -> String {
+    format!("{}/previews/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// `None` when `path` has a PNG, JPEG, GIF, or WebP header.
+/// A missing file, or one that is not one of those, is a failure.
+/// The image view still reports a later decode error through `on_error`.
+fn image_failure(path: &str) -> Option<String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        Ok(_) => return Some(DECODE_FAILURE.to_owned()),
+        Err(_) => return Some("Could not read image".to_owned()),
+    };
+    if image_kind(&bytes).is_some() {
+        None
+    } else {
+        Some(DECODE_FAILURE.to_owned())
+    }
+}
+
+fn image_kind(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+fn failure_text(message: &str) -> String {
+    let message = message.trim();
+    if message.is_empty() || message.chars().count() > 48 {
+        DECODE_FAILURE.to_owned()
+    } else {
+        message.to_owned()
+    }
+}
+
 /// Shown while this bot's Project pill is open. It names no real project.
 pub const PROJECT_BLURB: &str = "Demo project. Nothing is opened or sent.";
 
@@ -1086,7 +1176,7 @@ fn parked<'a>(rows: &'a [Unsent], bot_id: &str) -> Option<&'a Unsent> {
     rows.iter().find(|row| row.bot_id == bot_id)
 }
 
-fn local_outgoing(id: String, bot_id: String, body: String, previews: Vec<String>) -> Line {
+fn local_outgoing(id: String, bot_id: String, body: String, previews: Vec<Preview>) -> Line {
     Line {
         id,
         bot_id,
@@ -1255,9 +1345,10 @@ mod tests {
         assert!(rows.iter().all(|row| !row.note.is_empty()));
         let files = files_for(&philo);
         assert!(!files.is_empty());
-        assert!(files.iter().all(|name| rows.iter().all(|row| {
-            row.title != *name && row.id != *name && row.note != *name
-        })));
+        assert!(files.iter().all(|name| {
+            rows.iter()
+                .all(|row| row.title != *name && row.id != *name && row.note != *name)
+        }));
         assert!(activity_for(&bot_named("desk"), false).is_empty());
         assert!(files_for(&bot_named("desk")).is_empty());
         let local = Bot {
@@ -1332,6 +1423,80 @@ mod tests {
             Some(LineMark::Count(2))
         );
         assert_eq!(line_mark(&[second.mine, first.mine], 1), None);
+        assert_eq!(LOCAL_CAPTION, "Local · not sent");
+    }
+
+    #[test]
+    fn local_image_previews_stay_with_the_bot_and_a_bad_file_fails() {
+        assert_eq!(local_name(0), "rose.png");
+        assert_eq!(local_name(3), "broken.bin");
+        assert_eq!(local_name(4), "rose.png");
+        let rose = local_path(local_name(0));
+        let teal = local_path(local_name(1));
+        let amber = local_path(local_name(2));
+        let broken = local_path(local_name(3));
+        assert!(image_failure(&rose).is_none());
+        assert!(image_failure(&teal).is_none());
+        assert!(image_failure(&amber).is_none());
+        assert!(
+            std::fs::read(&rose)
+                .unwrap()
+                .starts_with(b"\x89PNG\r\n\x1a\n")
+        );
+        let broken_error = image_failure(&broken).expect("broken file");
+        assert_eq!(broken_error, DECODE_FAILURE);
+        assert!(!broken_error.contains("Local preview"));
+        assert!(
+            image_failure("/tmp/philo-missing-preview.png")
+                .unwrap()
+                .contains("read")
+        );
+        assert_eq!(failure_text(""), DECODE_FAILURE);
+        assert_eq!(failure_text("not a PNG"), "not a PNG");
+        assert_eq!(failure_text(&"x".repeat(80)), DECODE_FAILURE);
+
+        let philo_previews = vec![
+            Preview {
+                id: "preview-1".to_owned(),
+                path: rose.clone(),
+                error: None,
+            },
+            Preview {
+                id: "preview-2".to_owned(),
+                path: broken.clone(),
+                error: Some(broken_error),
+            },
+        ];
+        let mut rows = Vec::new();
+        park_unsent(
+            &mut rows,
+            "philo".to_owned(),
+            String::new(),
+            philo_previews.clone(),
+        );
+        park_unsent(&mut rows, "desk".to_owned(), String::new(), Vec::new());
+        assert!(parked(&rows, "desk").is_none());
+        assert_eq!(parked(&rows, "philo").unwrap().previews, philo_previews);
+
+        let line = local_outgoing(
+            "line-9".to_owned(),
+            "philo".to_owned(),
+            String::new(),
+            philo_previews,
+        );
+        assert!(line.mine);
+        assert_eq!(line.bot_id, "philo");
+        assert!(line.body.is_empty());
+        assert!(line.previews[0].path.ends_with("rose.png"));
+        assert!(line.previews[0].error.is_none());
+        assert_eq!(line.previews[1].error.as_deref(), Some(DECODE_FAILURE));
+        assert!(
+            !line
+                .previews
+                .iter()
+                .any(|item| item.path.contains("Local preview"))
+        );
+        assert!(!suggestion_cards_visible(false, true, 1));
         assert_eq!(LOCAL_CAPTION, "Local · not sent");
     }
 }
