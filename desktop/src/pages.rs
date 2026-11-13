@@ -199,6 +199,7 @@ fn transcript(shell: Shell) -> impl IntoElement {
         .relative()
         .style_when(move || shell.creating.get(), |style| style.hidden())
         .child(message_list(shell))
+        .child(empty_transcript(shell))
         .child(jump(shell))
 }
 
@@ -211,7 +212,6 @@ fn message_list(shell: Shell) -> impl IntoElement {
         .row_gap(px(3.0))
         .flex_1()
         .element_ref(&shell.transcript)
-        .empty(empty_transcript(shell))
         .on_scroll(move |event: &ScrollEvent| {
             shell.note_scroll(
                 event.offset.y.0,
@@ -221,27 +221,37 @@ fn message_list(shell: Shell) -> impl IntoElement {
         })
 }
 
+/// Centered in the thread. The list's own empty cell is only as tall as its
+/// text, and an inverted list then pins that short cell to the bottom.
 fn empty_transcript(shell: Shell) -> impl IntoElement {
-    view()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .p(px(24.0))
-        .gap(px(6.0))
-        .child(
-            text(move || {
-                if shell.selected_bot().is_some_and(|bot| bot.demo) {
-                    "No messages yet".to_owned()
-                } else {
-                    "No messages yet".to_owned()
-                }
-            })
-            .text_size(px(16.0))
-            .font_weight(FontWeight::SEMIBOLD),
-        )
-        .child(ui::quiet(
-            "What you type stays in this window. Nothing is sent, and there is no model reply.",
-        ))
+    when(
+        move || shell.line_count() == 0,
+        move || {
+            view()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .items_center()
+                .justify_center()
+                .p(px(24.0))
+                .gap(px(6.0))
+                .pointer_events(PointerEvents::None)
+                .child(
+                    text("No messages yet")
+                        .text_size(px(16.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_center(),
+                )
+                .child(
+                    ui::quiet(
+                        "What you type stays in this window. Nothing is sent, and there is no model reply.",
+                    )
+                    .text_center(),
+                )
+        },
+    )
 }
 
 fn time_mark(shell: Shell) -> impl IntoElement {
