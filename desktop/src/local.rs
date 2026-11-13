@@ -75,8 +75,12 @@ pub struct Line {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Activity {
+    pub id: String,
     pub title: String,
-    pub detail: String,
+    /// A local status word. These rows are samples.
+    pub status: String,
+    /// Shown only while this row is expanded.
+    pub note: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -92,6 +96,29 @@ struct Unsent {
     bot_id: String,
     text: String,
     previews: Vec<Preview>,
+}
+
+/// Activity, Library, and Suggested for one bot. The column's open flag is
+/// the window's. Closing the column does not clear this.
+#[derive(Clone, PartialEq, Eq)]
+struct Panel {
+    bot_id: String,
+    library: bool,
+    more: bool,
+    suggested_hidden: bool,
+    expanded: Vec<String>,
+}
+
+impl Panel {
+    fn empty(bot_id: String) -> Self {
+        Self {
+            bot_id,
+            library: false,
+            more: false,
+            suggested_hidden: false,
+            expanded: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -113,10 +140,10 @@ pub struct Shell {
     /// and the saved collapse returns. Unassigned starts collapsed.
     search_collapsed: Signal<Vec<String>>,
     pub sidebar_collapsed: Signal<bool>,
+    /// The details column. One for the window. What it shows is `panels`.
     pub details_open: Signal<bool>,
-    pub library: Signal<bool>,
-    pub activity_more: Signal<bool>,
-    pub suggested_hidden: Signal<bool>,
+    /// Per bot: Activity or Library, expanded rows, Show more, Suggested.
+    panels: Signal<Vec<Panel>>,
     pub creating: Signal<bool>,
     pub new_name: Signal<String>,
     pub notice: Signal<Option<String>>,
@@ -145,9 +172,7 @@ impl Shell {
             search_collapsed: signal(Vec::new()),
             sidebar_collapsed: signal(false),
             details_open: signal(false),
-            library: signal(false),
-            activity_more: signal(false),
-            suggested_hidden: signal(false),
+            panels: signal(Vec::new()),
             creating: signal(false),
             new_name: signal(String::new()),
             notice: signal(None),
@@ -546,8 +571,51 @@ impl Shell {
     }
 
     pub fn show_library(self, library: bool) {
-        self.library.set(library);
+        self.edit_panel(|panel| panel.library = library);
         self.details_open.set(true);
+    }
+
+    /// Library tab for the bot on screen. Activity is the other tab.
+    pub fn library_on(self) -> bool {
+        self.panel().library
+    }
+
+    pub fn reveal_activity(self) {
+        self.edit_panel(|panel| panel.more = true);
+    }
+
+    pub fn activity_more_on(self) -> bool {
+        self.panel().more
+    }
+
+    pub fn toggle_suggested(self) {
+        self.edit_panel(|panel| panel.suggested_hidden = !panel.suggested_hidden);
+    }
+
+    pub fn suggested_hidden_on(self) -> bool {
+        self.panel().suggested_hidden
+    }
+
+    /// Opens a demo row, or closes it when it is already open.
+    pub fn toggle_activity(self, id: String) {
+        self.edit_panel(|panel| toggle_expanded(&mut panel.expanded, id));
+    }
+
+    pub fn activity_expanded(self, id: &str) -> bool {
+        self.panel().expanded.iter().any(|item| item == id)
+    }
+
+    fn panel(self) -> Panel {
+        let id = self.selected.get().unwrap_or_default();
+        self.panels.with(|rows| read_panel(rows, &id))
+    }
+
+    fn edit_panel(self, edit: impl FnOnce(&mut Panel)) {
+        let Some(id) = self.selected.get() else {
+            return;
+        };
+        self.panels
+            .update(|rows| write_panel(rows, &id, edit));
     }
 
     pub fn notice(self, text: impl Into<String>) {
@@ -593,49 +661,16 @@ impl Shell {
     }
 
     pub fn activity(self) -> Vec<Activity> {
-        let Some(bot) = self.selected_bot() else {
-            return Vec::new();
-        };
-        if !bot.demo || bot.id == "desk" || bot.id == "shelf" {
-            return Vec::new();
+        match self.selected_bot() {
+            Some(bot) => activity_for(&bot, self.activity_more_on()),
+            None => Vec::new(),
         }
-        let mut rows = vec![
-            Activity {
-                title: "Demo sample".to_owned(),
-                detail: "Sample · not a run".to_owned(),
-            },
-            Activity {
-                title: "Demo label".to_owned(),
-                detail: "Sample · not a run".to_owned(),
-            },
-            Activity {
-                title: "Demo reminder".to_owned(),
-                detail: "Sample · not a run".to_owned(),
-            },
-        ];
-        if self.activity_more.get() {
-            rows.push(Activity {
-                title: "Demo archive".to_owned(),
-                detail: "Sample · not a run".to_owned(),
-            });
-            rows.push(Activity {
-                title: "Demo margin".to_owned(),
-                detail: "Sample · not a run".to_owned(),
-            });
-        }
-        rows
     }
 
     pub fn files(self) -> Vec<String> {
-        let Some(bot) = self.selected_bot() else {
-            return Vec::new();
-        };
-        if bot.id == "philo" {
-            vec!["Demo note".to_owned(), "Demo sketch".to_owned()]
-        } else if bot.demo && bot.id != "desk" && bot.id != "shelf" {
-            vec!["Demo file".to_owned()]
-        } else {
-            Vec::new()
+        match self.selected_bot() {
+            Some(bot) => files_for(&bot),
+            None => Vec::new(),
         }
     }
 
@@ -706,6 +741,78 @@ fn seed_bots() -> Vec<Bot> {
     ]
 }
 
+fn read_panel(rows: &[Panel], id: &str) -> Panel {
+    rows.iter()
+        .find(|row| row.bot_id == id)
+        .cloned()
+        .unwrap_or_else(|| Panel::empty(id.to_owned()))
+}
+
+fn write_panel(rows: &mut Vec<Panel>, id: &str, edit: impl FnOnce(&mut Panel)) {
+    if let Some(row) = rows.iter_mut().find(|row| row.bot_id == id) {
+        edit(row);
+    } else {
+        let mut row = Panel::empty(id.to_owned());
+        edit(&mut row);
+        rows.push(row);
+    }
+}
+
+fn toggle_expanded(ids: &mut Vec<String>, id: String) {
+    if let Some(at) = ids.iter().position(|item| item == &id) {
+        ids.remove(at);
+    } else {
+        ids.push(id);
+    }
+}
+
+fn activity_for(bot: &Bot, more: bool) -> Vec<Activity> {
+    if !bot.demo || bot.id == "desk" || bot.id == "shelf" {
+        return Vec::new();
+    }
+    let mut rows = vec![
+        sample("sample", "Demo sample", "Demo note. This sample is not a run."),
+        sample("label", "Demo label", "Demo note. A label only, still in this window."),
+        sample(
+            "reminder",
+            "Demo reminder",
+            "Demo note. Nothing was scheduled.",
+        ),
+    ];
+    if more {
+        rows.push(sample(
+            "archive",
+            "Demo archive",
+            "Demo note. An older sample.",
+        ));
+        rows.push(sample(
+            "margin",
+            "Demo margin",
+            "Demo note. The rest of the sample list.",
+        ));
+    }
+    rows
+}
+
+fn files_for(bot: &Bot) -> Vec<String> {
+    if bot.id == "philo" {
+        vec!["Demo note".to_owned(), "Demo sketch".to_owned()]
+    } else if bot.demo && bot.id != "desk" && bot.id != "shelf" {
+        vec!["Demo file".to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn sample(id: &str, title: &str, note: &str) -> Activity {
+    Activity {
+        id: id.to_owned(),
+        title: title.to_owned(),
+        status: "Demo".to_owned(),
+        note: note.to_owned(),
+    }
+}
+
 fn bot(id: &str, name: &str, summary: &str, group: &str, shape: u8) -> Bot {
     Bot {
         id: id.to_owned(),
@@ -768,5 +875,109 @@ fn philo_line(id: String, mine: bool, body: String) -> Line {
         mine,
         body,
         previews: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bot_named(id: &str) -> Bot {
+        seed_bots()
+            .into_iter()
+            .find(|bot| bot.id == id)
+            .unwrap_or_else(|| panic!("seed bot {id}"))
+    }
+
+    #[test]
+    fn closing_the_column_keeps_the_bots_tab_and_row() {
+        let mut panels = Vec::new();
+        let mut open = true;
+        assert!(open);
+        write_panel(&mut panels, "philo", |panel| panel.library = true);
+        write_panel(&mut panels, "philo", |panel| {
+            toggle_expanded(&mut panel.expanded, "sample".to_owned());
+        });
+        write_panel(&mut panels, "philo", |panel| panel.suggested_hidden = true);
+        write_panel(&mut panels, "philo", |panel| panel.more = true);
+        open = false;
+        assert!(!open);
+        let philo = read_panel(&panels, "philo");
+        assert!(philo.library);
+        assert_eq!(philo.expanded, vec!["sample".to_owned()]);
+        assert!(philo.suggested_hidden);
+        assert!(philo.more);
+    }
+
+    #[test]
+    fn library_tab_and_expanded_row_stay_with_the_bot() {
+        let mut panels = Vec::new();
+        write_panel(&mut panels, "philo", |panel| {
+            panel.library = true;
+            panel.suggested_hidden = true;
+            panel.more = true;
+            toggle_expanded(&mut panel.expanded, "sample".to_owned());
+        });
+        let philo_bot = bot_named("philo");
+        assert_eq!(activity_for(&philo_bot, true).len(), 5);
+
+        let notes = read_panel(&panels, "notes");
+        assert!(!notes.library);
+        assert!(notes.expanded.is_empty());
+        assert!(!notes.suggested_hidden);
+        assert!(!notes.more);
+        assert_eq!(activity_for(&bot_named("notes"), notes.more).len(), 3);
+        write_panel(&mut panels, "notes", |panel| {
+            toggle_expanded(&mut panel.expanded, "label".to_owned());
+        });
+
+        let philo = read_panel(&panels, "philo");
+        assert!(philo.library);
+        assert!(philo.expanded.iter().any(|id| id == "sample"));
+        assert!(!philo.expanded.iter().any(|id| id == "label"));
+        assert!(philo.suggested_hidden);
+        assert!(philo.more);
+        let row = activity_for(&philo_bot, philo.more)
+            .into_iter()
+            .find(|item| item.id == "sample")
+            .expect("sample row");
+        assert_eq!(row.status, "Demo");
+        assert!(row.note.contains("not a run"));
+
+        write_panel(&mut panels, "philo", |panel| {
+            toggle_expanded(&mut panel.expanded, "sample".to_owned());
+        });
+        assert!(read_panel(&panels, "philo").expanded.is_empty());
+        assert!(
+            read_panel(&panels, "notes")
+                .expanded
+                .iter()
+                .any(|id| id == "label")
+        );
+    }
+
+    #[test]
+    fn library_names_are_not_the_activity_rows() {
+        let philo = bot_named("philo");
+        let rows = activity_for(&philo, false);
+        assert!(rows.iter().all(|row| row.status == "Demo"));
+        assert!(rows.iter().all(|row| !row.note.is_empty()));
+        let files = files_for(&philo);
+        assert!(!files.is_empty());
+        assert!(files.iter().all(|name| rows.iter().all(|row| {
+            row.title != *name && row.id != *name && row.note != *name
+        })));
+        assert!(activity_for(&bot_named("desk"), false).is_empty());
+        assert!(files_for(&bot_named("desk")).is_empty());
+        let local = Bot {
+            id: "local-1".to_owned(),
+            name: "Local".to_owned(),
+            summary: "Local".to_owned(),
+            group: "unassigned".to_owned(),
+            shape: 1,
+            demo: false,
+        };
+        assert!(activity_for(&local, true).is_empty());
+        assert!(files_for(&local).is_empty());
     }
 }

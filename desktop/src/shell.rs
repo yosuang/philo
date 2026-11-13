@@ -383,7 +383,13 @@ fn user_row(shell: Shell) -> impl IntoElement {
 
 fn details(shell: Shell) -> impl IntoElement {
     view()
-        .w(px(DETAILS))
+        .w(move || {
+            if shell.details_open.get() {
+                px(DETAILS)
+            } else {
+                px(0.0)
+            }
+        })
         .flex_shrink_0()
         .h_full()
         .overflow_hidden()
@@ -401,7 +407,7 @@ fn details(shell: Shell) -> impl IntoElement {
                     .child(identity(shell))
                     .child(tabs(shell))
                     .child(
-                        when(move || shell.library.get(), move || library(shell))
+                        when(move || shell.library_on(), move || library(shell))
                             .otherwise(move || activity(shell)),
                     ),
             ),
@@ -474,7 +480,7 @@ fn tab(shell: Shell, label: &'static str, library: bool) -> impl IntoElement {
         .rounded(px(14.0))
         .cursor_pointer()
         .bg(move || {
-            if shell.library.get() == library {
+            if shell.library_on() == library {
                 theme().card
             } else {
                 theme().muted
@@ -482,7 +488,7 @@ fn tab(shell: Shell, label: &'static str, library: bool) -> impl IntoElement {
         })
         .shadow_sm()
         .style_when(
-            move || shell.library.get() != library,
+            move || shell.library_on() != library,
             |style| style.shadow_none(),
         )
         .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
@@ -520,12 +526,12 @@ fn activity_card(shell: Shell) -> impl IntoElement {
                 .gap(px(8.0))
                 .child(card().child(each(
                     move || shell.activity(),
-                    |row| row.title.clone(),
+                    |row| row.id.clone(),
                     move |row, _| activity_row(shell, row),
                 )))
                 .child(when(
                     move || {
-                        !shell.activity_more.get()
+                        !shell.activity_more_on()
                             && shell.selected_bot().is_some_and(|bot| bot.demo)
                     },
                     move || {
@@ -539,7 +545,7 @@ fn activity_card(shell: Shell) -> impl IntoElement {
                                 style.outline(px(2.0)).outline_color(move || theme().ring)
                             })
                             .accessibility_label("Show more")
-                            .on_press(move || shell.activity_more.set(true))
+                            .on_press(move || shell.reveal_activity())
                             .child(ui::quiet("Show more"))
                     },
                 ))
@@ -548,6 +554,11 @@ fn activity_card(shell: Shell) -> impl IntoElement {
 }
 
 fn activity_row(shell: Shell, row: ReadSignal<crate::local::Activity>) -> impl IntoElement {
+    let id = row.with(|item| item.id.clone());
+    let sample = id == "sample";
+    let press_id = id.clone();
+    let note_id = id.clone();
+    let mark_id = id;
     button()
         .w_full()
         .flex_row()
@@ -558,38 +569,44 @@ fn activity_row(shell: Shell, row: ReadSignal<crate::local::Activity>) -> impl I
         .rounded(px(8.0))
         .hover(|style| style.bg(move || theme().accent))
         .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
-        .on_press(move || {
-            shell.notice("Demo sample. This is not a run, and no model was asked.");
-        })
+        .accessibility_label(row.with(|item| item.title.clone()))
+        .on_press(move || shell.toggle_activity(press_id.clone()))
         .child(ui::tinted(
-            if row.with(|item| item.title.contains("sample")) {
-                "sparkle"
-            } else {
-                "check"
-            },
-            if row.with(|item| item.title.contains("sample")) {
-                "#f93598"
-            } else {
-                "#2f9d78"
-            },
+            if sample { "sparkle" } else { "check" },
+            if sample { "#f93598" } else { "#2f9d78" },
         ))
         .child(
             view()
                 .flex_1()
                 .min_w(px(0.0))
+                .gap(px(2.0))
                 .child(
                     text(move || row.with(|item| item.title.clone()))
                         .number_of_lines(1)
                         .text_size(px(14.0)),
                 )
                 .child(
-                    text(move || row.with(|item| item.detail.clone()))
+                    text(move || row.with(|item| item.status.clone()))
                         .number_of_lines(1)
                         .text_size(px(12.0))
                         .text_color(move || theme().muted_foreground),
-                ),
+                )
+                .child(when(
+                    move || shell.activity_expanded(&note_id),
+                    move || {
+                        text(move || row.with(|item| item.note.clone()))
+                            .text_size(px(12.0))
+                            .text_color(move || theme().foreground)
+                    },
+                )),
         )
-        .child(ui::glyph(shell, "chevron-right", false))
+        .child(
+            when(
+                move || shell.activity_expanded(&mark_id),
+                move || ui::glyph(shell, "chevron-down", false),
+            )
+            .otherwise(move || ui::glyph(shell, "chevron-right", false)),
+        )
 }
 
 fn suggested(shell: Shell) -> impl IntoElement {
@@ -601,27 +618,15 @@ fn suggested(shell: Shell) -> impl IntoElement {
                 .items_center()
                 .child(ui::section_label("Suggested").flex_1())
                 .child(
-                    button()
-                        .cursor_pointer()
-                        .px(px(6.0))
-                        .py(px(2.0))
-                        .rounded(px(8.0))
-                        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
-                        .accessibility_label("Hide suggested")
-                        .on_press(move || {
-                            shell.suggested_hidden.update(|hidden| *hidden = !*hidden);
-                        })
-                        .child(ui::quiet(move || {
-                            if shell.suggested_hidden.get() {
-                                "Show".to_owned()
-                            } else {
-                                "Hide".to_owned()
-                            }
-                        })),
+                    when(
+                        move || shell.suggested_hidden_on(),
+                        move || suggested_toggle(shell, "Show suggested", "Show"),
+                    )
+                    .otherwise(move || suggested_toggle(shell, "Hide suggested", "Hide")),
                 ),
         )
         .child(when(
-            move || !shell.suggested_hidden.get(),
+            move || !shell.suggested_hidden_on(),
             move || {
                 card()
                     .child(suggest_row(shell, "Share", "Not available", move || {
@@ -632,6 +637,18 @@ fn suggested(shell: Shell) -> impl IntoElement {
                     }))
             },
         ))
+}
+
+fn suggested_toggle(shell: Shell, label: &'static str, word: &'static str) -> impl IntoElement {
+    button()
+        .cursor_pointer()
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(8.0))
+        .focus(|style| style.outline(px(2.0)).outline_color(move || theme().ring))
+        .accessibility_label(label)
+        .on_press(move || shell.toggle_suggested())
+        .child(ui::quiet(word))
 }
 
 fn suggest_row(
