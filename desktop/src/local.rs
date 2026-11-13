@@ -56,8 +56,10 @@ pub struct Bot {
 }
 
 impl Bot {
+    /// Name only. Every summary starts with "Demo", so a letter from that
+    /// word would leave every row on screen.
     fn matches(&self, query: &str) -> bool {
-        self.name.to_lowercase().contains(query) || self.summary.to_lowercase().contains(query)
+        self.name.to_lowercase().contains(query)
     }
 }
 
@@ -93,6 +95,9 @@ pub struct Shell {
     pub query: Signal<String>,
     pub search_open: Signal<bool>,
     pub collapsed_groups: Signal<Vec<String>>,
+    /// Groups folded while a query is set. Clearing the query drops this
+    /// and the saved collapse returns. Unassigned starts collapsed.
+    search_collapsed: Signal<Vec<String>>,
     pub sidebar_collapsed: Signal<bool>,
     pub details_open: Signal<bool>,
     pub library: Signal<bool>,
@@ -121,6 +126,7 @@ impl Shell {
             query: signal(String::new()),
             search_open: signal(false),
             collapsed_groups: signal(vec!["unassigned".to_owned()]),
+            search_collapsed: signal(Vec::new()),
             sidebar_collapsed: signal(false),
             details_open: signal(false),
             library: signal(false),
@@ -170,10 +176,20 @@ impl Shell {
             .with(|bots| bots.iter().find(|bot| bot.id == id).cloned())
     }
 
+    pub fn set_query(self, text: impl Into<String>) {
+        let text = text.into();
+        let was_searching = self.searching();
+        self.query.set(text);
+        // Entering or leaving a query drops folds made for the previous one.
+        // A collapsed group opens when the query starts, so its matches show.
+        if self.searching() != was_searching {
+            self.search_collapsed.set(Vec::new());
+        }
+    }
+
     pub fn bots_in(self, group: &str) -> Vec<Bot> {
-        let query = self.query.get();
-        let query = query.trim().to_lowercase();
-        let searching = !query.is_empty();
+        let query = self.query_text();
+        let searching = self.searching();
         self.bots.with(|bots| {
             bots.iter()
                 .filter(|bot| bot.group == group && (!searching || bot.matches(&query)))
@@ -182,14 +198,21 @@ impl Shell {
         })
     }
 
+    /// Bots the icon rail shows. The same name filter as the expanded list.
+    pub fn visible_bots(self) -> Vec<Bot> {
+        let query = self.query_text();
+        let searching = self.searching();
+        self.bots.with(|bots| {
+            bots.iter()
+                .filter(|bot| !searching || bot.matches(&query))
+                .cloned()
+                .collect()
+        })
+    }
+
     pub fn group_open(self, group: &str) -> bool {
-        let query = self.query.get();
-        let searching = !query.trim().is_empty();
-        if searching {
-            return true;
-        }
         !self
-            .collapsed_groups
+            .folded_groups()
             .with(|groups| groups.iter().any(|item| item == group))
     }
 
@@ -199,13 +222,30 @@ impl Shell {
 
     pub fn toggle_group(self, group: &str) {
         let group = group.to_owned();
-        self.collapsed_groups.update(|groups| {
+        self.folded_groups().update(|groups| {
             if let Some(at) = groups.iter().position(|item| item == &group) {
                 groups.remove(at);
             } else {
                 groups.push(group);
             }
         });
+    }
+
+    fn searching(self) -> bool {
+        !self.query.get().trim().is_empty()
+    }
+
+    fn query_text(self) -> String {
+        self.query.get().trim().to_lowercase()
+    }
+
+    /// While a query is set, folding a group is only for that query.
+    fn folded_groups(self) -> Signal<Vec<String>> {
+        if self.searching() {
+            self.search_collapsed
+        } else {
+            self.collapsed_groups
+        }
     }
 
     pub fn toggle_sidebar(self) {
@@ -220,7 +260,7 @@ impl Shell {
             // The field is mounted by this update. Focus it on the next turn.
             set_timeout(std::time::Duration::from_millis(16), move || field.focus());
         } else {
-            self.query.set(String::new());
+            self.set_query(String::new());
             self.focus_active_field();
         }
     }
@@ -399,7 +439,7 @@ impl Shell {
     pub fn dismiss_top(self) {
         if !self.query.get().trim().is_empty() || self.search_open.get() {
             self.search_open.set(false);
-            self.query.set(String::new());
+            self.set_query(String::new());
             self.focus_active_field();
         } else if self.creating.get() {
             self.cancel_new();
