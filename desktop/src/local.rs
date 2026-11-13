@@ -94,6 +94,9 @@ pub struct Shell {
     pub previews: Signal<Vec<Preview>>,
     pub query: Signal<String>,
     pub search_open: Signal<bool>,
+    /// The rail asked for the search field. The field takes this once it
+    /// is mounted. A timer started on the rail is dropped with the rail.
+    search_focus: Stored<bool>,
     pub collapsed_groups: Signal<Vec<String>>,
     /// Groups folded while a query is set. Clearing the query drops this
     /// and the saved collapse returns. Unassigned starts collapsed.
@@ -125,6 +128,7 @@ impl Shell {
             previews: signal(Vec::new()),
             query: signal(String::new()),
             search_open: signal(false),
+            search_focus: stored(false),
             collapsed_groups: signal(vec!["unassigned".to_owned()]),
             search_collapsed: signal(Vec::new()),
             sidebar_collapsed: signal(false),
@@ -267,8 +271,35 @@ impl Shell {
         self.sidebar_collapsed.update(|open| *open = !*open);
     }
 
-    pub fn open_search(self) {
+    /// The rail has no field. Expand and keep the query. The field focuses
+    /// itself when it mounts. This does not clear the query.
+    pub fn reveal_search(self) {
+        self.search_focus.with(|flag| *flag = true);
         self.sidebar_collapsed.set(false);
+        self.search_open.set(true);
+    }
+
+    /// Called from the mounted search field. One request, then it is spent.
+    pub fn take_search_focus(self) -> bool {
+        if self.creating.get() {
+            return false;
+        }
+        self.search_focus.with(|flag| {
+            if !*flag {
+                return false;
+            }
+            *flag = false;
+            true
+        })
+    }
+
+    pub fn open_search(self) {
+        // The field is not on the rail. Opening search from there shows it
+        // and keeps the query. The header toggle is only while expanded.
+        if self.sidebar_collapsed.get() {
+            self.reveal_search();
+            return;
+        }
         self.search_open.update(|open| *open = !*open);
         if self.search_open.get() {
             let field = self.search_field;
@@ -278,6 +309,11 @@ impl Shell {
             self.set_query(String::new());
             self.focus_active_field();
         }
+    }
+
+    /// The portrait is a demo. It does not open an account.
+    pub fn show_demo_profile(self) {
+        self.notice("This is a demo profile. Accounts are not available.");
     }
 
     /// Search closed. The new-bot form keeps the keyboard when it is open.
