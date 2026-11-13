@@ -397,23 +397,13 @@ impl Shell {
         };
         let text = self.draft.get();
         let previews = self.previews.get();
-        self.unsent.update(|rows| {
-            rows.retain(|row| row.bot_id != bot_id);
-            if !text.is_empty() || !previews.is_empty() {
-                rows.push(Unsent {
-                    bot_id,
-                    text,
-                    previews,
-                });
-            }
-        });
+        self.unsent
+            .update(|rows| park_unsent(rows, bot_id, text, previews));
     }
 
     /// Shows the unsent line for `bot_id`, or an empty composer.
     fn apply_unsent(self, bot_id: &str) {
-        let found = self
-            .unsent
-            .with(|rows| rows.iter().find(|row| row.bot_id == bot_id).cloned());
+        let found = self.unsent.with(|rows| parked(rows, bot_id).cloned());
         match found {
             Some(row) => {
                 self.draft.set(row.text);
@@ -505,6 +495,29 @@ impl Shell {
         })
     }
 
+    /// Cards and chips belong to a bot that has no transcript lines.
+    pub fn shows_suggestions(self) -> bool {
+        suggestion_cards_visible(
+            self.creating.get(),
+            self.selected.get().is_some(),
+            self.line_count(),
+        )
+    }
+
+    /// Writes `prompt` into the open bot's composer and focuses the field.
+    /// The transcript stays as it was. Nothing is sent, and no model is asked.
+    pub fn fill_composer(self, prompt: &str) {
+        let Some(text) = composer_fill(
+            self.creating.get(),
+            self.selected.get().is_some(),
+            prompt,
+        ) else {
+            return;
+        };
+        self.draft.set(text);
+        self.focus_composer();
+    }
+
     pub fn send(self) {
         let Some(bot_id) = self.selected.get() else {
             self.notice("Choose a bot first.");
@@ -519,20 +532,11 @@ impl Shell {
         }
         let id = self.alloc("line");
         self.lines.update(|lines| {
-            lines.insert(
-                0,
-                Line {
-                    id,
-                    bot_id: bot_id.clone(),
-                    mine: true,
-                    body: text,
-                    previews,
-                },
-            );
+            lines.insert(0, local_outgoing(id, bot_id.clone(), text, previews));
         });
         self.bots.update(|bots| {
             if let Some(bot) = bots.iter_mut().find(|bot| bot.id == bot_id) {
-                bot.summary = "Local · not sent".to_owned();
+                bot.summary = LOCAL_CAPTION.to_owned();
             }
         });
         self.draft.set(String::new());
@@ -878,6 +882,128 @@ fn philo_line(id: String, mine: bool, body: String) -> Line {
     }
 }
 
+/// A demo prompt for an empty chat. The press writes `prompt` into the
+/// composer. It does not name a tool, and it does not run one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Starter {
+    pub title: &'static str,
+    pub detail: &'static str,
+    pub prompt: &'static str,
+    pub icon: &'static str,
+    pub color: &'static str,
+}
+
+const STARTER_CARDS: [Starter; 4] = [
+    Starter {
+        title: "A short greeting",
+        detail: "Hello, kept in this window",
+        prompt: "Write a short greeting I can keep in this window.",
+        icon: "sparkle",
+        color: "#f93598",
+    },
+    Starter {
+        title: "Three local notes",
+        detail: "Plain lines, still only a draft",
+        prompt: "List three short notes for this empty chat.",
+        icon: "plus",
+        color: "#7c6ad6",
+    },
+    Starter {
+        title: "A rough plan",
+        detail: "A few steps to edit first",
+        prompt: "Sketch a few steps I can edit before sending.",
+        icon: "clock",
+        color: "#e0a23a",
+    },
+    Starter {
+        title: "A reminder",
+        detail: "One line that stays here",
+        prompt: "Leave a reminder that this note stays on this machine.",
+        icon: "check",
+        color: "#2f9d78",
+    },
+];
+
+const STARTER_CHIPS: [Starter; 4] = [
+    Starter {
+        title: "Say hello",
+        detail: "",
+        prompt: "Say hello",
+        icon: "",
+        color: "",
+    },
+    Starter {
+        title: "What is this window?",
+        detail: "",
+        prompt: "What is this window?",
+        icon: "",
+        color: "",
+    },
+    Starter {
+        title: "A local reminder",
+        detail: "",
+        prompt: "A local reminder",
+        icon: "",
+        color: "",
+    },
+    Starter {
+        title: "Three draft points",
+        detail: "",
+        prompt: "Three draft points",
+        icon: "",
+        color: "",
+    },
+];
+
+pub fn starter_cards() -> &'static [Starter] {
+    &STARTER_CARDS
+}
+
+pub fn starter_chips() -> &'static [Starter] {
+    &STARTER_CHIPS
+}
+
+/// The caption on a line this window stored. It is not a model reply.
+pub const LOCAL_CAPTION: &str = "Local · not sent";
+
+fn suggestion_cards_visible(creating: bool, has_bot: bool, line_count: usize) -> bool {
+    !creating && has_bot && line_count == 0
+}
+
+/// The draft a card or chip would write. `None` leaves the composer alone.
+fn composer_fill(creating: bool, has_bot: bool, prompt: &str) -> Option<String> {
+    if creating || !has_bot {
+        None
+    } else {
+        Some(prompt.to_owned())
+    }
+}
+
+fn park_unsent(rows: &mut Vec<Unsent>, bot_id: String, text: String, previews: Vec<Preview>) {
+    rows.retain(|row| row.bot_id != bot_id);
+    if !text.is_empty() || !previews.is_empty() {
+        rows.push(Unsent {
+            bot_id,
+            text,
+            previews,
+        });
+    }
+}
+
+fn parked<'a>(rows: &'a [Unsent], bot_id: &str) -> Option<&'a Unsent> {
+    rows.iter().find(|row| row.bot_id == bot_id)
+}
+
+fn local_outgoing(id: String, bot_id: String, body: String, previews: Vec<String>) -> Line {
+    Line {
+        id,
+        bot_id,
+        mine: true,
+        body,
+        previews,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,6 +1013,79 @@ mod tests {
             .into_iter()
             .find(|bot| bot.id == id)
             .unwrap_or_else(|| panic!("seed bot {id}"))
+    }
+
+    #[test]
+    fn empty_chat_prompts_fill_a_draft_and_a_local_line_hides_them() {
+        assert_eq!(starter_cards().len(), 4);
+        assert_eq!(starter_chips().len(), 4);
+        assert!(suggestion_cards_visible(false, true, 0));
+        assert!(!suggestion_cards_visible(false, true, 1));
+        assert!(!suggestion_cards_visible(true, true, 0));
+        assert!(!suggestion_cards_visible(false, false, 0));
+
+        let prompt = starter_cards()[0].prompt;
+        let mut lines = Vec::new();
+        let filled = composer_fill(false, true, prompt).expect("open bot");
+        assert_eq!(filled, prompt);
+        assert!(lines.is_empty());
+        assert!(composer_fill(true, true, prompt).is_none());
+
+        let line = local_outgoing("line-1".to_owned(), "desk".to_owned(), filled, Vec::new());
+        assert!(line.mine);
+        assert_eq!(line.body, prompt);
+        assert!(line.previews.is_empty());
+        lines.push(line);
+        assert!(!suggestion_cards_visible(false, true, lines.len()));
+        assert!(lines.iter().all(|item| item.mine));
+        assert_eq!(LOCAL_CAPTION, "Local · not sent");
+    }
+
+    #[test]
+    fn a_chip_draft_stays_with_its_bot() {
+        let mut rows = Vec::new();
+        park_unsent(
+            &mut rows,
+            "philo".to_owned(),
+            "Philo's unsent line".to_owned(),
+            Vec::new(),
+        );
+        park_unsent(
+            &mut rows,
+            "notes".to_owned(),
+            "Notes draft".to_owned(),
+            Vec::new(),
+        );
+        let desk = composer_fill(false, true, starter_chips()[3].prompt).unwrap();
+        assert_eq!(desk, "Three draft points");
+        park_unsent(&mut rows, "desk".to_owned(), desk, Vec::new());
+        assert_eq!(parked(&rows, "philo").unwrap().text, "Philo's unsent line");
+        assert_eq!(parked(&rows, "notes").unwrap().text, "Notes draft");
+        assert_eq!(parked(&rows, "desk").unwrap().text, "Three draft points");
+        park_unsent(&mut rows, "shelf".to_owned(), String::new(), Vec::new());
+        assert!(parked(&rows, "shelf").is_none());
+        assert!(suggestion_cards_visible(false, true, 0));
+    }
+
+    #[test]
+    fn starter_copy_does_not_name_a_tool() {
+        let banned = [
+            "Search the web",
+            "Describe a photo",
+            "Run some code",
+            "Weather in Lisbon",
+        ];
+        for starter in starter_cards().iter().chain(starter_chips()) {
+            assert!(!starter.prompt.is_empty());
+            assert!(!starter.title.is_empty());
+            for word in banned {
+                assert!(!starter.title.contains(word));
+                assert!(!starter.detail.contains(word));
+                assert!(!starter.prompt.contains(word));
+            }
+        }
+        assert!(starter_cards().iter().all(|card| !card.detail.is_empty()));
+        assert!(starter_chips().iter().all(|chip| chip.prompt == chip.title));
     }
 
     #[test]
