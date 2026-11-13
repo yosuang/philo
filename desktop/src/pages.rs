@@ -417,9 +417,16 @@ fn composer(shell: Shell) -> impl IntoElement {
                 .rounded(px(24.0))
                 .bg(move || theme().card)
                 .shadow_lg()
+                .focus_within(|style| {
+                    style
+                        .outline(px(2.0))
+                        .outline_offset(px(2.0))
+                        .outline_color(move || theme().ring)
+                })
                 .child(attachment_row(shell))
                 .child(
                     input()
+                        .element_ref(&shell.composer)
                         .placeholder("Message")
                         .value(move || shell.draft.get())
                         .on_change(move |text: &str| shell.draft.set(text.to_owned()))

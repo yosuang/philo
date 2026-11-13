@@ -175,7 +175,15 @@ fn search_field(shell: Shell) -> impl IntoElement {
             .border(px(0.0))
             .shadow_sm()
             .bg(move || theme().card)
-            .text_size(px(13.0)),
+            .text_size(px(13.0))
+            // The field's border width is 0, so a focus color on that border
+            // never draws. The outline is the ring.
+            .focus(|style| {
+                style
+                    .outline(px(2.0))
+                    .outline_offset(px(2.0))
+                    .outline_color(move || theme().ring)
+            }),
     )
 }
 

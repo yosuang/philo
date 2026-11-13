@@ -107,6 +107,7 @@ pub struct Shell {
     pub transcript: ElementRef,
     pub search_field: ElementRef,
     pub name_field: ElementRef,
+    pub composer: ElementRef,
 }
 
 impl Shell {
@@ -134,12 +135,27 @@ impl Shell {
             transcript: element_ref(),
             search_field: element_ref(),
             name_field: element_ref(),
+            composer: element_ref(),
         };
         let choice = Storage::get_item(APPEARANCE_KEY)
             .map(|value| AppearanceChoice::parse(&value))
             .unwrap_or(AppearanceChoice::Light);
         shell.set_appearance(choice);
+        shell.focus_composer();
         shell
+    }
+
+    /// Puts the keyboard in the message field on the next turn, once that
+    /// field is mounted. The new-bot form keeps the keyboard if it opened
+    /// in the meantime.
+    pub fn focus_composer(self) {
+        let field = self.composer;
+        set_timeout(std::time::Duration::from_millis(16), move || {
+            if self.creating.get() {
+                return;
+            }
+            field.focus();
+        });
     }
 
     pub fn set_appearance(self, choice: AppearanceChoice) {
@@ -205,6 +221,17 @@ impl Shell {
             set_timeout(std::time::Duration::from_millis(16), move || field.focus());
         } else {
             self.query.set(String::new());
+            self.focus_active_field();
+        }
+    }
+
+    /// Search closed. The new-bot form keeps the keyboard when it is open.
+    fn focus_active_field(self) {
+        if self.creating.get() {
+            let field = self.name_field;
+            set_timeout(std::time::Duration::from_millis(16), move || field.focus());
+        } else {
+            self.focus_composer();
         }
     }
 
@@ -215,6 +242,7 @@ impl Shell {
         self.previews.set(Vec::new());
         self.away_from_bottom.set(false);
         self.show_newest(false);
+        self.focus_composer();
     }
 
     pub fn open_new(self) {
@@ -228,6 +256,7 @@ impl Shell {
     pub fn cancel_new(self) {
         self.creating.set(false);
         self.new_name.set(String::new());
+        self.focus_composer();
     }
 
     pub fn create_bot(self) {
@@ -323,6 +352,7 @@ impl Shell {
         self.previews.set(Vec::new());
         self.away_from_bottom.set(false);
         self.show_newest(false);
+        self.focus_composer();
     }
 
     pub fn add_preview(self) {
@@ -335,11 +365,13 @@ impl Shell {
             });
         });
         self.show_newest(false);
+        self.focus_composer();
     }
 
     pub fn remove_preview(self, id: String) {
         self.previews
             .update(|items| items.retain(|item| item.id != id));
+        self.focus_composer();
     }
 
     pub fn toggle_details(self) {
@@ -368,6 +400,7 @@ impl Shell {
         if !self.query.get().trim().is_empty() || self.search_open.get() {
             self.search_open.set(false);
             self.query.set(String::new());
+            self.focus_active_field();
         } else if self.creating.get() {
             self.cancel_new();
         } else if self.notice.get().is_some() {
