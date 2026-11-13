@@ -5,7 +5,7 @@ use nsh_base::{button, input, theme};
 use nsh_core::element::desktop::title_bar;
 use nsh_core::prelude::*;
 
-use crate::local::{Shell, LOCAL_CAPTION, starter_cards, starter_chips};
+use crate::local::{LOCAL_CAPTION, PROJECT_BLURB, Shell, starter_cards, starter_chips};
 use crate::ui;
 
 pub fn column(shell: Shell) -> impl IntoElement {
@@ -420,6 +420,7 @@ fn message_row(shell: Shell, at: Position) -> impl IntoElement {
                 when(mine, move || user_bubble(shell, at)).otherwise(move || note_bubble(shell, at))
             },
         ))
+        .child(attribution(shell, at))
 }
 
 fn time_line(shell: Shell, at: Position) -> impl IntoElement {
@@ -471,6 +472,86 @@ fn user_bubble(shell: Shell, at: Position) -> impl IntoElement {
                 .text_color(move || theme().primary_foreground),
             ),
     )
+}
+
+/// "Messaged {name}" under a bot note or a single local line.
+/// "N messages with {name}" once, under the newest line of a longer local run.
+/// The Project pill only opens this bot's blurb.
+fn attribution(shell: Shell, at: Position) -> impl IntoElement {
+    when(
+        move || shell.mark_at(at.index()).is_some(),
+        move || {
+            view()
+                .w_full()
+                .items_center()
+                .gap(px(4.0))
+                .pt(px(2.0))
+                .pb(px(2.0))
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            text(move || {
+                                shell
+                                    .mark_at(at.index())
+                                    .map(|mark| mark.prefix())
+                                    .unwrap_or_default()
+                            })
+                            .text_size(px(12.0))
+                            .text_color(move || theme().muted_foreground),
+                        )
+                        .child(ui::plane_badge())
+                        .child(
+                            text(move || shell.bot_name())
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(move || theme().foreground),
+                        )
+                        .child(project_pill(shell)),
+                )
+                .child(when(
+                    move || shell.project_on(),
+                    move || {
+                        text(PROJECT_BLURB)
+                            .text_size(px(12.0))
+                            .text_center()
+                            .text_color(move || theme().muted_foreground)
+                    },
+                ))
+        },
+    )
+}
+
+fn project_pill(shell: Shell) -> impl IntoElement {
+    button()
+        .accessibility_label("Project")
+        .px(px(8.0))
+        .py(px(1.0))
+        .rounded(px(10.0))
+        .cursor_pointer()
+        .bg(move || {
+            if shell.project_on() {
+                rgb(0xe4d8ff)
+            } else {
+                rgb(0xf3e8ff)
+            }
+        })
+        .hover(|style| style.bg(rgb(0xe4d8ff)))
+        .focus(|style| {
+            style
+                .outline(px(2.0))
+                .outline_offset(px(2.0))
+                .outline_color(move || theme().ring)
+        })
+        .on_press(move || shell.toggle_project())
+        .child(
+            text("Project")
+                .text_size(px(12.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(0x6d28d9)),
+        )
 }
 
 fn note_bubble(shell: Shell, at: Position) -> impl IntoElement {

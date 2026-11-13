@@ -178,6 +178,16 @@ pub fn tinted_size(name: &'static str, color: &'static str, size: f32) -> impl I
         .flex_shrink_0()
 }
 
+/// The small send mark between "Messaged" and the bot name. It does not send.
+pub fn plane_badge() -> impl IntoElement {
+    image(data_svg(
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='11' fill='#ececef'/><path fill='#3f3f46' d='M6.2 12.2l11.2-4.6-4.2 11.4-2.1-4.4-4.9-2.4z'/></svg>",
+    ))
+    .size(px(16.0))
+    .object_fit(ResizeMode::Contain)
+    .flex_shrink_0()
+}
+
 pub fn glyph(shell: Shell, name: &'static str, on_primary: bool) -> impl IntoElement {
     image(move || icon_uri(shell, name, on_primary))
         .size(px(16.0))
