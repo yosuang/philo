@@ -4,6 +4,9 @@
 //! socket, reads a database, or asks a model to run. The HTTP client in
 //! `client` stays in the crate for a later session and is not started.
 
+use std::path::PathBuf;
+
+use nsh_core::file_dialog::OpenDialog;
 use nsh_core::platform::Appearance;
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
@@ -135,8 +138,8 @@ pub struct Shell {
     pub selected: Signal<Option<String>>,
     pub draft: Signal<String>,
     pub previews: Signal<Vec<Preview>>,
-    /// How many files the attach control has offered. The next press takes the next file.
-    preview_seq: Stored<u32>,
+    /// True while the system file dialog is open. A second press waits.
+    choosing: Stored<bool>,
     /// Unsent lines for bots other than the one open now.
     unsent: Signal<Vec<Unsent>>,
     pub query: Signal<String>,
@@ -173,7 +176,7 @@ impl Shell {
             selected: signal(Some("philo".to_owned())),
             draft: signal(String::new()),
             previews: signal(Vec::new()),
-            preview_seq: stored(0),
+            choosing: stored(false),
             unsent: signal(Vec::new()),
             query: signal(String::new()),
             search_open: signal(false),
@@ -552,20 +555,44 @@ impl Shell {
         self.focus_composer();
     }
 
-    /// Attaches the next local file on the open bot. A file that is not an
-    /// image is still attached, with the decode failure on that preview.
-    pub fn add_preview(self) {
-        let index = self.preview_seq.with(|n| {
-            let index = *n;
-            *n = index.wrapping_add(1);
-            index as usize
-        });
-        let path = local_path(local_name(index));
-        let error = image_failure(&path);
-        let id = self.alloc("preview");
-        self.previews.update(|items| {
-            items.push(Preview { id, path, error });
-        });
+    /// Opens the system file dialog. Cancel adds nothing. The file the user
+    /// picks is attached on the open bot. A file that is not a picture is
+    /// still attached, with the decode failure on that preview. If the
+    /// dialog cannot open, a notice is shown and nothing is attached.
+    pub fn choose_file(self) {
+        if self.choosing.replace(true) {
+            return;
+        }
+        // `spawn` cancels a task when its handle is dropped.
+        std::mem::forget(spawn(async move {
+            let picked = pick_paths(
+                OpenDialog::files()
+                    .title("Choose a file")
+                    .button_label("Open"),
+            )
+            .await;
+            self.choosing.replace(false);
+            match files_from_dialog(picked) {
+                Ok(files) if files.is_empty() => {}
+                Ok(files) => self.attach_files(files),
+                Err(message) => {
+                    log::warn!("file dialog: {message}");
+                    self.notice("Could not open the file dialog.");
+                }
+            }
+        }));
+    }
+
+    fn attach_files(self, files: Vec<ChosenFile>) {
+        let mut attached = Vec::with_capacity(files.len());
+        for file in files {
+            attached.push(Preview {
+                id: self.alloc("preview"),
+                path: file.path,
+                error: file.error,
+            });
+        }
+        self.previews.update(|items| items.extend(attached));
         self.show_newest(false);
         self.focus_composer();
     }
@@ -1037,15 +1064,29 @@ pub const LOCAL_CAPTION: &str = "Local · not sent";
 /// Shown on a preview whose file is not a picture. Not a stand-in for the picture.
 pub const DECODE_FAILURE: &str = "Could not decode";
 
-/// Files the attach control offers, in order, then from the start.
-/// `broken.bin` is not an image, so that preview shows [`DECODE_FAILURE`].
-fn local_name(index: usize) -> &'static str {
-    const NAMES: [&str; 4] = ["rose.png", "teal.png", "amber.png", "broken.bin"];
-    NAMES[index % NAMES.len()]
+/// One file the open dialog returned, after the header check.
+struct ChosenFile {
+    path: String,
+    error: Option<String>,
 }
 
-fn local_path(name: &str) -> String {
-    format!("{}/previews/{name}", env!("CARGO_MANIFEST_DIR"))
+/// Files the dialog gave. Cancel (`Ok(None)`) is an empty list, so nothing
+/// is attached. `Err` is the dialog failing to open, which also attaches
+/// nothing. A path is read only after the user picks it.
+fn files_from_dialog(
+    result: Result<Option<Vec<PathBuf>>, String>,
+) -> Result<Vec<ChosenFile>, String> {
+    let Some(paths) = result? else {
+        return Ok(Vec::new());
+    };
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let path = path.display().to_string();
+            let error = image_failure(&path);
+            ChosenFile { path, error }
+        })
+        .collect())
 }
 
 /// `None` when `path` has a PNG, JPEG, GIF, or WebP header.
@@ -1426,15 +1467,32 @@ mod tests {
         assert_eq!(LOCAL_CAPTION, "Local · not sent");
     }
 
+    fn fixture(name: &str) -> String {
+        format!("{}/previews/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
     #[test]
     fn local_image_previews_stay_with_the_bot_and_a_bad_file_fails() {
-        assert_eq!(local_name(0), "rose.png");
-        assert_eq!(local_name(3), "broken.bin");
-        assert_eq!(local_name(4), "rose.png");
-        let rose = local_path(local_name(0));
-        let teal = local_path(local_name(1));
-        let amber = local_path(local_name(2));
-        let broken = local_path(local_name(3));
+        let rose = fixture("rose.png");
+        let teal = fixture("teal.png");
+        let amber = fixture("amber.png");
+        let broken = fixture("broken.bin");
+        let cancelled = files_from_dialog(Ok(None)).expect("cancel");
+        assert!(cancelled.is_empty());
+        assert!(
+            files_from_dialog(Err(
+                "this platform has no file dialogs, file manager or trash".into()
+            ))
+            .is_err()
+        );
+        let chosen = files_from_dialog(Ok(Some(vec![
+            std::path::PathBuf::from(&rose),
+            std::path::PathBuf::from(&broken),
+        ])))
+        .expect("picked files");
+        assert!(chosen[0].error.is_none());
+        assert!(chosen[0].path.ends_with("rose.png"));
+        assert_eq!(chosen[1].error.as_deref(), Some(DECODE_FAILURE));
         assert!(image_failure(&rose).is_none());
         assert!(image_failure(&teal).is_none());
         assert!(image_failure(&amber).is_none());

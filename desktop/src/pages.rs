@@ -788,11 +788,11 @@ fn composer(shell: Shell) -> impl IntoElement {
                         .items_center()
                         .child(ui::icon_button(
                             shell,
-                            "Attach a local preview",
+                            "Choose a file",
                             "plus",
                             ui::Circle::Bare,
                             || true,
-                            move || shell.add_preview(),
+                            move || shell.choose_file(),
                         ))
                         .child(view().flex_1())
                         .child(ui::icon_button(
